@@ -11,9 +11,9 @@
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>Overwhisper</string>
+    <string>Local Dictation</string>
     <key>CFBundleDisplayName</key>
-    <string>Overwhisper</string>
+    <string>Local Dictation</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -27,18 +27,12 @@
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.productivity</string>
     <key>NSHumanReadableCopyright</key>
-    <string>Copyright 2024 Overseed. All rights reserved.</string>
+    <string>Copyright 2026 Nate Munk. Overwhisper portions copyright their original contributors.</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Overwhisper needs microphone access to record your voice for transcription.</string>
+    <string>Local Dictation records your microphone locally so it can transcribe your speech on this Mac.</string>
     <key>NSAppleEventsUsageDescription</key>
-    <string>Overwhisper needs to control system audio to mute sounds while recording.</string>
+    <string>Local Dictation can optionally read a browser hostname for an app-specific local profile.</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
-    <key>SUFeedURL</key>
-    <string>https://overseedai.github.io/overwhisper/appcast.xml</string>
-    <key>SUPublicEDKey</key>
-    <string>TVbKW7Eho/pA8YdxeGAkauxjL+AsgcE4k9fzhTXVqhA=</string>
-    <key>SUEnableAutomaticChecks</key>
-    <true/>
 </dict>
 </plist>

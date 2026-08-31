@@ -1,0 +1,215 @@
+#!/bin/zsh
+set -euo pipefail
+
+PROJECT_ROOT=${0:A:h}
+LAUNCH_APP=1
+RUN_TESTS=1
+
+for argument in "$@"; do
+  case "$argument" in
+    --no-launch) LAUNCH_APP=0 ;;
+    --skip-tests) RUN_TESTS=0 ;;
+    *) print -u2 "Unknown option: $argument"; exit 64 ;;
+  esac
+done
+
+if [[ "$(uname -m)" != "arm64" ]]; then
+  print -u2 "Local Dictation v1 requires an Apple Silicon Mac."
+  exit 1
+fi
+
+MACOS_MAJOR=$(sw_vers -productVersion | cut -d. -f1)
+if (( MACOS_MAJOR < 15 )); then
+  print -u2 "Local Dictation v1 requires macOS 15 or newer."
+  exit 1
+fi
+
+XCODE_DEVELOPER_ROOT=${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}
+SWIFT_BIN=""
+SDK_ROOT=""
+
+if DEVELOPER_DIR="$XCODE_DEVELOPER_ROOT" /usr/bin/xcrun --find swift >/dev/null 2>&1 \
+   && DEVELOPER_DIR="$XCODE_DEVELOPER_ROOT" /usr/bin/xcrun --sdk macosx --show-sdk-path >/dev/null 2>&1; then
+  SWIFT_BIN=$(DEVELOPER_DIR="$XCODE_DEVELOPER_ROOT" /usr/bin/xcrun --find swift)
+  SDK_ROOT=$(DEVELOPER_DIR="$XCODE_DEVELOPER_ROOT" /usr/bin/xcrun --sdk macosx --show-sdk-path)
+elif [[ -x "$XCODE_DEVELOPER_ROOT/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift" \
+     && -d "$XCODE_DEVELOPER_ROOT/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk" ]]; then
+  SWIFT_BIN="$XCODE_DEVELOPER_ROOT/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift"
+  SDK_ROOT="$XCODE_DEVELOPER_ROOT/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+  print "xcrun is unavailable; using the Xcode toolchain directly."
+else
+  print -u2 "A compatible full Xcode installation and macOS SDK are required."
+  print -u2 "Install Xcode, launch it once, then run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
+  exit 1
+fi
+
+SWIFT_VERSION_OUTPUT=$("$SWIFT_BIN" --version 2>&1) || {
+  print -u2 "Unable to run the selected Swift toolchain: $SWIFT_BIN"
+  exit 1
+}
+SWIFT_VERSION=$(print -r -- "$SWIFT_VERSION_OUTPUT" \
+  | /usr/bin/sed -nE 's/^.*Swift version ([0-9]+([.][0-9]+)*).*$/\1/p' \
+  | /usr/bin/head -n 1)
+SWIFT_MAJOR=${SWIFT_VERSION%%.*}
+if [[ -z "$SWIFT_VERSION" || "$SWIFT_MAJOR" != <-> ]]; then
+  print -u2 "Unable to determine the Swift version from: ${SWIFT_VERSION_OUTPUT%%$'\n'*}"
+  exit 1
+fi
+if (( SWIFT_MAJOR < 6 )); then
+  print -u2 "Swift 6 or newer is required; found Swift $SWIFT_VERSION at $SWIFT_BIN."
+  print -u2 "Install Xcode 16 or newer and select it with xcode-select or DEVELOPER_DIR."
+  exit 1
+fi
+
+SDK_VERSION=""
+if [[ -f "$SDK_ROOT/SDKSettings.plist" ]]; then
+  SDK_VERSION=$(/usr/bin/plutil -extract Version raw "$SDK_ROOT/SDKSettings.plist" 2>/dev/null || true)
+fi
+if [[ -z "$SDK_VERSION" ]]; then
+  SDK_VERSION=$(DEVELOPER_DIR="$XCODE_DEVELOPER_ROOT" \
+    /usr/bin/xcrun --sdk macosx --show-sdk-version 2>/dev/null || true)
+fi
+SDK_MAJOR=${SDK_VERSION%%.*}
+if [[ -z "$SDK_VERSION" || "$SDK_MAJOR" != <-> ]]; then
+  print -u2 "Unable to determine the macOS SDK version at: $SDK_ROOT"
+  exit 1
+fi
+if (( SDK_MAJOR < 15 )); then
+  print -u2 "macOS SDK 15 or newer is required; found SDK $SDK_VERSION at $SDK_ROOT."
+  print -u2 "Install Xcode 16 or newer and select it with xcode-select or DEVELOPER_DIR."
+  exit 1
+fi
+
+GIT_BIN=""
+for candidate in \
+  "$XCODE_DEVELOPER_ROOT/usr/bin/git" \
+  /Applications/Xcode.app/Contents/Developer/usr/bin/git \
+  /Library/Developer/CommandLineTools/usr/bin/git \
+  /usr/bin/git \
+  /opt/homebrew/bin/git \
+  /usr/local/bin/git \
+  "$(command -v git 2>/dev/null || true)" \
+  "$HOME/.cache/codex-runtimes/codex-primary-runtime/dependencies/bin/fallback/git"; do
+  if [[ -n "$candidate" && -x "$candidate" ]] && "$candidate" --version >/dev/null 2>&1; then
+    GIT_BIN="$candidate"
+    break
+  fi
+done
+if [[ -z "$GIT_BIN" ]]; then
+  print -u2 "A working Git executable is required for Swift package resolution."
+  exit 1
+fi
+
+print "Toolchain preflight passed: Swift $SWIFT_VERSION, macOS SDK $SDK_VERSION."
+
+GIT_BIN_DIR=${GIT_BIN:h}
+export PATH="$GIT_BIN_DIR:/usr/bin:/bin:/usr/sbin:/sbin"
+export SDKROOT="$SDK_ROOT"
+
+BUILD_ROOT="$PROJECT_ROOT/.build/local-dictation"
+export CLANG_MODULE_CACHE_PATH="$BUILD_ROOT/module-cache"
+export SWIFTPM_MODULECACHE_OVERRIDE="$BUILD_ROOT/module-cache"
+SWIFTPM_CACHE="$PROJECT_ROOT/.build/swiftpm-cache"
+TEST_FRAMEWORKS="$XCODE_DEVELOPER_ROOT/Platforms/MacOSX.platform/Developer/Library/Frameworks"
+TRANSFORMERS_CHECKOUT="$BUILD_ROOT/checkouts/swift-transformers"
+TRANSFORMERS_HUB_SOURCE="$TRANSFORMERS_CHECKOUT/Sources/Hub/Hub.swift"
+TRANSFORMERS_HUB_BACKUP="${TRANSFORMERS_HUB_SOURCE}.orig"
+TRANSFORMERS_RESOURCE_PATCH="$PROJECT_ROOT/patches/swift-transformers-resource-bundle.patch"
+
+restore_dependency_patch() {
+  if [[ -d "$TRANSFORMERS_CHECKOUT/.git" ]]; then
+    "$GIT_BIN" -C "$TRANSFORMERS_CHECKOUT" checkout -- Sources/Hub/Hub.swift >/dev/null 2>&1 || true
+    /bin/rm -f "$TRANSFORMERS_HUB_BACKUP"
+  fi
+}
+
+# A killed prior setup must not leave the generated checkout dirty before
+# SwiftPM resolves the exact pinned dependency again.
+restore_dependency_patch
+
+print "Resolving pinned dependencies…"
+"$SWIFT_BIN" package resolve \
+  --disable-sandbox \
+  --scratch-path "$BUILD_ROOT" \
+  --cache-path "$SWIFTPM_CACHE"
+
+if [[ ! -f "$TRANSFORMERS_HUB_SOURCE" || ! -f "$TRANSFORMERS_RESOURCE_PATCH" ]]; then
+  print -u2 "The pinned swift-transformers checkout or its packaging patch is missing."
+  exit 1
+fi
+if ! /usr/bin/grep -q 'packagedBundleURL' "$TRANSFORMERS_HUB_SOURCE"; then
+  /usr/bin/patch --quiet -p1 -d "$TRANSFORMERS_CHECKOUT" < "$TRANSFORMERS_RESOURCE_PATCH"
+  /bin/rm -f "$TRANSFORMERS_HUB_BACKUP"
+fi
+trap restore_dependency_patch EXIT HUP INT TERM
+
+if (( RUN_TESTS )); then
+  print "Running unit and contract tests…"
+  DYLD_FRAMEWORK_PATH="$TEST_FRAMEWORKS${DYLD_FRAMEWORK_PATH:+:$DYLD_FRAMEWORK_PATH}" \
+    "$SWIFT_BIN" test \
+      --disable-sandbox \
+      --scratch-path "$BUILD_ROOT" \
+      --cache-path "$SWIFTPM_CACHE" \
+      -Xswiftc -F -Xswiftc "$TEST_FRAMEWORKS" \
+      -Xlinker -F -Xlinker "$TEST_FRAMEWORKS"
+fi
+
+print "Building Local Dictation…"
+"$SWIFT_BIN" build \
+  --disable-sandbox \
+  --configuration release \
+  --product LocalDictation \
+  --scratch-path "$BUILD_ROOT" \
+  --cache-path "$SWIFTPM_CACHE"
+
+BIN_DIRECTORY=$("$SWIFT_BIN" build \
+  --configuration release \
+  --show-bin-path \
+  --scratch-path "$BUILD_ROOT" \
+  --cache-path "$SWIFTPM_CACHE")
+BINARY="$BIN_DIRECTORY/LocalDictation"
+if [[ ! -x "$BINARY" ]]; then
+  print -u2 "Build completed without the expected LocalDictation executable."
+  exit 1
+fi
+
+STAGE_ROOT="$PROJECT_ROOT/.build/app-stage"
+STAGED_APP="$STAGE_ROOT/Local Dictation.app"
+rm -rf "$STAGE_ROOT"
+mkdir -p "$STAGED_APP/Contents/MacOS" "$STAGED_APP/Contents/Resources"
+ditto "$BINARY" "$STAGED_APP/Contents/MacOS/LocalDictation"
+ditto "$PROJECT_ROOT/Overwhisper/Info.plist" "$STAGED_APP/Contents/Info.plist"
+
+PLIST="$STAGED_APP/Contents/Info.plist"
+plutil -replace CFBundleExecutable -string LocalDictation "$PLIST"
+plutil -replace CFBundleIdentifier -string com.natemunk.LocalDictation "$PLIST"
+plutil -replace CFBundleShortVersionString -string 0.1.0 "$PLIST"
+plutil -replace CFBundleVersion -string 1 "$PLIST"
+plutil -replace LSMinimumSystemVersion -string 15.0 "$PLIST"
+
+for resource_bundle in "$BIN_DIRECTORY"/*.bundle(N); do
+  ditto "$resource_bundle" "$STAGED_APP/Contents/Resources/${resource_bundle:t}"
+done
+
+codesign --force --deep --sign - \
+  --entitlements "$PROJECT_ROOT/Overwhisper/Overwhisper.entitlements" \
+  "$STAGED_APP"
+
+USER_APPLICATIONS="$HOME/Applications"
+INSTALLED_APP="$USER_APPLICATIONS/Local Dictation.app"
+mkdir -p "$USER_APPLICATIONS"
+if [[ -e "$INSTALLED_APP" ]]; then
+  BACKUP_DIRECTORY="$PROJECT_ROOT/.build/installed-app-backups"
+  mkdir -p "$BACKUP_DIRECTORY"
+  BACKUP_APP="$BACKUP_DIRECTORY/Local Dictation previous $(date +%Y%m%d-%H%M%S).app"
+  mv "$INSTALLED_APP" "$BACKUP_APP"
+  print "Previous build moved to: $BACKUP_APP"
+fi
+ditto "$STAGED_APP" "$INSTALLED_APP"
+
+print "Installed: $INSTALLED_APP"
+print "Configuration: $HOME/.config/local-dictation"
+if (( LAUNCH_APP )); then
+  open "$INSTALLED_APP"
+  print "Local Dictation launched. Complete the three documented permission prompts, then press Hyper+D."
+fi

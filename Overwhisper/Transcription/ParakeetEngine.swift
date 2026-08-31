@@ -80,7 +80,7 @@ actor ParakeetEngine: TranscriptionEngine {
         }
     }
 
-    func transcribe(audioURL: URL) async throws -> String {
+    func transcribe(audioURL: URL) async throws -> FinalTranscript {
         do {
             try await initialize()
         } catch {
@@ -92,16 +92,33 @@ actor ParakeetEngine: TranscriptionEngine {
             throw ParakeetError.notInitialized
         }
 
-        AppLogger.transcription.debug("Transcribing audio from: \(audioURL.path)")
+        AppLogger.transcription.debug("Transcribing a local temporary recording")
         var decoderState = TdtDecoderState.make(decoderLayers: await asrManager.decoderLayerCount)
+        let language = await languageHint()
         let result = try await asrManager.transcribe(
             audioURL,
             decoderState: &decoderState,
-            language: await languageHint()
+            language: language
         )
-        AppLogger.transcription.debug("Transcription result: \(result.text)")
+        AppLogger.transcription.debug("Local Parakeet transcription completed")
 
-        return result.text.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        let transcript = FinalTranscript(text: result.text, language: language?.rawValue)
+        let fragments = result.tokenTimings?.map {
+            TimedTranscriptFragment(
+                text: $0.token,
+                startTime: $0.startTime,
+                endTime: $0.endTime
+            )
+        } ?? []
+        let boundaries = TranscriptBoundaryMapper.pauseBoundaries(
+            in: transcript.text,
+            fragments: fragments
+        )
+        return FinalTranscript(
+            text: transcript.text,
+            language: transcript.language,
+            boundaries: boundaries
+        )
     }
 
     private func languageHint() async -> Language? {
@@ -128,11 +145,9 @@ extension ParakeetEngine {
         do {
             _ = try await AsrModels.download(version: version)
             appState.parakeetDownloadedModels.insert(modelType.rawValue)
-            UsageAnalytics.trackModelDownload(engine: .parakeet, model: modelType.rawValue, succeeded: true)
             AppLogger.transcription.info("Downloaded Parakeet model: \(modelType.rawValue)")
         } catch {
             appState.lastError = "Failed to download \(modelType.displayName): \(error.localizedDescription)"
-            UsageAnalytics.trackModelDownload(engine: .parakeet, model: modelType.rawValue, succeeded: false)
             AppLogger.transcription.error("Failed to download Parakeet model \(modelType.rawValue): \(error.localizedDescription)")
         }
     }

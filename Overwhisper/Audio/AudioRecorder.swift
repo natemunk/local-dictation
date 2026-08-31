@@ -149,11 +149,15 @@ class AudioDeviceManager: ObservableObject {
             mElement: kAudioObjectPropertyElementMain
         )
 
-        var name: CFString = "" as CFString
-        var dataSize = UInt32(MemoryLayout<CFString>.size)
+        // CoreAudio writes a CFStringRef pointer. Store that pointer as
+        // `Unmanaged` so Swift does not form an UnsafeMutableRawPointer to a
+        // strong object-reference variable (which is both warned about and can
+        // violate ARC's representation assumptions).
+        var name: Unmanaged<CFString>?
+        var dataSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
         let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &dataSize, &name)
-        guard status == noErr else { return nil }
-        return name as String
+        guard status == noErr, let name else { return nil }
+        return name.takeUnretainedValue() as String
     }
 
     private static func deviceUID(_ deviceID: AudioDeviceID) -> String? {
@@ -163,11 +167,11 @@ class AudioDeviceManager: ObservableObject {
             mElement: kAudioObjectPropertyElementMain
         )
 
-        var uid: CFString = "" as CFString
-        var dataSize = UInt32(MemoryLayout<CFString>.size)
+        var uid: Unmanaged<CFString>?
+        var dataSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
         let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &dataSize, &uid)
-        guard status == noErr else { return nil }
-        return uid as String
+        guard status == noErr, let uid else { return nil }
+        return uid.takeUnretainedValue() as String
     }
 
     private static func deviceHasInput(_ deviceID: AudioDeviceID) -> Bool {
@@ -223,6 +227,8 @@ class AudioRecorder: ObservableObject {
     private var selectedInputDeviceID: AudioDeviceID?
     private var converter: AVAudioConverter?
     private var converterInputFormat: AVAudioFormat?
+    private var audioChunkSource: BoundedAudioChunkStream?
+    private let audioChunkBufferingLimit: Int
 
     @Published var currentLevel: Float = 0.0
     @Published var isRecording: Bool = false
@@ -238,6 +244,10 @@ class AudioRecorder: ObservableObject {
     /// threshold even when the bulk of the recording is silence.
     private(set) var meanRMS: Float = 0
 
+    /// Number of live chunks dropped because transcription did not keep up with
+    /// the bounded stream. Sequence numbers expose the same gap to consumers.
+    private(set) var droppedAudioChunkCount = 0
+
     private var sumOfSquares: Double = 0
     private var totalSamples: Int = 0
 
@@ -246,7 +256,10 @@ class AudioRecorder: ObservableObject {
 
     private var levelUpdateTimer: Timer?
 
-    init() {}
+    init(audioChunkBufferingLimit: Int = 128) {
+        precondition(audioChunkBufferingLimit > 0)
+        self.audioChunkBufferingLimit = audioChunkBufferingLimit
+    }
 
     func setInputDevice(_ device: AudioInputDevice?) {
         // The device is bound when recording actually starts (makeInputUnit),
@@ -254,13 +267,20 @@ class AudioRecorder: ObservableObject {
         selectedInputDeviceID = device?.id
     }
 
-    func startRecording() throws {
-        guard !isRecording else { return }
+    @discardableResult
+    func startRecording() throws -> AsyncStream<AudioChunk> {
+        if isRecording {
+            guard let audioChunkSource else {
+                throw AudioRecorderError.deviceConfigurationFailed
+            }
+            return audioChunkSource.stream
+        }
         loggedOnce.removeAll()
         peakRMS = 0
         meanRMS = 0
         sumOfSquares = 0
         totalSamples = 0
+        droppedAudioChunkCount = 0
 
         // Check microphone permission before opening the device
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
@@ -274,7 +294,7 @@ class AudioRecorder: ObservableObject {
 
         // Create temporary file for recording
         let tempDir = FileManager.default.temporaryDirectory
-        let fileName = "overwhisper_recording_\(UUID().uuidString).wav"
+        let fileName = "local_dictation_recording_\(UUID().uuidString).wav"
         let url = tempDir.appendingPathComponent(fileName)
         recordingURL = url
 
@@ -341,6 +361,11 @@ class AudioRecorder: ObservableObject {
             throw error
         }
 
+        let audioChunkSource = BoundedAudioChunkStream(
+            bufferingLimit: audioChunkBufferingLimit
+        )
+        self.audioChunkSource = audioChunkSource
+
         // Wire the input render callback (passing self via the opaque refcon)
         var callbackStruct = AURenderCallbackStruct(
             inputProc: { inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, _ in
@@ -386,6 +411,8 @@ class AudioRecorder: ObservableObject {
 
         // Start level monitoring
         startLevelMonitoring()
+
+        return audioChunkSource.stream
     }
 
     /// Pulls captured audio from the input unit and feeds it through the existing
@@ -524,6 +551,8 @@ class AudioRecorder: ObservableObject {
         audioFile = nil
         converter = nil
         converterInputFormat = nil
+        audioChunkSource?.cancel()
+        audioChunkSource = nil
         if let url = recordingURL {
             try? FileManager.default.removeItem(at: url)
         }
@@ -585,6 +614,25 @@ class AudioRecorder: ObservableObject {
             try audioFile?.write(from: convertedBuffer)
         } catch {
             AppLogger.audio.error("Error writing audio buffer: \(error.localizedDescription)")
+        }
+
+        // The live path is copied from the exact converted buffer written above;
+        // it never opens another capture device or performs a second conversion.
+        if let channel = convertedBuffer.floatChannelData?[0] {
+            let sampleCount = Int(convertedBuffer.frameLength)
+            let disposition = audioChunkSource?.yield(
+                copying: UnsafeBufferPointer(start: channel, count: sampleCount),
+                sampleRate: Int(sampleRate)
+            )
+
+            if disposition == .dropped {
+                droppedAudioChunkCount = audioChunkSource?.droppedChunkCount ?? droppedAudioChunkCount
+                logOnce("audio-stream-overflow") {
+                    AppLogger.audio.error(
+                        "Live transcription buffer is full; dropping new audio chunks"
+                    )
+                }
+            }
         }
     }
 
@@ -651,6 +699,12 @@ class AudioRecorder: ObservableObject {
         // Stop and dispose the input unit
         teardownInputUnit()
 
+        // AudioOutputUnitStop synchronously quiesces the render callback, so no
+        // producer can race this terminal event or write after stream finish.
+        audioChunkSource?.finish()
+        droppedAudioChunkCount = audioChunkSource?.droppedChunkCount ?? droppedAudioChunkCount
+        audioChunkSource = nil
+
         // Close the audio file
         audioFile = nil
         converter = nil
@@ -680,6 +734,9 @@ class AudioRecorder: ObservableObject {
         levelUpdateTimer = nil
 
         teardownInputUnit()
+        audioChunkSource?.cancel()
+        droppedAudioChunkCount = audioChunkSource?.droppedChunkCount ?? droppedAudioChunkCount
+        audioChunkSource = nil
         audioFile = nil
         converter = nil
         converterInputFormat = nil
@@ -703,6 +760,8 @@ class AudioRecorder: ObservableObject {
         levelUpdateTimer = nil
 
         teardownInputUnit()
+        audioChunkSource?.cancel()
+        audioChunkSource = nil
 
         isRecording = false
         currentLevel = 0

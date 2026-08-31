@@ -1,30 +1,29 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.0
 import PackageDescription
 
 let package = Package(
-    name: "Overwhisper",
+    name: "LocalDictation",
     platforms: [
-        .macOS(.v14)
+        .macOS(.v15)
     ],
     products: [
-        .executable(name: "Overwhisper", targets: ["Overwhisper"])
+        .executable(name: "LocalDictation", targets: ["LocalDictation"]),
+        .executable(name: "local-dictation-benchmark", targets: ["LocalDictationBenchmark"])
     ],
     dependencies: [
-        .package(url: "https://github.com/argmaxinc/WhisperKit.git", from: "0.9.0"),
-        .package(url: "https://github.com/soffes/HotKey.git", from: "0.2.0"),
-        .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.5.0"),
-        .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.12.4"),
-        .package(url: "https://github.com/PostHog/posthog-ios.git", exact: "3.64.6")
+        .package(url: "https://github.com/argmaxinc/WhisperKit.git", exact: "0.15.0"),
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.14.3"),
+        .package(url: "https://github.com/groue/GRDB.swift.git", exact: "7.10.0"),
+        .package(url: "https://github.com/LebJe/TOMLKit.git", exact: "0.6.0")
     ],
     targets: [
         .executableTarget(
-            name: "Overwhisper",
+            name: "LocalDictation",
             dependencies: [
                 "WhisperKit",
-                "HotKey",
-                .product(name: "Sparkle", package: "Sparkle"),
                 .product(name: "FluidAudio", package: "FluidAudio"),
-                .product(name: "PostHog", package: "posthog-ios")
+                .product(name: "GRDB", package: "GRDB.swift"),
+                .product(name: "TOMLKit", package: "TOMLKit")
             ],
             path: "Overwhisper",
             exclude: [
@@ -35,10 +34,16 @@ let package = Package(
                 .process("Resources")
             ]
         ),
+        .executableTarget(
+            name: "LocalDictationBenchmark",
+            path: "Benchmark",
+            exclude: ["Fixtures", "Schemas", "README.md", "verify-fixtures.sh"]
+        ),
         .testTarget(
-            name: "OverwhisperTests",
-            dependencies: ["Overwhisper"],
+            name: "LocalDictationTests",
+            dependencies: ["LocalDictation"],
             path: "Tests/OverwhisperTests"
         )
-    ]
+    ],
+    swiftLanguageModes: [.v5]
 )

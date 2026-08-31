@@ -1,0 +1,14 @@
+Local Dictation
+===============
+
+Local Dictation was seeded from Overwhisper at audited commit:
+
+    b8ef86eb2fda65d7dcc68ab500fb371469c4d283
+    https://github.com/OverseedAI/overwhisper
+
+Overwhisper is Copyright (c) 2026 Hal Shin and licensed under the MIT License.
+Its attribution and license terms are preserved in LICENSE and this notice.
+
+Local Dictation removes Overwhisper's PostHog analytics, OpenAI audio
+transcription, Overseed service calls, Sparkle updater, and release machinery.
+The remaining application and new work are also licensed under MIT.

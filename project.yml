@@ -1,19 +1,19 @@
-name: Overwhisper
+name: LocalDictation
 options:
-  bundleIdPrefix: com.overseed
+  bundleIdPrefix: com.natemunk
   deploymentTarget:
-    macOS: "14.0"
-  xcodeVersion: "15.0"
+    macOS: "15.0"
+  xcodeVersion: "26.0"
   generateEmptyDirectories: true
   groupSortPosition: top
 
 settings:
   base:
-    MARKETING_VERSION: "1.9.2"
+    MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
     CODE_SIGN_STYLE: Automatic
     ARCHS: arm64
-    SWIFT_VERSION: "5.9"
+    SWIFT_VERSION: "5.0"
   configs:
     Debug:
       ONLY_ACTIVE_ARCH: YES
@@ -23,22 +23,19 @@ settings:
 packages:
   WhisperKit:
     url: https://github.com/argmaxinc/WhisperKit.git
-    from: "0.9.0"
-  HotKey:
-    url: https://github.com/soffes/HotKey.git
-    from: "0.2.0"
-  Sparkle:
-    url: https://github.com/sparkle-project/Sparkle.git
-    from: "2.6.0"
+    exactVersion: "0.15.0"
   FluidAudio:
     url: https://github.com/FluidInference/FluidAudio.git
-    from: "0.12.4"
-  PostHog:
-    url: https://github.com/PostHog/posthog-ios.git
-    exactVersion: "3.64.6"
+    exactVersion: "0.14.3"
+  GRDB:
+    url: https://github.com/groue/GRDB.swift.git
+    exactVersion: "7.10.0"
+  TOMLKit:
+    url: https://github.com/LebJe/TOMLKit.git
+    exactVersion: "0.6.0"
 
 targets:
-  Overwhisper:
+  LocalDictation:
     type: application
     platform: macOS
     sources:
@@ -48,7 +45,7 @@ targets:
           - "**/Info.plist"
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.overseed.overwhisper
+        PRODUCT_BUNDLE_IDENTIFIER: com.natemunk.LocalDictation
         INFOPLIST_FILE: Overwhisper/Info.plist
         CODE_SIGN_ENTITLEMENTS: Overwhisper/Overwhisper.entitlements
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
@@ -60,16 +57,15 @@ targets:
           CODE_SIGN_IDENTITY: "Apple Development"
     dependencies:
       - package: WhisperKit
-      - package: HotKey
-      - package: Sparkle
       - package: FluidAudio
-      - package: PostHog
+      - package: GRDB
+      - package: TOMLKit
 
 schemes:
-  Overwhisper:
+  LocalDictation:
     build:
       targets:
-        Overwhisper: all
+        LocalDictation: all
     run:
       config: Debug
     archive:

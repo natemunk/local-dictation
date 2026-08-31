@@ -2,58 +2,63 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
-    branches: [main]
 
 jobs:
-  site-analytics:
-    runs-on: ubuntu-latest
+  build-test-audit:
+    runs-on: macos-15
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Verify landing page keeps its analytics
+      - name: Report toolchain
+        run: uname -m && xcodebuild -version && swift --version
+
+      - name: Resolve pinned packages
+        run: swift package resolve
+
+      - name: Build app and benchmark CLI
+        run: swift build --product LocalDictation && swift build --product local-dictation-benchmark
+
+      - name: Run tests
+        run: swift test
+
+      - name: Verify benchmark fixtures
+        run: zsh Benchmark/verify-fixtures.sh
+
+      - name: Audit privacy invariants
+        run: zsh scripts/privacy-audit.sh
+
+      - name: Verify setup packaging
+        shell: zsh {0}
         run: |
-          grep -q '<script src="analytics.js"></script>' docs/index.html \
-            || { echo '::error file=docs/index.html::Landing page no longer loads analytics.js — a redesign dropped the PostHog hook (this killed analytics once before, see eb7f6ca).'; exit 1; }
-          grep -q "posthog.init('phc_" docs/analytics.js \
-            || { echo '::error file=docs/analytics.js::analytics.js no longer initializes PostHog.'; exit 1; }
-          grep -q "api_host: 'https://s.overseed.ai'" docs/analytics.js \
-            || { echo '::error file=docs/analytics.js::PostHog must use the first-party analytics proxy.'; exit 1; }
+          isolated_home=$(mktemp -d "$RUNNER_TEMP/local-dictation-home.XXXXXX")
+          HOME="$isolated_home" ./setup --no-launch --skip-tests
 
-  build:
-    runs-on: macos-14
+          app="$isolated_home/Applications/Local Dictation.app"
+          plist="$app/Contents/Info.plist"
+          binary="$app/Contents/MacOS/LocalDictation"
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+          [[ -d "$app" && -f "$plist" && -x "$binary" ]] || {
+            print -u2 "::error::setup did not create the expected application bundle"
+            exit 1
+          }
 
-      - name: Setup Xcode
-        uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: latest-stable
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$app"
 
-      - name: Build
-        run: |
-          xcodebuild -project Overwhisper.xcodeproj \
-            -scheme Overwhisper \
-            -configuration Debug \
-            -destination "platform=macOS,arch=arm64" \
-            CODE_SIGN_IDENTITY="-" \
-            CODE_SIGNING_REQUIRED=NO \
-            ARCHS=arm64 \
-            ONLY_ACTIVE_ARCH=YES \
-            build
+          bundle_id=$(/usr/bin/plutil -extract CFBundleIdentifier raw "$plist")
+          [[ "$bundle_id" == "com.natemunk.LocalDictation" ]] || {
+            print -u2 "::error::unexpected bundle identifier: $bundle_id"
+            exit 1
+          }
 
-      - name: Build Release (unsigned)
-        run: |
-          xcodebuild -project Overwhisper.xcodeproj \
-            -scheme Overwhisper \
-            -configuration Release \
-            -destination "platform=macOS,arch=arm64" \
-            CODE_SIGN_IDENTITY="-" \
-            CODE_SIGNING_REQUIRED=NO \
-            ARCHS=arm64 \
-            ONLY_ACTIVE_ARCH=YES \
-            build
+          minimum_os=$(/usr/bin/plutil -extract LSMinimumSystemVersion raw "$plist")
+          [[ "$minimum_os" == "15.0" ]] || {
+            print -u2 "::error::unexpected minimum macOS version: $minimum_os"
+            exit 1
+          }
+
+          architectures=$(/usr/bin/lipo -archs "$binary")
+          [[ "$architectures" == "arm64" ]] || {
+            print -u2 "::error::expected an arm64-only executable, found: $architectures"
+            exit 1
+          }

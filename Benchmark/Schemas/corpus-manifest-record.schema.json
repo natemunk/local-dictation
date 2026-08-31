@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local-dictation.invalid/schemas/corpus-manifest-record.schema.json",
+  "title": "Local Dictation corpus manifest JSONL record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "audio_path",
+    "category",
+    "device",
+    "noise",
+    "duration_seconds",
+    "reference",
+    "protected_tokens",
+    "provenance"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "audio_path": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Path to a fresh opt-in or synthetic WAV. The scorer does not open it."
+    },
+    "category": {
+      "type": "string",
+      "enum": [
+        "technical-vocabulary",
+        "correction",
+        "enumeration",
+        "command",
+        "short-dictation",
+        "two-minute",
+        "noise",
+        "device-change"
+      ]
+    },
+    "device": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Non-identifying input-device class or stable lab label; never a hardware serial number."
+    },
+    "noise": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Controlled condition such as quiet, office, fan, music, outdoor, or synthetic."
+    },
+    "duration_seconds": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "reference": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Verbatim ASR reference, before cleanup."
+    },
+    "protected_tokens": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "provenance": {
+      "type": "string",
+      "enum": ["synthetic", "fresh-opt-in"]
+    },
+    "notes": {
+      "type": "string"
+    }
+  }
+}

@@ -1,83 +1,90 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file gives coding agents repository-specific guidance for Local Dictation.
 
-## Build Commands
+## Identity and provenance
 
-This repo is SwiftPM-first. The canonical build path is plain `swift build`; the `.xcodeproj` is generated convenience output from `project.yml` via XcodeGen.
+- The product, Swift package, executable, and app bundle are **Local Dictation**.
+- The `Overwhisper/` source directory remains for seed-history continuity; it is
+  not the current product name.
+- Local Dictation was seeded from MIT-licensed Overwhisper commit
+  `b8ef86eb2fda65d7dcc68ab500fb371469c4d283`. Preserve the attribution in
+  `NOTICE` and `LICENSE`.
+- This is an active v1 implementation. A successful source build is not proof
+  that engine selection, latency, accuracy, permissions, or cutover gates have
+  passed.
 
-```bash
-swift build                    # Debug build
-swift build -c release         # Release build
-swift run Overwhisper          # Run debug build
+## Build and validation
+
+SwiftPM is the primary project definition. `Package.swift` is canonical for
+targets and dependencies; `project.yml` is optional XcodeGen input. Do not
+restore or hand-edit a checked-in generated `.xcodeproj`. Open `Package.swift`
+in Xcode when an IDE is needed.
+
+```sh
+just build
+just test
+just privacy-audit
+just benchmark-fixtures
 ```
 
-When running inside Codex or another Seatbelt sandbox, SwiftPM can fail because it tries to spawn its own nested sandbox and write caches under `~/Library/Caches/org.swift.swiftpm`. Use:
+The `Justfile` accepts `LOCAL_DICTATION_SWIFT=/absolute/path/to/swift` when
+the active `xcrun` shim is broken. It also uses a repository-local SwiftPM
+cache and disables SwiftPM's nested sandbox for agent environments.
 
-```bash
-swift build --disable-sandbox --cache-path .swiftpm-cache
+For the documented end-to-end source install, run:
+
+```sh
+./setup
+# or, when launch is not wanted:
+./setup --no-launch
 ```
 
-Prefer that over `xcodebuild -project ...` unless the task is specifically about the generated Xcode project. FSEvents/CoreSimulator warnings from Xcode are usually noise; the actionable SwiftPM failures are the nested sandbox/cache permission errors.
+`setup` resolves pinned dependencies, runs tests unless explicitly skipped,
+builds the `LocalDictation` product, creates an ad-hoc-signed
+`Local Dictation.app`, and installs it in `~/Applications`. Treat that
+installation as a user-visible side effect.
 
-Or use the Justfile:
-```bash
-just build                     # Debug build
-just run                       # Run app
-just bundle                    # Create .app bundle
-```
+## Privacy boundary
 
-For Xcode: `open Package.swift` or `open Overwhisper.xcodeproj`
+- Speech audio stays on the Mac and ASR uses the local FluidAudio or WhisperKit
+  paths. There is no cloud speech engine.
+- The app has no telemetry SDK, Overseed service integration, Sparkle updater,
+  or automatic update check.
+- Optional cleanup may call Apple Foundation Models locally or an explicitly
+  configured OpenAI-compatible **text** endpoint. It must never send audio,
+  destination-app context, browser location, focused-field contents, clipboard
+  contents, or history.
+- Non-loopback cleanup endpoints require explicit remote opt-in.
+- `scripts/privacy-audit.sh` is a source audit, not proof of runtime network
+  behavior.
 
-## Releasing
-
-When asked to "push to prod", "bump a release", or similar:
-
-1. **Check changes since last release**:
-   ```bash
-   git describe --tags --abbrev=0   # Get last tag
-   git log --oneline $(git describe --tags --abbrev=0)..HEAD
-   ```
-
-2. **Decide version bump type** (semver: MAJOR.MINOR.PATCH):
-   - **PATCH** (1.0.x): Bug fixes, minor tweaks, no new features
-   - **MINOR** (1.x.0): New features, significant improvements, non-breaking changes
-
-3. **Run the release script**:
-   ```bash
-   ./scripts/bump-version.sh X.Y.Z   # Updates version, commits, tags, pushes
-   ```
-
-This triggers the GitHub Actions workflow to build, notarize, and release a DMG.
+The normative privacy contract is `docs/privacy-invariants.md`.
 
 ## Architecture
 
-**Menu bar app** - No dock icon, lives in the menu bar. Entry point is `AppDelegate` which coordinates all components.
+Local Dictation is a menu-bar app. The main flow is:
 
-### Core Flow
-1. **HotkeyManager** detects global hotkey press → notifies AppDelegate
-2. **AppDelegate** starts **AudioRecorder** (AVAudioEngine-based, 16kHz mono WAV)
-3. **OverlayWindow** shows recording indicator with waveform
-4. On stop, audio file passed to **TranscriptionEngine** (WhisperKit local or OpenAI cloud)
-5. **TextInserter** pastes result at cursor via clipboard + synthetic Cmd+V
+1. `HotkeyManager` observes Hyper+D and the typing safety interlock.
+2. `DictationCoordinator` owns the tap/hold and session state machine.
+3. `AudioRecorder` captures microphone input through an input-only AUHAL path.
+4. Local transcription produces finalized and volatile text without
+   concatenating revisable partials.
+5. The cleanup pipeline applies the selected profile and privacy policy.
+6. Preview or `TextInserter` delivers the accepted text to the captured
+   destination.
 
-### Key Components
+Configuration, profiles, history, and benchmark contracts live in their
+corresponding source directories and checked-in docs. Keep source behavior,
+tests, requirements, and acceptance status distinct.
 
-- **AppState** (`App/AppState.swift`): Observable state for all settings, persisted via `@AppStorage`
-- **AudioRecorder** (`Audio/AudioRecorder.swift`): Handles mic input, device selection, format conversion
-- **ModelManager** (`Transcription/ModelManager.swift`): Downloads/deletes WhisperKit models, scans multiple cache locations
-- **TranscriptionEngine** protocol with two implementations: `WhisperKitEngine` (local) and `OpenAIEngine` (cloud)
+## Release status
 
-### UI
-- **OverlayWindow**: Floating NSPanel that appears during recording
-- **SettingsView**: SwiftUI settings with tabs (General, Transcription, Output, Debug)
+The repository currently documents a source-build workflow only. It has no
+Sparkle appcast, notarized-DMG workflow, or automatic release script. Do not
+commit, tag, push, publish, sign for distribution, or claim a downloadable
+release without an explicit release plan and authorization.
 
-## Key Learnings
-
-**AVAudioEngine device handling**: Don't call `AudioUnitSetProperty` to set the system default device - AVAudioEngine already handles this. Only set explicitly for user-selected non-default devices. See `LEARNINGS.md`.
-
-## Dependencies
-
-- **WhisperKit**: Local on-device transcription (Apple Silicon optimized)
-- **HotKey**: Global keyboard shortcut handling
-- **Sparkle**: Auto-updates
+When versioning is eventually authorized, keep the version sources used by
+`project.yml` and `setup` aligned and review the resulting diff before any
+Git operation.

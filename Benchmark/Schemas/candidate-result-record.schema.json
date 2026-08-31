@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local-dictation.invalid/schemas/candidate-result-record.schema.json",
+  "title": "Local Dictation candidate result JSONL record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "sample_id",
+    "candidate",
+    "status",
+    "content_loss",
+    "latency_failure"
+  ],
+  "properties": {
+    "sample_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "candidate": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "transcript": {
+      "type": ["string", "null"]
+    },
+    "processing_seconds": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "description": "Wall-clock processing time used for RTF."
+    },
+    "latency_ms": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "description": "Audio-end to final-transcript latency for percentile reporting."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["ok", "crash", "error"]
+    },
+    "content_loss": {
+      "type": "boolean",
+      "description": "True when the run lost or truncated material, especially a long-session prefix/suffix."
+    },
+    "latency_failure": {
+      "type": "boolean",
+      "description": "True when run instrumentation observed a latency failure not expressible by aggregate thresholds."
+    },
+    "error": {
+      "type": ["string", "null"]
+    }
+  }
+}

@@ -22,7 +22,7 @@ class ModelManager: ObservableObject {
 
         // Set up models directory in Application Support
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        self.modelsDirectory = appSupport.appendingPathComponent("Overwhisper/Models", isDirectory: true)
+        self.modelsDirectory = appSupport.appendingPathComponent("LocalDictation/Models", isDirectory: true)
 
         // For dev builds, use .models/ in the working directory (repo root)
         if Self.isDevBuild {
@@ -200,7 +200,6 @@ class ModelManager: ObservableObject {
             appState.isDownloadingModel = false
             appState.currentlyDownloadingModel = nil
             appState.modelDownloadProgress = 1.0
-            UsageAnalytics.trackModelDownload(engine: .whisperKit, model: modelName, succeeded: true)
 
         } catch {
             appState.isDownloadingModel = false
@@ -210,7 +209,6 @@ class ModelManager: ObservableObject {
             } else {
                 appState.lastError = "Failed to download model: \(error.localizedDescription)"
             }
-            UsageAnalytics.trackModelDownload(engine: .whisperKit, model: modelName, succeeded: false)
             throw error
         }
     }
@@ -219,23 +217,17 @@ class ModelManager: ObservableObject {
         let fileManager = FileManager.default
         var deleted = false
 
-        // Check all possible locations where the model might be stored
-        // Must match the same paths as scanForModels()
-        let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let homeDir = fileManager.homeDirectoryForCurrentUser
-
-        let searchPaths = [
-            // MacWhisper's model directory
-            appSupport.appendingPathComponent("MacWhisper/models/whisperkit/models/argmaxinc/whisperkit-coreml"),
-            // SuperWhisper's model directory
-            appSupport.appendingPathComponent("superwhisper/models/argmaxinc/whisperkit-coreml"),
-            // Huggingface in Documents
-            homeDir.appendingPathComponent("Documents/huggingface/models/argmaxinc/whisperkit-coreml"),
-            // Standard huggingface cache in Application Support
-            appSupport.appendingPathComponent("huggingface/models/argmaxinc/whisperkit-coreml"),
-            // Our custom directory
-            modelsDirectory
-        ]
+        // Deletion is deliberately restricted to Local Dictation-owned paths.
+        // Read-only discovery may reuse a compatible model cache, but this app
+        // never removes another application's model files.
+        var searchPaths = [modelsDirectory]
+        if let devDownloadBase {
+            searchPaths.append(
+                devDownloadBase.appendingPathComponent(
+                    "models/argmaxinc/whisperkit-coreml"
+                )
+            )
+        }
 
         // Search direct paths for model folders (with potential version suffixes)
         for basePath in searchPaths {
@@ -251,25 +243,7 @@ class ModelManager: ObservableObject {
                    name == modelName {
                     try fileManager.removeItem(at: url)
                     deleted = true
-                    AppLogger.transcription.info("Deleted model at: \(url.path)")
-                }
-            }
-        }
-
-        // Also check huggingface hub cache structure
-        let hubCachePath = homeDir.appendingPathComponent(".cache/huggingface/hub/models--argmaxinc--whisperkit-coreml/snapshots")
-        if let snapshots = try? fileManager.contentsOfDirectory(at: hubCachePath, includingPropertiesForKeys: nil) {
-            for snapshot in snapshots where snapshot.hasDirectoryPath {
-                if let modelDirs = try? fileManager.contentsOfDirectory(at: snapshot, includingPropertiesForKeys: nil) {
-                    for modelDir in modelDirs where modelDir.hasDirectoryPath {
-                        let name = modelDir.lastPathComponent
-                        if name == "openai_whisper-\(modelName)" ||
-                           name.hasPrefix("openai_whisper-\(modelName)-v") {
-                            try fileManager.removeItem(at: modelDir)
-                            deleted = true
-                            AppLogger.transcription.info("Deleted model at: \(modelDir.path)")
-                        }
-                    }
+                    AppLogger.transcription.info("Deleted Local Dictation model: \(modelName)")
                 }
             }
         }

@@ -14,7 +14,6 @@ struct TranscriptionDebugSession: Codable, Identifiable, Equatable {
   let latencySeconds: Double
   let language: String?
   let errorMessage: String?
-  let usedCloudFallback: Bool
 
   var success: Bool { errorMessage == nil }
 }
@@ -23,7 +22,7 @@ struct TranscriptionDebugSession: Codable, Identifiable, Equatable {
 final class DebugSessionStore: ObservableObject {
   @Published private(set) var sessions: [TranscriptionDebugSession] = []
 
-  private let maxSessions = 30
+  private let maxSessions = 10
   private let metadataFileName = "sessions.json"
   private let audioDirectoryName = "audio"
 
@@ -36,7 +35,7 @@ final class DebugSessionStore: ObservableObject {
   var rootDirectory: URL {
     let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
       .first!
-    let bundleId = Bundle.main.bundleIdentifier ?? "com.overseed.overwhisper"
+    let bundleId = Bundle.main.bundleIdentifier ?? "com.natemunk.LocalDictation"
     return support.appendingPathComponent(bundleId).appendingPathComponent("DebugSessions")
   }
 
@@ -68,8 +67,7 @@ final class DebugSessionStore: ObservableObject {
     transcribedText: String,
     latencySeconds: Double,
     language: String?,
-    errorMessage: String?,
-    usedCloudFallback: Bool
+    errorMessage: String?
   ) -> TranscriptionDebugSession {
     let id = UUID()
     ensureDirectories()
@@ -106,8 +104,7 @@ final class DebugSessionStore: ObservableObject {
       transcribedText: transcribedText,
       latencySeconds: latencySeconds,
       language: language,
-      errorMessage: errorMessage,
-      usedCloudFallback: usedCloudFallback
+      errorMessage: errorMessage
     )
 
     sessions.insert(session, at: 0)
@@ -116,7 +113,7 @@ final class DebugSessionStore: ObservableObject {
     return session
   }
 
-  /// Updates an existing session (e.g., when cloud fallback succeeds after a local failure).
+  /// Updates metadata for an existing retained local recording.
   func update(_ session: TranscriptionDebugSession) {
     guard let idx = sessions.firstIndex(where: { $0.id == session.id }) else { return }
     sessions[idx] = session

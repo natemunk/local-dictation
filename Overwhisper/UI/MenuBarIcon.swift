@@ -31,7 +31,7 @@ enum MenuBarIcon {
     }
 
     /// Draws bars centered vertically in the rect
-    private static func drawBarsCentered(in rect: NSRect, heights: [CGFloat], barWidth: CGFloat = 2, spacing: CGFloat = 1.5, maxHeight: CGFloat? = nil) {
+    private static func drawBarsCentered(in rect: NSRect, heights: [CGFloat], barWidth: CGFloat = 1.5, spacing: CGFloat = 0.75, maxHeight: CGFloat? = nil) {
         let barCount = heights.count
         let totalWidth = CGFloat(barCount) * barWidth + CGFloat(barCount - 1) * spacing
         let startX = (rect.width - totalWidth) / 2
@@ -71,6 +71,16 @@ enum MenuBarIcon {
 
     /// Creates the menubar icon image - idle state
     static func create(size: CGFloat = 18) -> NSImage {
+        if let image = NSImage(
+            systemSymbolName: "waveform",
+            accessibilityDescription: "Local Dictation"
+        ) {
+            let configuration = NSImage.SymbolConfiguration(pointSize: size, weight: .medium)
+            let configured = image.withSymbolConfiguration(configuration) ?? image
+            configured.isTemplate = true
+            return configured
+        }
+
         let image = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
             drawBarsCentered(in: rect, heights: idleHeights)
             drawDevBadgeIfNeeded(in: rect)

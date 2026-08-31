@@ -2,7 +2,7 @@ import Foundation
 import os
 
 enum AppLogger {
-    static let subsystem = Bundle.main.bundleIdentifier ?? "com.overseed.overwhisper"
+    static let subsystem = Bundle.main.bundleIdentifier ?? "com.natemunk.LocalDictation"
 
     static let app = Logger(subsystem: subsystem, category: "app")
     static let audio = Logger(subsystem: subsystem, category: "audio")

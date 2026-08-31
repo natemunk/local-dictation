@@ -42,7 +42,10 @@ class OverlayWindow: NSPanel {
     }
 
     func show(position: OverlayPosition) {
-        guard let screen = NSScreen.main else { return }
+        let pointer = NSEvent.mouseLocation
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(pointer) })
+            ?? NSScreen.main
+        else { return }
 
         let screenFrame = screen.visibleFrame
         let windowSize = self.frame.size
@@ -87,7 +90,7 @@ class OverlayWindow: NSPanel {
 
         // Animate in
         self.alphaValue = 0
-        self.makeKeyAndOrderFront(nil)
+        self.orderFrontRegardless()
 
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.2

@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local-dictation.invalid/schemas/cleanup-pair-record.schema.json",
+  "title": "Local Dictation cleanup pair JSONL record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "category",
+    "mode",
+    "raw",
+    "ideal",
+    "protected_tokens",
+    "provenance"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "category": {
+      "type": "string",
+      "enum": [
+        "filler",
+        "correction",
+        "new-line",
+        "new-paragraph",
+        "bullet-list",
+        "protected-token",
+        "unrecognized-command",
+        "literal"
+      ]
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["clean", "literal"]
+    },
+    "raw": {
+      "type": "string"
+    },
+    "ideal": {
+      "type": "string"
+    },
+    "protected_tokens": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "provenance": {
+      "type": "string",
+      "enum": ["synthetic", "fresh-opt-in"]
+    },
+    "expected_validation": {
+      "type": "string",
+      "enum": ["accept", "reject"]
+    },
+    "notes": {
+      "type": "string"
+    }
+  }
+}

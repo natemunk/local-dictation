@@ -1,0 +1,68 @@
+# Local Dictation privacy invariants
+
+Status: normative v1 constraints. Unless a row cites completed evidence, it is a requirement to verify rather than a claim about the running app.
+
+## Trust boundary
+
+Local Dictation may handle microphone audio, transcript text, focused-application metadata, clipboard contents, local configuration, and local history. The default trust boundary is the user's Mac. Crossing that boundary is allowed only for an explicitly configured text refiner under the policy below.
+
+| ID | Invariant | Required failure behavior | Current evidence |
+|---|---|---|---|
+| PRV-001 | Speech audio never leaves the Mac. Cloud speech-to-text is absent, not merely disabled. | Refuse any ASR path that requires upload. | Cloud ASR source and dependency removal passes the static privacy audit; live network capture is pending. |
+| PRV-002 | Telemetry, Overseed service calls, and automatic update checks are absent. | Build/release fails if a prohibited dependency or endpoint returns. | `Package.swift` and the source tree pass the prohibited-integration audit; runtime network behavior is still unverified. |
+| PRV-003 | One temporary session WAV may exist only for active local ASR. | Delete after ASR or cancellation; delete crash orphans on next launch. | Lifecycle and orphan cleanup are source-observed; cancellation/crash file-system exercise is pending. |
+| PRV-004 | Audio retention defaults off. Debug retention requires an explicit toggle and keeps at most the latest 10 recordings. | Refuse silent retention and provide a dedicated delete-retained-audio action. | Configuration default, explicit UI, cap, and delete action are source-observed; real file-system exercise is pending. |
+| PRV-005 | Existing Raycast recordings are never imported or inspected without recording-specific opt-in. | Exclude them from corpus and app workflows. | Repository benchmark fixtures are synthetic and contain no audio files. |
+| PRV-006 | A model-backed cleanup request contains transcript tokens and static cleanup rules only. It never contains audio, destination app, bundle ID, browser hostname/path, focused-field data, surrounding text, clipboard data, or history. | Reject request construction before transmission. | Apple and OpenAI-compatible request-boundary contract tests pass. Live request capture remains pending. |
+| PRV-007 | Only loopback OpenAI-compatible endpoints count as local. Non-loopback hosts require `allow_remote = true`. | Reject the request and use deterministic cleanup when opt-in is absent. | Automated endpoint-policy tests pass, including non-loopback HTTPS and opt-in requirements. |
+| PRV-008 | A configured non-loopback refiner displays a persistent Remote badge while active. | Do not hide or downgrade the indicator. | Badge state and UI are source-observed; runtime UI verification remains pending. |
+| PRV-009 | API keys live in Keychain and never appear in TOML, history, logs, benchmark data, or diagnostics. | Omit/redact and fail closed if secure storage is unavailable. | Keychain storage and static source audit are present; end-to-end artifact/log verification is pending. |
+| PRV-010 | Browser profile access is opt-in and requests Apple Events Automation just in time per browser. | Permission denial falls back to generic browser behavior and does not repeatedly prompt. | Automated adapter contracts verify opt-in, persisted denial, and unsupported-browser fallback; real system permission prompts remain manual. |
+| PRV-011 | Browser URLs are reduced to hostname inside the adapter. Paths, queries, and fragments never escape the adapter. | Drop the browser-specific context if reduction fails. | Automated adapter tests verify immediate reduction and hostname allowlisting. |
+| PRV-012 | Browser hostname and page information are never logged, stored in history, or sent to a refiner. | Discard before logging/storage/request assembly. | Automated adapter, history-schema, and request-body contracts pass; live capture remains pending. |
+| PRV-013 | Raw and delivered transcript history is local SQLite data with 90-day successful-entry retention by default. | Purge expired rows; delete-entry and delete-all are complete and local. | GRDB migrations, FTS5 search, configurable retention, and deletion tests pass. |
+| PRV-014 | Raw transcript is saved immediately after ASR, before optional cleanup or insertion, so a later failure cannot erase captured text. | Keep local raw history and surface recovery. | Source ordering and raw-recovery/history tests are present; process-crash injection remains pending. |
+| PRV-015 | Clipboard insertion snapshots every representation and restores it only if the user has not copied something else. | Preserve the newer user clipboard; on paste failure keep the transcript available. | macOS pasteboard tests verify full-representation restoration, pre-paste cancellation, paste failure, and concurrent user clipboard changes; cross-app rich-text integration remains pending. |
+| PRV-016 | Idle means no microphone capture, ASR inference, refiner polling, telemetry, or sustained outbound traffic. Models may remain loaded. | Stop the offending work and surface a diagnostic. | Idle CPU/network measurements remain unbenchmarked. |
+| PRV-017 | Logs and crash diagnostics exclude audio, transcript bodies, clipboard contents, URLs/hostnames, API keys, and focused-field content. | Redact or omit the event. | Custom transcript-bearing crash capture was removed and the static privacy scan passes; runtime unified-log review remains pending. |
+| PRV-018 | Corpus metadata uses non-identifying device classes/labels and provenance `synthetic` or `fresh-opt-in`; hardware serials and account identity are excluded. | Reject invalid manifest records. | The benchmark CLI enforces provenance and non-empty device metadata; schemas prohibit undeclared fields. |
+
+## Permitted local data flow
+
+```text
+microphone
+  → in-memory 16 kHz mono stream
+  → temporary local WAV
+  → local ASR
+  → raw local history
+  → deterministic cleanup
+  → optional text-only refiner
+  → validated local text
+  → clipboard/paste or preview
+```
+
+The optional refiner is the only approved network-capable runtime stage. It receives no ambient app context. On a fresh install the app does not initialize or download a speech model until the user chooses **Finish Setup & Download Local Model**; later model changes are also explicit settings actions. Model downloads must not be confused with transcription or cleanup traffic.
+
+## Benchmark and corpus rules
+
+- [Benchmark/Fixtures](../Benchmark/Fixtures) contains synthetic text/metadata only. Its `audio_path` values explicitly point to non-included files.
+- A real benchmark corpus must be newly recorded with opt-in and stored outside source control unless a separate, explicit publication decision is made.
+- References are verbatim ASR targets. Cleanup ideals belong in a separate cleanup-pairs JSONL file so polished text cannot leak into WER ground truth.
+- Result `error` text must be sanitized before it is committed or shared.
+- Reports may contain reference and hypothesis-derived metrics but should not contain audio or user identity. The current report emits scores and sample IDs, not transcript bodies.
+
+## Remote cleanup consent
+
+The following conditions are all mandatory before a non-loopback cleanup call:
+
+1. The user explicitly configured the endpoint.
+2. `allow_remote = true` is present in effective configuration.
+3. The UI shows the persistent Remote badge.
+4. Request construction has passed a privacy contract test.
+5. Timeout or invalid response falls back locally without retrying another remote host.
+
+There is no implicit cloud fallback.
+
+## Verification rule
+
+Source configuration, a unit test, a successful build, and a live runtime observation are distinct evidence. Privacy acceptance requires both source review and runtime network/file-system inspection. No current document may describe a privacy invariant as runtime-verified until that evidence is attached in [acceptance-matrix.md](acceptance-matrix.md).

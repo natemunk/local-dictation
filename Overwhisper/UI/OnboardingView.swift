@@ -1,271 +1,141 @@
-import SwiftUI
 import AVFoundation
 import AppKit
+import SwiftUI
 
 struct OnboardingView: View {
-    @EnvironmentObject var appState: AppState
-
-    let openAppSettings: () -> Void
-    let finishOnboarding: () -> Void
-
-    @State private var stepIndex: Int = 0
-    @State private var microphoneStatus: AVAuthorizationStatus = .notDetermined
-    @State private var accessibilityGranted: Bool = false
-
-    private let totalSteps = 3
+    @ObservedObject var appState: AppState
+    let onComplete: () -> Void
+    @State private var microphoneGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+    @State private var accessibilityGranted = AXIsProcessTrusted()
+    @State private var inputMonitoringGranted = CGPreflightListenEventAccess()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text(stepTitle)
-                .font(.system(size: 22, weight: .semibold))
-
-            stepContent
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-            Spacer(minLength: 12)
-
-            HStack {
-                if stepIndex > 0 {
-                    Button("Back") {
-                        stepIndex = max(stepIndex - 1, 0)
-                    }
-                }
-
-                Spacer()
-
-                if stepIndex < totalSteps - 1 {
-                    Button("Continue") {
-                        stepIndex = min(stepIndex + 1, totalSteps - 1)
-                    }
-                    .keyboardShortcut(.defaultAction)
-                } else {
-                    Button("Finish") {
-                        finishOnboarding()
-                    }
-                    .keyboardShortcut(.defaultAction)
-                }
-            }
-        }
-        .padding(24)
-        .frame(width: 520, height: 460)
-        .onAppear {
-            refreshPermissions()
-        }
-    }
-
-    private var stepTitle: String {
-        switch stepIndex {
-        case 0: return "Welcome to Overwhisper"
-        case 1: return "Grant Permissions"
-        case 2: return "Final Setup"
-        default: return "Welcome"
-        }
-    }
-
-    @ViewBuilder
-    private var stepContent: some View {
-        switch stepIndex {
-        case 0:
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Let’s get you ready to record and transcribe fast.")
+        VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Local Dictation")
+                    .font(.largeTitle.bold())
+                Text("Fast local speech-to-text anywhere on your Mac")
                     .font(.title3)
-                Text("We’ll check permissions and confirm your recording preferences.")
-                    .foregroundColor(.secondary)
-
-                Divider().padding(.vertical, 8)
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Label("Record from any microphone", systemImage: "mic.fill")
-                    Label("Instant transcription with Whisper", systemImage: "waveform")
-                    Label("Hotkey-driven workflow", systemImage: "keyboard")
-                }
-                .font(.subheadline)
+                    .foregroundStyle(.secondary)
             }
-        case 1:
-            VStack(alignment: .leading, spacing: 16) {
-                PermissionRow(
-                    title: "Microphone",
-                    subtitle: "Required to capture audio",
-                    status: microphoneStatusText,
-                    statusColor: microphoneStatusColor,
-                    actionTitle: microphoneActionTitle,
-                    action: handleMicrophoneAction
-                )
 
-                PermissionRow(
-                    title: "Accessibility",
-                    subtitle: "Required to paste text into other apps",
-                    status: accessibilityStatusText,
-                    statusColor: accessibilityStatusColor,
-                    actionTitle: accessibilityActionTitle,
-                    action: handleAccessibilityAction
-                )
-
-                if microphoneStatus == .denied || !accessibilityGranted {
-                    Text("If permissions are denied, use the action buttons to open System Settings.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+            GroupBox {
+                VStack(alignment: .leading, spacing: 12) {
+                    permissionRow(
+                        title: "Microphone",
+                        detail: "Records a temporary 16 kHz mono WAV for local ASR.",
+                        granted: microphoneGranted,
+                        action: requestMicrophone
+                    )
+                    Divider()
+                    permissionRow(
+                        title: "Input Monitoring",
+                        detail: "Recognizes Hyper+D and safely owns Enter/Escape during a session.",
+                        granted: inputMonitoringGranted,
+                        action: requestInputMonitoring
+                    )
+                    Divider()
+                    permissionRow(
+                        title: "Accessibility",
+                        detail: "Pastes with Command+V without taking focus from your destination.",
+                        granted: accessibilityGranted,
+                        action: requestAccessibility
+                    )
                 }
+                .padding(4)
             }
-        case 2:
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Choose your preferred recording mode.")
-                Picker("Recording Mode", selection: $appState.recordingMode) {
-                    ForEach(RecordingMode.allCases) { mode in
-                        Text(mode.rawValue).tag(mode)
-                    }
-                }
-                .pickerStyle(.radioGroup)
 
-                Divider().padding(.vertical, 8)
-
-                Toggle("Share anonymous usage analytics", isOn: $appState.analyticsEnabled)
-                Text("Sends app usage, basic app/device/OS information, model choices, and dictation outcomes through Overseed's PostHog proxy. Never sends audio, transcribed text, API keys, filenames, other app names, or raw errors.")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-
-                Text("You can fine-tune models, hotkeys, and output behavior in Settings.")
-                    .foregroundColor(.secondary)
-
-                HStack {
-                    Button("Open Settings") {
-                        openAppSettings()
-                    }
-                    Spacer()
-                    Button("Skip for now") {
-                        finishOnboarding()
-                    }
-                }
-            }
-        default:
-            EmptyView()
-        }
-    }
-
-    private var microphoneStatusText: String {
-        switch microphoneStatus {
-        case .authorized: return "Granted"
-        case .denied: return "Denied"
-        case .restricted: return "Restricted"
-        case .notDetermined: return "Not requested"
-        @unknown default: return "Unknown"
-        }
-    }
-
-    private var microphoneStatusColor: Color {
-        switch microphoneStatus {
-        case .authorized: return .green
-        case .denied, .restricted: return .red
-        case .notDetermined: return .secondary
-        @unknown default: return .secondary
-        }
-    }
-
-    private var microphoneActionTitle: String {
-        switch microphoneStatus {
-        case .authorized: return "Granted"
-        case .denied, .restricted: return "Open Settings"
-        case .notDetermined: return "Request Access"
-        @unknown default: return "Request"
-        }
-    }
-
-    private func handleMicrophoneAction() {
-        switch microphoneStatus {
-        case .authorized:
-            break
-        case .denied, .restricted:
-            openSystemSettings(for: "Microphone")
-        case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .audio) { _ in
-                Task { @MainActor in
-                    refreshPermissions()
-                }
-            }
-        @unknown default:
-            break
-        }
-    }
-
-    private var accessibilityStatusText: String {
-        accessibilityGranted ? "Granted" : "Not granted"
-    }
-
-    private var accessibilityStatusColor: Color {
-        accessibilityGranted ? .green : .red
-    }
-
-    private var accessibilityActionTitle: String {
-        accessibilityGranted ? "Granted" : "Open Settings"
-    }
-
-    private func handleAccessibilityAction() {
-        if accessibilityGranted {
-            return
-        }
-
-        let requested = TextInserter.requestAccessibilityPermission()
-        if !requested {
-            openSystemSettings(for: "Accessibility")
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            refreshPermissions()
-        }
-    }
-
-    private func refreshPermissions() {
-        microphoneStatus = AVCaptureDevice.authorizationStatus(for: .audio)
-        accessibilityGranted = TextInserter.hasAccessibilityPermission()
-    }
-
-    private func openSystemSettings(for privacyPane: String) {
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_\(privacyPane)") {
-            NSWorkspace.shared.open(url)
-        }
-    }
-}
-
-struct PermissionRow: View {
-    let title: String
-    let subtitle: String
-    let status: String
-    let statusColor: Color
-    let actionTitle: String
-    let action: () -> Void
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(title)
-                    .font(.headline)
-                Text(subtitle)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
+            Label("Audio always stays local", systemImage: "lock.shield.fill")
+                .foregroundStyle(.green)
+            Text("Finishing setup downloads the selected speech model directly to this Mac. No model is downloaded until you choose the button below; transcription then runs locally.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("Browser Automation is optional and is requested later only if you enable hostname profiles. It is not needed for first dictation.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
             Spacer()
 
-            Text(status)
-                .font(.caption)
-                .foregroundColor(statusColor)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(statusColor.opacity(0.1))
-                .cornerRadius(6)
-
-            Button(actionTitle) {
-                action()
+            if appState.isInitializingEngine || appState.isDownloadingModel {
+                HStack(spacing: 10) {
+                    ProgressView()
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Preparing the local speech model…")
+                            .fontWeight(.semibold)
+                        if let model = appState.currentlyDownloadingModel, !model.isEmpty {
+                            Text(model)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            } else if let error = appState.lastError, !error.isEmpty {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
             }
-            .disabled(actionTitle == "Granted")
-        }
-        .padding(12)
-        .background(Color.secondary.opacity(0.08))
-        .cornerRadius(10)
-    }
-}
 
-#Preview {
-    let appState = AppState()
-    return OnboardingView(openAppSettings: {}, finishOnboarding: {})
-        .environmentObject(appState)
+            HStack {
+                Text("Shortcut: Hyper+D")
+                    .font(.system(.body, design: .monospaced).weight(.semibold))
+                Spacer()
+                Button("Finish Setup & Download Local Model") {
+                    appState.hasCompletedOnboarding = true
+                    onComplete()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!microphoneGranted || appState.isInitializingEngine || appState.isDownloadingModel)
+            }
+        }
+        .padding(28)
+        .frame(width: 600, height: 500)
+    }
+
+    @ViewBuilder
+    private func permissionRow(
+        title: String,
+        detail: String,
+        granted: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: granted ? "checkmark.circle.fill" : "circle")
+                .foregroundStyle(granted ? .green : .secondary)
+                .font(.title3)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).fontWeight(.semibold)
+                Text(detail).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if !granted { Button("Allow", action: action) }
+        }
+    }
+
+    private func requestMicrophone() {
+        Task {
+            microphoneGranted = await AVCaptureDevice.requestAccess(for: .audio)
+        }
+    }
+
+    private func requestInputMonitoring() {
+        inputMonitoringGranted = CGRequestListenEventAccess()
+        if !inputMonitoringGranted {
+            openPrivacyPane("Privacy_ListenEvent")
+        }
+    }
+
+    private func requestAccessibility() {
+        accessibilityGranted = TextInserter.requestAccessibilityPermission()
+        if !accessibilityGranted {
+            openPrivacyPane("Privacy_Accessibility")
+        }
+    }
+
+    private func openPrivacyPane(_ anchor: String) {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)"
+        ) else { return }
+        NSWorkspace.shared.open(url)
+    }
 }

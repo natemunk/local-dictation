@@ -40,8 +40,8 @@ actor WhisperKitEngine: TranscriptionEngine {
         let cachedModelFolder = await modelManager.findModelFolder(for: modelName)
         let modelAlreadyDownloaded = cachedModelFolder != nil
 
-        if let folder = cachedModelFolder {
-            AppLogger.transcription.info("Using cached model at: \(folder)")
+        if cachedModelFolder != nil {
+            AppLogger.transcription.info("Using a cached WhisperKit model")
         }
 
         for attempt in 1...Self.maxRetries {
@@ -52,14 +52,14 @@ actor WhisperKitEngine: TranscriptionEngine {
 
                 whisperKit = try await WhisperKit(
                     model: modelName,
-                    downloadBase: await modelManager.devDownloadBase,
+                    downloadBase: modelManager.devDownloadBase,
                     modelFolder: cachedModelFolder,
                     computeOptions: ModelComputeOptions(
                         audioEncoderCompute: .cpuAndNeuralEngine,
                         textDecoderCompute: .cpuAndNeuralEngine
                     ),
-                    verbose: true,
-                    logLevel: .debug,
+                    verbose: false,
+                    logLevel: .none,
                     prewarm: true,
                     load: true,
                     download: !modelAlreadyDownloaded
@@ -98,7 +98,7 @@ actor WhisperKitEngine: TranscriptionEngine {
 
     private static let transcriptionTimeoutSeconds: UInt64 = 30
 
-    func transcribe(audioURL: URL) async throws -> String {
+    func transcribe(audioURL: URL) async throws -> FinalTranscript {
         // Ensure initialized
         if !isInitialized {
             await initialize()
@@ -108,24 +108,10 @@ actor WhisperKitEngine: TranscriptionEngine {
             throw WhisperKitError.notInitialized
         }
 
-        AppLogger.transcription.debug("Transcribing audio from: \(audioURL.path)")
+        AppLogger.transcription.debug("Transcribing a local temporary recording")
 
-        // Get language, task, and vocabulary settings
-        let language = await appState.language
-        let shouldTranslate = await appState.translateToEnglish
+        // V1 is English-only. Translation and language detection remain off.
         let customVocabulary = await appState.customVocabulary
-
-        // When auto-detect is selected, detect language first to avoid English bias
-        let resolvedLanguage: String?
-        if language == "auto" {
-            let detected = try? await whisperKit.detectLanguage(audioPath: audioURL.path)
-            resolvedLanguage = detected?.language
-            if let lang = resolvedLanguage {
-                AppLogger.transcription.debug("Auto-detected language: \(lang)")
-            }
-        } else {
-            resolvedLanguage = language
-        }
 
         // Encode custom vocabulary as prompt tokens to bias spelling
         var promptTokens: [Int]?
@@ -137,29 +123,28 @@ actor WhisperKitEngine: TranscriptionEngine {
         }
 
         let decodingOptions = DecodingOptions(
-            verbose: true,
-            task: shouldTranslate ? .translate : .transcribe,
-            language: resolvedLanguage,
+            verbose: false,
+            task: .transcribe,
+            language: "en",
             temperature: 0.0,
             temperatureFallbackCount: 5,
             sampleLength: 224,
             usePrefillPrompt: true,
             usePrefillCache: true,
             skipSpecialTokens: true,
-            withoutTimestamps: true,
+            withoutTimestamps: false,
             clipTimestamps: [],
             promptTokens: promptTokens
         )
 
         // Run transcription with timeout
-        let text = try await withThrowingTaskGroup(of: String.self) { group in
+        let transcript = try await withThrowingTaskGroup(of: FinalTranscript.self) { group in
             group.addTask {
                 let results = try await whisperKit.transcribe(
                     audioPath: audioURL.path,
                     decodeOptions: decodingOptions
                 )
-                // Combine all segments into final text
-                return results.compactMap { $0.text }.joined(separator: " ")
+                return Self.finalTranscript(from: results)
             }
 
             group.addTask {
@@ -178,9 +163,52 @@ actor WhisperKitEngine: TranscriptionEngine {
             return result
         }
 
-        AppLogger.transcription.debug("Transcription result: \(text)")
+        AppLogger.transcription.debug("Local WhisperKit transcription completed")
 
-        return text.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        return transcript
+    }
+
+    private static func finalTranscript(from results: [TranscriptionResult]) -> FinalTranscript {
+        var text = ""
+        var language: String?
+        var boundaries: [TranscriptBoundary] = []
+
+        for result in results {
+            let normalized = FinalTranscript(text: result.text, language: result.language)
+            guard !normalized.text.isEmpty else { continue }
+
+            let fragments = result.segments.map {
+                TimedTranscriptFragment(
+                    text: $0.text,
+                    startTime: TimeInterval($0.start),
+                    endTime: TimeInterval($0.end)
+                )
+            }
+            let component = FinalTranscript(
+                text: normalized.text,
+                language: normalized.language,
+                boundaries: TranscriptBoundaryMapper.segmentBoundaries(
+                    in: normalized.text,
+                    fragments: fragments
+                )
+            )
+
+            let separator = text.isEmpty ? "" : " "
+            let componentOffset = text.utf8.count + separator.utf8.count
+            text.append(separator)
+            text.append(component.text)
+            boundaries.append(contentsOf: component.boundaries.map {
+                TranscriptBoundary(
+                    utf8Offset: componentOffset + $0.utf8Offset,
+                    source: $0.source
+                )
+            })
+            if language == nil {
+                language = component.language
+            }
+        }
+
+        return FinalTranscript(text: text, language: language, boundaries: boundaries)
     }
 }
 

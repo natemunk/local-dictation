@@ -1,50 +1,14 @@
-import Foundation
 import Combine
-import SwiftUI
-import Carbon.HIToolbox
+import Foundation
+import Security
 
-struct TranscriptionHistoryEntry: Identifiable, Codable, Equatable {
-    let id: UUID
-    let timestamp: Date
-    let text: String
-
-    init(id: UUID = UUID(), timestamp: Date = Date(), text: String) {
-        self.id = id
-        self.timestamp = timestamp
-        self.text = text
-    }
-}
-
-enum MicInputStatus: Equatable {
+enum MicInputStatus: Equatable, Sendable {
     case ok
-    case low      // audible, but likely too quiet for good transcription
-    case silent   // nothing the STT could use at all
+    case low
+    case silent
 }
 
-enum RecordingState: Equatable {
-    case idle
-    case recording
-    case transcribing
-    case error(String)
-
-    var isIdle: Bool {
-        switch self {
-        case .idle, .error:
-            return true
-        case .recording, .transcribing:
-            return false
-        }
-    }
-}
-
-enum RecordingMode: String, CaseIterable, Identifiable {
-    case pushToTalk = "Push-to-Talk"
-    case toggle = "Toggle"
-
-    var id: String { rawValue }
-}
-
-enum OverlayPosition: String, CaseIterable, Identifiable {
+enum OverlayPosition: String, Codable, CaseIterable, Identifiable, Sendable {
     case topLeft = "Top Left"
     case topCenter = "Top Center"
     case topRight = "Top Right"
@@ -53,21 +17,16 @@ enum OverlayPosition: String, CaseIterable, Identifiable {
     case bottomRight = "Bottom Right"
 
     var id: String { rawValue }
-
-    // Grid layout helpers
-    static var topRow: [OverlayPosition] { [.topLeft, .topCenter, .topRight] }
-    static var bottomRow: [OverlayPosition] { [.bottomLeft, .bottomCenter, .bottomRight] }
 }
 
-enum TranscriptionEngineType: String, CaseIterable, Identifiable {
-    case whisperKit = "WhisperKit (Local)"
-    case parakeet = "Parakeet (NVIDIA)"
-    case openAI = "OpenAI API"
+enum TranscriptionEngineType: String, Codable, CaseIterable, Identifiable, Sendable {
+    case parakeet = "FluidAudio Parakeet"
+    case whisperKit = "WhisperKit"
 
     var id: String { rawValue }
 }
 
-enum ParakeetModelType: String, CaseIterable, Identifiable {
+enum ParakeetModelType: String, Codable, CaseIterable, Identifiable, Sendable {
     case v2English = "parakeet-v2"
     case v3Multilingual = "parakeet-v3"
 
@@ -75,782 +34,258 @@ enum ParakeetModelType: String, CaseIterable, Identifiable {
 
     var displayName: String {
         switch self {
-        case .v2English: return "Parakeet v2 — English"
-        case .v3Multilingual: return "Parakeet v3 — Multilingual"
+        case .v2English: "Parakeet v2 — English"
+        case .v3Multilingual: "Parakeet v3 — Multilingual benchmark"
         }
     }
 
     var size: String {
         switch self {
-        case .v2English: return "~600 MB"
-        case .v3Multilingual: return "~700 MB"
+        case .v2English: "~600 MB"
+        case .v3Multilingual: "~700 MB"
         }
     }
 
     var cacheDirectoryName: String {
         switch self {
-        case .v2English: return "parakeet-tdt-0.6b-v2"
-        case .v3Multilingual: return "parakeet-tdt-0.6b-v3"
+        case .v2English: "parakeet-tdt-0.6b-v2"
+        case .v3Multilingual: "parakeet-tdt-0.6b-v3"
         }
     }
 
     var cacheURL: URL? {
-        guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
-            return nil
-        }
-        return appSupport
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
             .appendingPathComponent("FluidAudio", isDirectory: true)
             .appendingPathComponent("Models", isDirectory: true)
             .appendingPathComponent(cacheDirectoryName, isDirectory: true)
     }
 }
 
-enum WhisperModel: String, CaseIterable, Identifiable {
-    // English-only models (faster, more accurate for English)
-    case tinyEn = "tiny.en"
-    case baseEn = "base.en"
+enum WhisperModel: String, Codable, CaseIterable, Identifiable, Sendable {
     case smallEn = "small.en"
-    case mediumEn = "medium.en"
-    // Multilingual models (supports 99+ languages including Korean, Japanese, Chinese, etc.)
-    case tiny = "tiny"
-    case base = "base"
-    case small = "small"
-    case medium = "medium"
-    case largeV2 = "large-v2"
-    case largeV3 = "large-v3"
     case largeV3Turbo = "large-v3_turbo"
 
     var id: String { rawValue }
 
-    var isEnglishOnly: Bool {
-        switch self {
-        case .tinyEn, .baseEn, .smallEn, .mediumEn: return true
-        case .tiny, .base, .small, .medium, .largeV2, .largeV3, .largeV3Turbo: return false
-        }
-    }
-
     var displayName: String {
         switch self {
-        case .tinyEn, .tiny: return "Tiny"
-        case .baseEn, .base: return "Base"
-        case .smallEn, .small: return "Small"
-        case .mediumEn, .medium: return "Medium"
-        case .largeV2: return "Large v2"
-        case .largeV3: return "Large v3"
-        case .largeV3Turbo: return "Large v3 Turbo"
+        case .smallEn: "Small English"
+        case .largeV3Turbo: "Large v3 Turbo"
         }
     }
 
     var size: String {
         switch self {
-        case .tinyEn, .tiny: return "~75 MB"
-        case .baseEn, .base: return "~150 MB"
-        case .smallEn, .small: return "~500 MB"
-        case .mediumEn, .medium: return "~1.5 GB"
-        case .largeV2, .largeV3: return "~3 GB"
-        case .largeV3Turbo: return "~1.6 GB"
+        case .smallEn: "~500 MB"
+        case .largeV3Turbo: "~1.6 GB"
         }
-    }
-
-    static var englishModels: [WhisperModel] {
-        [.tinyEn, .baseEn, .smallEn, .mediumEn]
-    }
-
-    static var multilingualModels: [WhisperModel] {
-        [.tiny, .base, .small, .medium, .largeV2, .largeV3, .largeV3Turbo]
     }
 }
 
-struct HotkeyConfig: Codable, Equatable {
-    var keyCode: UInt32
-    var modifiers: UInt32
+struct LiveTranscript: Equatable, Sendable {
+    var finalized: String = ""
+    var volatile: String = ""
 
-    // Default: Option+Space for toggle, Option+Shift+Space for push-to-talk
-    static let defaultToggle = HotkeyConfig(keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey))
-    static let defaultPushToTalk = HotkeyConfig(keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey | shiftKey))
-
-    // Empty/not set state - keyCode 0xFFFF is unused
-    static let empty = HotkeyConfig(keyCode: 0xFFFF, modifiers: 0)
-
-    // Legacy default for migration
-    static let `default` = defaultToggle
-
-    var isEmpty: Bool {
-        keyCode == 0xFFFF
-    }
-
-    var displayString: String {
-        if isEmpty {
-            return "Not set"
-        }
-
-        var parts: [String] = []
-        if modifiers & UInt32(controlKey) != 0 { parts.append("⌃") }
-        if modifiers & UInt32(optionKey) != 0 { parts.append("⌥") }
-        if modifiers & UInt32(shiftKey) != 0 { parts.append("⇧") }
-        if modifiers & UInt32(cmdKey) != 0 { parts.append("⌘") }
-
-        let keyName = keyCodeToString(keyCode)
-        parts.append(keyName)
-
-        return parts.joined()
-    }
-
-    private func keyCodeToString(_ keyCode: UInt32) -> String {
-        switch Int(keyCode) {
-        case kVK_Space: return "Space"
-        case kVK_Return: return "Return"
-        case kVK_Tab: return "Tab"
-        case kVK_Delete: return "Delete"
-        case kVK_Escape: return "Esc"
-        case kVK_F1: return "F1"
-        case kVK_F2: return "F2"
-        case kVK_F3: return "F3"
-        case kVK_F4: return "F4"
-        case kVK_F5: return "F5"
-        case kVK_F6: return "F6"
-        case kVK_F7: return "F7"
-        case kVK_F8: return "F8"
-        case kVK_F9: return "F9"
-        case kVK_F10: return "F10"
-        case kVK_F11: return "F11"
-        case kVK_F12: return "F12"
-        case kVK_ANSI_A: return "A"
-        case kVK_ANSI_S: return "S"
-        case kVK_ANSI_D: return "D"
-        case kVK_ANSI_F: return "F"
-        case kVK_ANSI_G: return "G"
-        case kVK_ANSI_H: return "H"
-        case kVK_ANSI_J: return "J"
-        case kVK_ANSI_K: return "K"
-        case kVK_ANSI_L: return "L"
-        case kVK_ANSI_Q: return "Q"
-        case kVK_ANSI_W: return "W"
-        case kVK_ANSI_E: return "E"
-        case kVK_ANSI_R: return "R"
-        case kVK_ANSI_T: return "T"
-        case kVK_ANSI_Y: return "Y"
-        case kVK_ANSI_U: return "U"
-        case kVK_ANSI_I: return "I"
-        case kVK_ANSI_O: return "O"
-        case kVK_ANSI_P: return "P"
-        case kVK_ANSI_Z: return "Z"
-        case kVK_ANSI_X: return "X"
-        case kVK_ANSI_C: return "C"
-        case kVK_ANSI_V: return "V"
-        case kVK_ANSI_B: return "B"
-        case kVK_ANSI_N: return "N"
-        case kVK_ANSI_M: return "M"
-        case kVK_ANSI_0: return "0"
-        case kVK_ANSI_1: return "1"
-        case kVK_ANSI_2: return "2"
-        case kVK_ANSI_3: return "3"
-        case kVK_ANSI_4: return "4"
-        case kVK_ANSI_5: return "5"
-        case kVK_ANSI_6: return "6"
-        case kVK_ANSI_7: return "7"
-        case kVK_ANSI_8: return "8"
-        case kVK_ANSI_9: return "9"
-        default: return "Key\(keyCode)"
-        }
+    var displayed: String {
+        [finalized, volatile].filter { !$0.isEmpty }.joined(separator: finalized.isEmpty ? "" : " ")
     }
 }
 
 @MainActor
-class AppState: ObservableObject {
-    // Recording state
-    @Published var recordingState: RecordingState = .idle
-    @Published var audioLevel: Float = 0.0
-    @Published var recordingDuration: TimeInterval = 0.0
+final class AppState: ObservableObject {
+    private let preferences: UserDefaults
 
-    /// Live read on whether the mic is delivering usable signal: .silent means
-    /// nothing audible for long enough to warn (wrong device, muted hardware,
-    /// dead mic), .low means signal is present but probably too weak for the
-    /// STT models to do well.
+    @Published var phase: DictationPhase = .idle
+    @Published var audioLevel: Float = 0
+    @Published var recordingDuration: TimeInterval = 0
     @Published var micInputStatus: MicInputStatus = .ok
+    @Published var interleavedTyping = false
+    @Published var overlayMessage = "Listening"
+    @Published var liveTranscript = LiveTranscript()
+    @Published var isRemoteRefiner = false
+    @Published var activeProfileName = "Default"
 
-    // Settings
-    @Published var recordingMode: RecordingMode {
-        didSet { UserDefaults.standard.set(recordingMode.rawValue, forKey: "recordingMode") }
-    }
     @Published var overlayPosition: OverlayPosition {
-        didSet { UserDefaults.standard.set(overlayPosition.rawValue, forKey: "overlayPosition") }
-    }
-    @Published var transcriptionEngine: TranscriptionEngineType {
-        didSet { UserDefaults.standard.set(transcriptionEngine.rawValue, forKey: "transcriptionEngine") }
-    }
-    @Published var whisperModel: WhisperModel {
-        didSet { UserDefaults.standard.set(whisperModel.rawValue, forKey: "whisperModel") }
-    }
-    @Published var parakeetModel: ParakeetModelType {
-        didSet { UserDefaults.standard.set(parakeetModel.rawValue, forKey: "parakeetModel") }
-    }
-    @Published var language: String {
-        didSet { UserDefaults.standard.set(language, forKey: "language") }
-    }
-    @Published var translateToEnglish: Bool {
-        didSet { UserDefaults.standard.set(translateToEnglish, forKey: "translateToEnglish") }
-    }
-    @Published var enableCloudFallback: Bool {
-        didSet { UserDefaults.standard.set(enableCloudFallback, forKey: "enableCloudFallback") }
-    }
-    @Published var customVocabulary: String {
-        didSet { UserDefaults.standard.set(customVocabulary, forKey: "customVocabulary") }
-    }
-    @Published var textReplacements: String {
-        didSet { UserDefaults.standard.set(textReplacements, forKey: "textReplacements") }
-    }
-    @Published var openAIAPIKey: String {
-        didSet {
-            try? KeychainHelper.save(key: "openAIAPIKey", data: openAIAPIKey.data(using: .utf8) ?? Data())
-        }
-    }
-    @Published var playSoundOnCompletion: Bool {
-        didSet { UserDefaults.standard.set(playSoundOnCompletion, forKey: "playSoundOnCompletion") }
-    }
-    @Published var playSoundOnStart: Bool {
-        didSet { UserDefaults.standard.set(playSoundOnStart, forKey: "playSoundOnStart") }
-    }
-    @Published var showNotificationOnError: Bool {
-        didSet { UserDefaults.standard.set(showNotificationOnError, forKey: "showNotificationOnError") }
-    }
-    @Published var muteSystemAudioWhileRecording: Bool {
-        didSet { UserDefaults.standard.set(muteSystemAudioWhileRecording, forKey: "muteSystemAudioWhileRecording") }
-    }
-    @Published var skipSilentRecordings: Bool {
-        didSet { UserDefaults.standard.set(skipSilentRecordings, forKey: "skipSilentRecordings") }
+        didSet { preferences.set(overlayPosition.rawValue, forKey: LocalDictationPreferenceKey.overlayPosition) }
     }
     @Published var selectedInputDeviceUID: String {
-        didSet { UserDefaults.standard.set(selectedInputDeviceUID, forKey: "selectedInputDeviceUID") }
+        didSet { preferences.set(selectedInputDeviceUID, forKey: LocalDictationPreferenceKey.selectedInputDeviceUID) }
     }
-    @Published var recordingDurationLimitEnabled: Bool {
-        didSet { UserDefaults.standard.set(recordingDurationLimitEnabled, forKey: "recordingDurationLimitEnabled") }
+    @Published var transcriptionEngine: TranscriptionEngineType {
+        didSet { preferences.set(transcriptionEngine.rawValue, forKey: LocalDictationPreferenceKey.transcriptionEngine) }
     }
-    @Published var recordingDurationLimitSeconds: Int {
-        didSet { UserDefaults.standard.set(recordingDurationLimitSeconds, forKey: "recordingDurationLimitSeconds") }
+    @Published var parakeetModel: ParakeetModelType {
+        didSet { preferences.set(parakeetModel.rawValue, forKey: LocalDictationPreferenceKey.parakeetModel) }
     }
-    @Published var startAtLogin: Bool {
-        didSet {
-            UserDefaults.standard.set(startAtLogin, forKey: "startAtLogin")
-            LaunchAtLogin.isEnabled = startAtLogin
-        }
+    @Published var whisperModel: WhisperModel {
+        didSet { preferences.set(whisperModel.rawValue, forKey: LocalDictationPreferenceKey.whisperModel) }
     }
-    @Published var hasCompletedOnboarding: Bool {
-        didSet { UserDefaults.standard.set(hasCompletedOnboarding, forKey: "hasCompletedOnboarding") }
-    }
-    @Published var analyticsEnabled: Bool {
-        didSet { UserDefaults.standard.set(analyticsEnabled, forKey: Self.analyticsEnabledKey) }
-    }
-    @Published var toggleHotkeyConfig: HotkeyConfig {
-        didSet {
-            if let data = try? JSONEncoder().encode(toggleHotkeyConfig) {
-                UserDefaults.standard.set(data, forKey: "toggleHotkeyConfig")
-            }
-        }
-    }
-    @Published var pushToTalkHotkeyConfig: HotkeyConfig {
-        didSet {
-            if let data = try? JSONEncoder().encode(pushToTalkHotkeyConfig) {
-                UserDefaults.standard.set(data, forKey: "pushToTalkHotkeyConfig")
-            }
-        }
-    }
+    @Published var language = "en"
+    @Published var customVocabulary = ""
+    @Published var raycastVocabularyImportText = ""
 
-    // Legacy property for backwards compatibility
-    var hotkeyConfig: HotkeyConfig {
-        get { toggleHotkeyConfig }
-        set { toggleHotkeyConfig = newValue }
-    }
-
-    // Model state
-    @Published var isModelDownloaded: Bool = false
-    @Published var modelDownloadProgress: Double = 0.0
-    @Published var isDownloadingModel: Bool = false
-    @Published var isInitializingEngine: Bool = false
+    @Published var isModelDownloaded = false
+    @Published var modelDownloadProgress: Double = 0
+    @Published var isDownloadingModel = false
+    @Published var isInitializingEngine = false
     @Published var downloadedModels: Set<String> = []
-    @Published var parakeetDownloadedModels: Set<String> {
-        didSet {
-            UserDefaults.standard.set(Array(parakeetDownloadedModels), forKey: "parakeetDownloadedModels")
-        }
-    }
+    @Published var parakeetDownloadedModels: Set<String> = []
     @Published var currentlyDownloadingModel: String?
 
-    // Last transcription result
-    @Published var lastTranscription: String = ""
+    @Published var lastTranscription = ""
     @Published var lastError: String?
-    @Published var transcriptionHistory: [TranscriptionHistoryEntry] {
-        didSet { persistTranscriptionHistory() }
-    }
+    @Published var microphonePermissionGranted = false
+    @Published var inputMonitoringGranted = false
+    @Published var accessibilityGranted = false
+    @Published var hotkeyMonitoringActive = false
+    @Published var hotkeyMonitoringError: String?
+    @Published var hasCompletedOnboarding = false
+    @Published var retainDebugAudio: Bool
+    @Published var refinerAPIKey = KeychainStore.load(
+        account: LocalDictationKeychainAccount.openAICompatibleRefiner
+    ) ?? ""
 
     let debugSessionStore = DebugSessionStore()
 
-    // Hotkey recording state - tracks which recorder is active (nil if none)
-    @Published var activeHotkeyRecorder: String?
-
     private var recordingTimer: Timer?
-    private let maxTranscriptionHistory = 50
-    private let transcriptionHistoryKey = "transcriptionHistory"
-    private static let analyticsEnabledKey = "analyticsEnabled"
-
-    // Live mic input monitoring, evaluated on a 2s rolling mean level so
-    // one-tick transients (keyboard clacks, door slams) can't mask a mic
-    // that isn't actually picking up speech.
-    // audioLevel is normalized 0...1 over -40...0 dBFS, so 0.05 ≈ -38 dBFS —
-    // the same threshold used to skip silent recordings after the fact.
-    private let silenceLevelThreshold: Float = 0.05
-    // -32 dBFS: one-shot health check for the mic itself, not a running
-    // signal monitor. The first time any 100ms chunk reaches this level the
-    // mic is proven working and the low warning is disabled for the rest of
-    // the recording — the warning exists to catch a mic that is broken or
-    // far too quiet in general, not momentary soft speech.
-    private let lowLevelThreshold: Float = 0.20
-    // Warn quickly when nothing has been heard at all…
-    private let initialSilenceWarningDelay: TimeInterval = 3.0
-    // …but tolerate thinking pauses once real speech has come through.
-    private let ongoingSilenceWarningDelay: TimeInterval = 10.0
-    private let lowLevelWarningDelay: TimeInterval = 3.0
-    private let levelWindowCapacity = 20  // 2s at the 0.1s tick
     private var levelWindow: [Float] = []
     private var lastAudibleAt: TimeInterval = 0
     private var hasHeardAudio = false
     private var micProvenHealthy = false
 
-    init() {
-        // Load settings from UserDefaults
-        let modeStr = UserDefaults.standard.string(forKey: "recordingMode") ?? RecordingMode.toggle.rawValue
-        self.recordingMode = RecordingMode(rawValue: modeStr) ?? .toggle
-
-        let posStr = UserDefaults.standard.string(forKey: "overlayPosition") ?? OverlayPosition.bottomRight.rawValue
-        self.overlayPosition = OverlayPosition(rawValue: posStr) ?? .bottomRight
-
-        let engineStr = UserDefaults.standard.string(forKey: "transcriptionEngine") ?? TranscriptionEngineType.whisperKit.rawValue
-        self.transcriptionEngine = TranscriptionEngineType(rawValue: engineStr) ?? .whisperKit
-
-        let modelStr = UserDefaults.standard.string(forKey: "whisperModel") ?? WhisperModel.smallEn.rawValue
-        self.whisperModel = WhisperModel(rawValue: modelStr) ?? .smallEn
-
-        let parakeetModelStr = UserDefaults.standard.string(forKey: "parakeetModel") ?? ParakeetModelType.v3Multilingual.rawValue
-        self.parakeetModel = ParakeetModelType(rawValue: parakeetModelStr) ?? .v3Multilingual
-
-        let storedParakeetDownloads = UserDefaults.standard.stringArray(forKey: "parakeetDownloadedModels") ?? []
-        self.parakeetDownloadedModels = Set(storedParakeetDownloads)
-
-        self.language = UserDefaults.standard.string(forKey: "language") ?? "auto"
-        self.translateToEnglish = UserDefaults.standard.bool(forKey: "translateToEnglish")
-        self.enableCloudFallback = UserDefaults.standard.bool(forKey: "enableCloudFallback")
-        self.customVocabulary = UserDefaults.standard.string(forKey: "customVocabulary") ?? ""
-        self.textReplacements = UserDefaults.standard.string(forKey: "textReplacements") ?? ""
-
-        if let apiKeyData = try? KeychainHelper.load(key: "openAIAPIKey"),
-           let apiKey = String(data: apiKeyData, encoding: .utf8) {
-            self.openAIAPIKey = apiKey
-        } else {
-            self.openAIAPIKey = ""
-        }
-
-        self.playSoundOnCompletion = UserDefaults.standard.object(forKey: "playSoundOnCompletion") as? Bool ?? true
-        self.playSoundOnStart = UserDefaults.standard.bool(forKey: "playSoundOnStart")
-        self.showNotificationOnError = UserDefaults.standard.object(forKey: "showNotificationOnError") as? Bool ?? true
-        self.muteSystemAudioWhileRecording = UserDefaults.standard.bool(forKey: "muteSystemAudioWhileRecording")
-        self.skipSilentRecordings = UserDefaults.standard.object(forKey: "skipSilentRecordings") as? Bool ?? true
-        self.selectedInputDeviceUID = UserDefaults.standard.string(forKey: "selectedInputDeviceUID") ?? ""
-        self.recordingDurationLimitEnabled = UserDefaults.standard.bool(forKey: "recordingDurationLimitEnabled")
-        let storedLimit = UserDefaults.standard.integer(forKey: "recordingDurationLimitSeconds")
-        self.recordingDurationLimitSeconds = storedLimit > 0 ? storedLimit : 60
-        self.startAtLogin = UserDefaults.standard.bool(forKey: "startAtLogin")
-        self.hasCompletedOnboarding = UserDefaults.standard.bool(forKey: "hasCompletedOnboarding")
-        self.analyticsEnabled = UserDefaults.standard.object(forKey: Self.analyticsEnabledKey) as? Bool ?? false
-
-        // Load toggle hotkey (with migration from legacy hotkeyConfig)
-        if let hotkeyData = UserDefaults.standard.data(forKey: "toggleHotkeyConfig"),
-           let config = try? JSONDecoder().decode(HotkeyConfig.self, from: hotkeyData) {
-            self.toggleHotkeyConfig = config
-        } else if let legacyData = UserDefaults.standard.data(forKey: "hotkeyConfig"),
-                  let legacyConfig = try? JSONDecoder().decode(HotkeyConfig.self, from: legacyData) {
-            // Migrate from legacy single hotkey
-            self.toggleHotkeyConfig = legacyConfig
-        } else {
-            self.toggleHotkeyConfig = .defaultToggle
-        }
-
-        // Load push-to-talk hotkey
-        if let hotkeyData = UserDefaults.standard.data(forKey: "pushToTalkHotkeyConfig"),
-           let config = try? JSONDecoder().decode(HotkeyConfig.self, from: hotkeyData) {
-            self.pushToTalkHotkeyConfig = config
-        } else {
-            self.pushToTalkHotkeyConfig = .defaultPushToTalk
-        }
-
-        UserDefaults.standard.removeObject(forKey: "debugModeEnabled")
-
-        if let historyData = UserDefaults.standard.data(forKey: transcriptionHistoryKey),
-           let history = try? JSONDecoder().decode([TranscriptionHistoryEntry].self, from: historyData) {
-            self.transcriptionHistory = history
-            self.lastTranscription = history.first?.text ?? ""
-        } else {
-            self.transcriptionHistory = []
-        }
+    init(preferences: UserDefaults = .standard) {
+        self.preferences = preferences
+        overlayPosition = preferences.string(forKey: LocalDictationPreferenceKey.overlayPosition)
+            .flatMap(OverlayPosition.init(rawValue:)) ?? .bottomCenter
+        selectedInputDeviceUID = preferences.string(
+            forKey: LocalDictationPreferenceKey.selectedInputDeviceUID
+        ) ?? ""
+        transcriptionEngine = preferences.string(forKey: LocalDictationPreferenceKey.transcriptionEngine)
+            .flatMap(TranscriptionEngineType.init(rawValue:)) ?? .parakeet
+        parakeetModel = preferences.string(forKey: LocalDictationPreferenceKey.parakeetModel)
+            .flatMap(ParakeetModelType.init(rawValue:)) ?? .v2English
+        whisperModel = preferences.string(forKey: LocalDictationPreferenceKey.whisperModel)
+            .flatMap(WhisperModel.init(rawValue:)) ?? .smallEn
+        retainDebugAudio = preferences.bool(forKey: LocalDictationPreferenceKey.retainDebugAudio)
     }
 
-    func startRecordingTimer() {
+    func beginRecording() {
+        phase = .recording
+        overlayMessage = "Listening"
         recordingDuration = 0
-        levelWindow = []
+        micInputStatus = .ok
+        interleavedTyping = false
+        liveTranscript = LiveTranscript()
+        levelWindow.removeAll(keepingCapacity: true)
         lastAudibleAt = 0
         hasHeardAudio = false
         micProvenHealthy = false
-        micInputStatus = .ok
+
+        recordingTimer?.invalidate()
         recordingTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-                self.recordingDuration += 0.1
-                self.updateMicInputStatus()
-            }
+            Task { @MainActor in self?.tickRecordingClock() }
         }
     }
 
-    func stopRecordingTimer() {
+    func endRecordingClock() {
         recordingTimer?.invalidate()
         recordingTimer = nil
+    }
+
+    func resetSessionUI() {
+        endRecordingClock()
+        phase = .idle
+        audioLevel = 0
+        recordingDuration = 0
+        interleavedTyping = false
+        overlayMessage = "Listening"
+        liveTranscript = LiveTranscript()
         micInputStatus = .ok
     }
 
-    private func updateMicInputStatus() {
-        guard recordingState == .recording else { return }
+    func setInterleavedTyping() {
+        interleavedTyping = true
+        overlayMessage = "Typing detected · Hyper+D to finish"
+    }
 
+    private func tickRecordingClock() {
+        recordingDuration += 0.1
         levelWindow.append(audioLevel)
-        if levelWindow.count > levelWindowCapacity { levelWindow.removeFirst() }
-        // The rolling mean answers "is anything coming through at all" and
-        // drives silence detection only.
-        let mean = levelWindow.reduce(0, +) / Float(levelWindow.count)
+        if levelWindow.count > 20 { levelWindow.removeFirst() }
 
-        if mean >= silenceLevelThreshold {
-            lastAudibleAt = recordingDuration
+        if audioLevel >= 0.05 {
             hasHeardAudio = true
+            lastAudibleAt = recordingDuration
         }
-        // One-shot latch: a single healthy chunk proves the mic works, and
-        // the low warning stays off for the rest of the recording.
-        if audioLevel >= lowLevelThreshold {
-            micProvenHealthy = true
-        }
+        if audioLevel >= 0.20 { micProvenHealthy = true }
 
-        let silenceDelay = hasHeardAudio ? ongoingSilenceWarningDelay : initialSilenceWarningDelay
-
-        let newStatus: MicInputStatus
-        if recordingDuration - lastAudibleAt >= silenceDelay {
-            newStatus = .silent
-        } else if micProvenHealthy {
-            newStatus = .ok
-        } else if micInputStatus == .low {
-            // Sticky: only a healthy chunk (latch above) clears the warning.
-            newStatus = .low
-        } else if mean >= silenceLevelThreshold,
-                  recordingDuration >= lowLevelWarningDelay {
-            // Something audible is coming through, but it has never reached a
-            // healthy level — the mic is likely misconfigured or too quiet.
-            // True silence is handled by the silent path on its own delay.
-            newStatus = .low
+        let average = levelWindow.isEmpty ? 0 : levelWindow.reduce(0, +) / Float(levelWindow.count)
+        if !hasHeardAudio && recordingDuration >= 3 && average < 0.05 {
+            micInputStatus = .silent
+        } else if hasHeardAudio && recordingDuration - lastAudibleAt >= 10 {
+            micInputStatus = .silent
+        } else if !micProvenHealthy && recordingDuration >= 3 {
+            micInputStatus = .low
         } else {
-            newStatus = .ok
+            micInputStatus = .ok
         }
-
-        if newStatus != micInputStatus { micInputStatus = newStatus }
-    }
-
-    /// Applies text replacements (case-insensitive) from the "from → to" pairs in settings.
-    func applyTextReplacements(_ text: String) -> String {
-        guard !textReplacements.isEmpty else { return text }
-
-        var result = text
-        for line in textReplacements.components(separatedBy: "\n") {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.isEmpty else { continue }
-
-            // Support both "→" and "->" as separators
-            let separator = trimmed.contains("→") ? "→" : "->"
-            let parts = trimmed.components(separatedBy: separator)
-            guard parts.count == 2 else { continue }
-
-            let from = parts[0].trimmingCharacters(in: .whitespaces)
-            let to = parts[1].trimmingCharacters(in: .whitespaces)
-            guard !from.isEmpty else { continue }
-
-            result = result.replacingOccurrences(of: from, with: to, options: .caseInsensitive)
-        }
-        return result
-    }
-
-    func addTranscriptionHistory(_ text: String) {
-        guard !text.isEmpty else { return }
-        let entry = TranscriptionHistoryEntry(text: text)
-        transcriptionHistory.insert(entry, at: 0)
-        if transcriptionHistory.count > maxTranscriptionHistory {
-            transcriptionHistory = Array(transcriptionHistory.prefix(maxTranscriptionHistory))
-        }
-        lastTranscription = text
-    }
-
-    func clearTranscriptionHistory() {
-        transcriptionHistory = []
-        lastTranscription = ""
-    }
-
-    func resetToDefaults() {
-        recordingMode = .toggle
-        overlayPosition = .bottomRight
-        transcriptionEngine = .whisperKit
-        whisperModel = .smallEn
-        parakeetModel = .v3Multilingual
-        language = "auto"
-        translateToEnglish = false
-        enableCloudFallback = false
-        customVocabulary = ""
-        textReplacements = ""
-        playSoundOnCompletion = true
-        playSoundOnStart = false
-        showNotificationOnError = true
-        muteSystemAudioWhileRecording = false
-        skipSilentRecordings = true
-        selectedInputDeviceUID = ""
-        recordingDurationLimitEnabled = false
-        recordingDurationLimitSeconds = 60
-        startAtLogin = false
-        analyticsEnabled = false
-        toggleHotkeyConfig = .defaultToggle
-        pushToTalkHotkeyConfig = .defaultPushToTalk
-    }
-
-    var hasChosenAnalyticsPreference: Bool {
-        UserDefaults.standard.object(forKey: Self.analyticsEnabledKey) != nil
-    }
-
-    func confirmAnalyticsPreference() {
-        UserDefaults.standard.set(analyticsEnabled, forKey: Self.analyticsEnabledKey)
-    }
-
-    private func persistTranscriptionHistory() {
-        if let data = try? JSONEncoder().encode(transcriptionHistory) {
-            UserDefaults.standard.set(data, forKey: transcriptionHistoryKey)
-        }
-    }
-
-    func hotkeyConflictMessage(for recorderId: String, pendingConfig: HotkeyConfig? = nil) -> String? {
-        let currentConfig: HotkeyConfig
-        let otherConfig: HotkeyConfig
-        let otherName: String
-
-        switch recorderId {
-        case "toggle":
-            currentConfig = pendingConfig ?? toggleHotkeyConfig
-            otherConfig = pushToTalkHotkeyConfig
-            otherName = "Push-to-Talk"
-        case "pushToTalk":
-            currentConfig = pendingConfig ?? pushToTalkHotkeyConfig
-            otherConfig = toggleHotkeyConfig
-            otherName = "Toggle"
-        default:
-            return nil
-        }
-
-        guard !currentConfig.isEmpty, !otherConfig.isEmpty else { return nil }
-        guard currentConfig == otherConfig else { return nil }
-
-        return "Conflicts with \(otherName) hotkey."
     }
 }
 
-// Keychain helper for secure API key storage
-enum KeychainHelper {
-    static func save(key: String, data: Data) throws {
-        let query: [String: Any] = [
+enum LocalDictationPreferenceKey {
+    static let overlayPosition = "LocalDictation.overlayPosition.v1"
+    static let selectedInputDeviceUID = "LocalDictation.selectedInputDeviceUID.v1"
+    static let transcriptionEngine = "LocalDictation.transcriptionEngine.v1"
+    static let parakeetModel = "LocalDictation.parakeetModel.v1"
+    static let whisperModel = "LocalDictation.whisperModel.v1"
+    static let retainDebugAudio = "LocalDictation.retainDebugAudio.v1"
+}
+
+enum LocalDictationKeychainAccount {
+    static let openAICompatibleRefiner = "openai-compatible-refiner"
+}
+
+enum KeychainStore {
+    private static var service: String {
+        Bundle.main.bundleIdentifier ?? "com.natemunk.LocalDictation"
+    }
+
+    static func save(_ value: String, account: String) throws {
+        let base: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrAccount as String: key,
-            kSecValueData as String: data
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
         ]
-
-        SecItemDelete(query as CFDictionary)
-        let status = SecItemAdd(query as CFDictionary, nil)
-
+        SecItemDelete(base as CFDictionary)
+        var insert = base
+        insert[kSecValueData as String] = Data(value.utf8)
+        let status = SecItemAdd(insert as CFDictionary, nil)
         guard status == errSecSuccess else {
-            throw NSError(domain: "KeychainError", code: Int(status))
+            throw NSError(domain: NSOSStatusErrorDomain, code: Int(status))
         }
     }
 
-    static func load(key: String) throws -> Data {
+    static func load(account: String) -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrAccount as String: key,
-            kSecReturnData as String: true
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
         ]
-
         var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-        guard status == errSecSuccess, let data = result as? Data else {
-            throw NSError(domain: "KeychainError", code: Int(status))
-        }
-
-        return data
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data
+        else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 
-    static func delete(key: String) {
+    static func delete(account: String) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrAccount as String: key
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
         ]
         SecItemDelete(query as CFDictionary)
-    }
-}
-
-// Launch at login helper
-enum LaunchAtLogin {
-    static var isEnabled: Bool {
-        get {
-            // Check if launch agent exists
-            if Bundle.main.bundleIdentifier != nil {
-                return SMAppService.mainApp.status == .enabled
-            }
-            return false
-        }
-        set {
-            do {
-                if newValue {
-                    try SMAppService.mainApp.register()
-                } else {
-                    try SMAppService.mainApp.unregister()
-                }
-            } catch {
-                AppLogger.system.error("Failed to set launch at login: \(error.localizedDescription)")
-            }
-        }
-    }
-}
-
-import ServiceManagement
-
-// System audio control via AppleScript (requires non-sandboxed app)
-// Note: This only works with built-in audio or audio devices that support macOS volume controls.
-// External audio interfaces (like Focusrite Scarlett) may not support mute/volume control.
-enum SystemAudioManager {
-    /// Longest we let the start chime hold off the mute. Chime files carry a
-    /// long decay tail (Glass.aiff reports 1.65s), and while we wait, system
-    /// audio the user asked to silence keeps playing into the recording. The
-    /// chime's attack lands well inside this window; only ring-out is cut.
-    static let maxChimeMuteDelay: TimeInterval = 0.3
-
-    static func muteDelay(afterChimeOf duration: TimeInterval) -> TimeInterval {
-        min(max(duration, 0), maxChimeMuteDelay)
-    }
-
-    /// The first NSAppleScript execution in a process pays ~150ms of one-time
-    /// component loading; run a harmless query up front so a real mute doesn't.
-    static func prewarm() {
-        _ = getSystemVolume()
-    }
-
-    private static var wasSystemMuted = false
-    private static var previousVolume: Int = 0
-    private static var usedVolumeFallback = false
-
-    static func muteSystemAudio() {
-        // Check if volume control is supported (re-check each time in case audio device changed)
-        guard let currentVolume = getSystemVolume() else {
-            AppLogger.system.warning("System audio volume control not supported on current audio device")
-            return
-        }
-
-        // First, check if already muted
-        if let muted = isSystemMuted(), muted {
-            wasSystemMuted = true
-            usedVolumeFallback = false
-            AppLogger.system.info("System already muted")
-            return
-        }
-
-        wasSystemMuted = false
-        previousVolume = currentVolume
-
-        // Try mute command first
-        _ = setSystemMuted(true)
-
-        // Verify it actually worked - some devices silently ignore the mute command
-        if let muted = isSystemMuted(), muted {
-            usedVolumeFallback = false
-            AppLogger.system.info("Muted using mute command")
-            return
-        }
-
-        // Fallback: set volume to 0
-        if setSystemVolume(0) {
-            usedVolumeFallback = true
-            AppLogger.system.info("Muted by setting volume to 0 (was \(previousVolume))")
-        }
-    }
-
-    static func restoreSystemAudio() {
-        if wasSystemMuted {
-            AppLogger.system.info("System was muted before recording, not restoring")
-            return
-        }
-
-        // If we used volume fallback, restore volume
-        if usedVolumeFallback {
-            if previousVolume > 0 {
-                if setSystemVolume(previousVolume) {
-                    AppLogger.system.info("Restored volume to \(previousVolume)")
-                }
-            }
-            return
-        }
-
-        // Try unmute command
-        if setSystemMuted(false) {
-            AppLogger.system.info("Unmuted using mute command")
-        }
-    }
-
-    private static func isSystemMuted() -> Bool? {
-        let script = NSAppleScript(source: "output muted of (get volume settings)")
-        var error: NSDictionary?
-        let result = script?.executeAndReturnError(&error)
-        if error != nil {
-            return nil
-        }
-        // Check for "missing value" by seeing if we can get a boolean
-        let descriptor = result?.coerce(toDescriptorType: typeBoolean)
-        if descriptor == nil {
-            return nil
-        }
-        return result?.booleanValue
-    }
-
-    private static func getSystemVolume() -> Int? {
-        let script = NSAppleScript(source: "output volume of (get volume settings)")
-        var error: NSDictionary?
-        let result = script?.executeAndReturnError(&error)
-        if error != nil {
-            return nil
-        }
-        // Check for "missing value" by trying to coerce to integer
-        let descriptor = result?.coerce(toDescriptorType: typeSInt32)
-        if descriptor == nil {
-            return nil
-        }
-        return Int(result?.int32Value ?? 0)
-    }
-
-    @discardableResult
-    private static func setSystemMuted(_ muted: Bool) -> Bool {
-        let script = NSAppleScript(source: "set volume output muted \(muted)")
-        var error: NSDictionary?
-        script?.executeAndReturnError(&error)
-        return error == nil
-    }
-
-    @discardableResult
-    private static func setSystemVolume(_ volume: Int) -> Bool {
-        let script = NSAppleScript(source: "set volume output volume \(volume)")
-        var error: NSDictionary?
-        script?.executeAndReturnError(&error)
-        return error == nil
     }
 }

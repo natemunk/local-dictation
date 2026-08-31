@@ -1,293 +1,189 @@
 import AppKit
 import Carbon.HIToolbox
-import HotKey
 
-enum HotkeyEvent {
-    case keyDown
-    case keyUp
-}
+enum GlobalKeyMonitorError: LocalizedError {
+    case eventTapUnavailable
 
-enum HotkeyMode {
-    case toggle
-    case pushToTalk
-}
-
-@MainActor
-class HotkeyManager {
-    private var toggleHotKey: HotKey?
-    private var pushToTalkHotKey: HotKey?
-    private let appState: AppState
-    private let eventHandler: (HotkeyEvent, HotkeyMode) -> Void
-
-    // Track key state for push-to-talk
-    private var isPushToTalkKeyDown = false
-
-    init(appState: AppState, eventHandler: @escaping (HotkeyEvent, HotkeyMode) -> Void) {
-        self.appState = appState
-        self.eventHandler = eventHandler
-
-        registerHotkeys()
-        _ = checkAccessibilityPermission()
-    }
-
-    func registerHotkeys() {
-        registerToggleHotkey(config: appState.toggleHotkeyConfig)
-        registerPushToTalkHotkey(config: appState.pushToTalkHotkeyConfig)
-    }
-
-    func registerToggleHotkey(config: HotkeyConfig) {
-        toggleHotKey = nil
-
-        // Skip registration if hotkey is not set
-        guard !config.isEmpty else {
-            AppLogger.hotkey.debug("Toggle hotkey not set, skipping registration")
-            return
+    var errorDescription: String? {
+        switch self {
+        case .eventTapUnavailable:
+            "Local Dictation could not monitor Hyper+D. Enable Input Monitoring and Accessibility in System Settings."
         }
-
-        guard let key = Key(carbonKeyCode: UInt32(config.keyCode)) else {
-            AppLogger.hotkey.error("Invalid toggle key code: \(config.keyCode)")
-            return
-        }
-
-        let modifiers = convertModifiers(config.modifiers)
-        toggleHotKey = HotKey(key: key, modifiers: modifiers)
-
-        toggleHotKey?.keyDownHandler = { [weak self] in
-            self?.eventHandler(.keyDown, .toggle)
-        }
-
-        // keyUp lets the toggle hotkey double as push-to-talk when held
-        toggleHotKey?.keyUpHandler = { [weak self] in
-            self?.eventHandler(.keyUp, .toggle)
-        }
-    }
-
-    func registerPushToTalkHotkey(config: HotkeyConfig) {
-        pushToTalkHotKey = nil
-
-        // Skip registration if hotkey is not set
-        guard !config.isEmpty else {
-            AppLogger.hotkey.debug("Push-to-talk hotkey not set, skipping registration")
-            return
-        }
-
-        guard let key = Key(carbonKeyCode: UInt32(config.keyCode)) else {
-            AppLogger.hotkey.error("Invalid push-to-talk key code: \(config.keyCode)")
-            return
-        }
-
-        let modifiers = convertModifiers(config.modifiers)
-        pushToTalkHotKey = HotKey(key: key, modifiers: modifiers)
-
-        pushToTalkHotKey?.keyDownHandler = { [weak self] in
-            guard let self = self else { return }
-            self.isPushToTalkKeyDown = true
-            self.eventHandler(.keyDown, .pushToTalk)
-        }
-
-        pushToTalkHotKey?.keyUpHandler = { [weak self] in
-            guard let self = self else { return }
-            if self.isPushToTalkKeyDown {
-                self.isPushToTalkKeyDown = false
-                self.eventHandler(.keyUp, .pushToTalk)
-            }
-        }
-    }
-
-    private func convertModifiers(_ carbonModifiers: UInt32) -> NSEvent.ModifierFlags {
-        var modifiers: NSEvent.ModifierFlags = []
-        if carbonModifiers & UInt32(optionKey) != 0 {
-            modifiers.insert(.option)
-        }
-        if carbonModifiers & UInt32(controlKey) != 0 {
-            modifiers.insert(.control)
-        }
-        if carbonModifiers & UInt32(shiftKey) != 0 {
-            modifiers.insert(.shift)
-        }
-        if carbonModifiers & UInt32(cmdKey) != 0 {
-            modifiers.insert(.command)
-        }
-        return modifiers
-    }
-
-    func unregisterHotkeys() {
-        toggleHotKey = nil
-        pushToTalkHotKey = nil
-    }
-
-    @discardableResult
-    func checkAccessibilityPermission() -> Bool {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        let trusted = AXIsProcessTrustedWithOptions(options)
-
-        if !trusted {
-            AppLogger.system.warning("Accessibility permission not granted")
-        }
-
-        return trusted
     }
 }
 
-// Hotkey recorder view for settings
-import SwiftUI
+/// A single session event tap owns the dictation chord and the session-scoped
+/// Enter/Escape safety rules. It never synthesizes Return.
+final class HotkeyManager {
+    typealias EffectHandler = ([DictationCoordinatorEffect]) -> Void
 
-struct HotkeyRecorderView: View {
-    @EnvironmentObject var appState: AppState
-    @Binding var config: HotkeyConfig
-    let recorderId: String  // Unique identifier for this recorder
-    @State private var localMonitor: Any?
-    @State private var globalMonitor: Any?
-    @State private var conflictMessage: String?
+    private let coordinator: DictationCoordinator
+    private let profileMode: () -> DictationMode
+    private let effectHandler: EffectHandler
+    private var eventTap: CFMachPort?
+    private var runLoopSource: CFRunLoopSource?
+    private var suppressedKeyUps = Set<UInt16>()
 
-    private var isRecording: Bool {
-        appState.activeHotkeyRecorder == recorderId
+    init(
+        coordinator: DictationCoordinator,
+        profileMode: @escaping () -> DictationMode,
+        effectHandler: @escaping EffectHandler
+    ) {
+        self.coordinator = coordinator
+        self.profileMode = profileMode
+        self.effectHandler = effectHandler
     }
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                Text(isRecording ? "Press a key..." : config.displayString)
-                    .frame(minWidth: 100)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(isRecording ? Color.accentColor.opacity(0.2) : Color.secondary.opacity(0.1))
-                    .foregroundColor(config.isEmpty && !isRecording ? .secondary : .primary)
-                    .cornerRadius(6)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 6)
-                            .stroke(isRecording ? Color.accentColor : Color.clear, lineWidth: 2)
-                    )
+    deinit {
+        stop()
+    }
 
-                Button(isRecording ? "Cancel" : "Record") {
-                    if isRecording {
-                        stopRecording()
-                    } else {
-                        startRecording()
-                    }
-                }
-                .buttonStyle(.bordered)
+    var isMonitoring: Bool {
+        guard let eventTap else { return false }
+        return CGEvent.tapIsEnabled(tap: eventTap)
+    }
 
-                // Clear button - only show if hotkey is set and not recording
-                if !config.isEmpty && !isRecording {
-                    Button {
-                        config = .empty
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundColor(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Clear hotkey")
-                }
-            }
+    func start(promptForPermission: Bool = true) throws {
+        guard eventTap == nil else { return }
+        if promptForPermission, !CGPreflightListenEventAccess() {
+            _ = CGRequestListenEventAccess()
+        }
 
-            if let message = appState.hotkeyConflictMessage(for: recorderId) {
-                Text(message)
-                    .font(.caption)
-                    .foregroundColor(.red)
-            }
-        }
-        .onDisappear {
-            // Clean up monitors when view disappears
-            if isRecording {
-                stopRecording()
-            }
-        }
-        .onChange(of: appState.activeHotkeyRecorder) { _, newValue in
-            // If another recorder became active, clean up our monitors
-            if newValue != recorderId {
-                cleanupMonitors()
-            }
-        }
-        .alert(
-            "Hotkey Conflict",
-            isPresented: Binding(
-                get: { conflictMessage != nil },
-                set: { if !$0 { conflictMessage = nil } }
+        let mask = CGEventMask(1 << CGEventType.keyDown.rawValue)
+            | CGEventMask(1 << CGEventType.keyUp.rawValue)
+            | CGEventMask(1 << CGEventType.flagsChanged.rawValue)
+
+        let opaqueSelf = Unmanaged.passUnretained(self).toOpaque()
+        guard let eventTap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: mask,
+            callback: Self.eventTapCallback,
+            userInfo: opaqueSelf
+        ) else {
+            AppLogger.hotkey.error(
+                "Unable to create event tap; Input Monitoring=\(CGPreflightListenEventAccess(), privacy: .public), Accessibility=\(AXIsProcessTrusted(), privacy: .public)"
             )
-        ) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(conflictMessage ?? "")
+            throw GlobalKeyMonitorError.eventTapUnavailable
         }
+
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
+        self.eventTap = eventTap
+        self.runLoopSource = source
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: eventTap, enable: true)
+        AppLogger.hotkey.info(
+            "Hyper+D event tap started; Input Monitoring=\(CGPreflightListenEventAccess(), privacy: .public), Accessibility=\(AXIsProcessTrusted(), privacy: .public)"
+        )
     }
 
-    private func startRecording() {
-        // Set this recorder as active (will automatically deactivate any other)
-        appState.activeHotkeyRecorder = recorderId
-
-        // Monitor for key events
-        localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { event in
-            self.handleKeyEvent(event)
-            return nil // Consume the event
-        }
-
-        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { event in
-            self.handleKeyEvent(event)
-        }
+    func stop() {
+        if let eventTap { CGEvent.tapEnable(tap: eventTap, enable: false) }
+        if let runLoopSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes) }
+        eventTap = nil
+        runLoopSource = nil
+        suppressedKeyUps.removeAll()
+        AppLogger.hotkey.info("Hyper+D event tap stopped")
     }
 
-    private func stopRecording() {
-        appState.activeHotkeyRecorder = nil
-        cleanupMonitors()
+    private static let eventTapCallback: CGEventTapCallBack = { _, type, event, userInfo in
+        guard let userInfo else { return Unmanaged.passUnretained(event) }
+        let manager = Unmanaged<HotkeyManager>.fromOpaque(userInfo).takeUnretainedValue()
+
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            AppLogger.hotkey.warning("Hyper+D event tap was disabled by the system; re-enabling it")
+            if let eventTap = manager.eventTap {
+                CGEvent.tapEnable(tap: eventTap, enable: true)
+            }
+            return Unmanaged.passUnretained(event)
+        }
+
+        return manager.handle(type: type, event: event)
     }
 
-    private func cleanupMonitors() {
-        if let monitor = localMonitor {
-            NSEvent.removeMonitor(monitor)
-            localMonitor = nil
+    func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+        let isDKey = keyCode == UInt16(kVK_ANSI_D)
+        let hyperD = isDKey && hasHyperModifiers(event.flags)
+        let timestamp = ProcessInfo.processInfo.systemUptime
+        let response: DictationEventResponse
+
+        switch type {
+        case .keyDown where hyperD:
+            let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+            response = isRepeat
+                ? .consume
+                : coordinator.hotkeyDown(at: timestamp, profileMode: profileMode())
+
+        // Recognize the initiating D key-up even if the user released one or
+        // more Hyper modifiers first.
+        case .keyUp where isDKey && coordinator.session?.hotkeyIsDown == true:
+            response = coordinator.hotkeyUp(at: timestamp, profileMode: profileMode())
+
+        case .keyUp where suppressedKeyUps.remove(keyCode) != nil:
+            response = .consume
+
+        case .keyDown where coordinator.phase.hasActiveSession:
+            if keyCode == UInt16(kVK_Escape) {
+                response = coordinator.escapePressed()
+            } else if keyCode == UInt16(kVK_Return) || keyCode == UInt16(kVK_ANSI_KeypadEnter) {
+                response = coordinator.enterPressed(
+                    modifiers: enterModifiers(from: event.flags),
+                    profileMode: profileMode()
+                )
+            } else {
+                response = coordinator.nonModifierKeyTyped()
+            }
+
+        default:
+            response = .passThrough
         }
 
-        if let monitor = globalMonitor {
-            NSEvent.removeMonitor(monitor)
-            globalMonitor = nil
+        if !response.effects.isEmpty {
+            DispatchQueue.main.async { [effectHandler] in effectHandler(response.effects) }
         }
+        if type == .keyDown,
+           response.consumeKeyEvent,
+           keyCode == UInt16(kVK_Return)
+               || keyCode == UInt16(kVK_ANSI_KeypadEnter)
+               || keyCode == UInt16(kVK_Escape)
+        {
+            suppressedKeyUps.insert(keyCode)
+        }
+        return response.consumeKeyEvent ? nil : Unmanaged.passUnretained(event)
     }
 
-    private func handleKeyEvent(_ event: NSEvent) {
-        // Only handle events if we're the active recorder
-        guard isRecording else { return }
+    private func hasHyperModifiers(_ flags: CGEventFlags) -> Bool {
+        let relevant: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate, .maskShift]
+        return flags.intersection(relevant) == relevant
+    }
 
-        // Ignore modifier-only events unless there's also a key
-        if event.type == .flagsChanged {
-            return
-        }
+    private func enterModifiers(from flags: CGEventFlags) -> EnterModifiers {
+        var result: EnterModifiers = []
+        if flags.contains(.maskAlternate) { result.insert(.option) }
+        if flags.contains(.maskShift) { result.insert(.shift) }
+        if flags.contains(.maskCommand) { result.insert(.command) }
+        if flags.contains(.maskControl) { result.insert(.control) }
+        if flags.contains(.maskSecondaryFn) { result.insert(.function) }
 
-        // Ignore escape - used to cancel
-        if event.keyCode == UInt16(kVK_Escape) {
-            stopRecording()
-            return
+        // CGEvent's low 16 bits identify left/right device keys and event
+        // metadata. Bits 16 and above are the device-independent modifier and
+        // special-key plane. Numeric-pad is key-origin metadata, so ignore it;
+        // fail closed for every other unclassified bit, including Caps Lock,
+        // Help, and future flags.
+        let classifiedFlags: CGEventFlags = [
+            .maskAlternate,
+            .maskShift,
+            .maskCommand,
+            .maskControl,
+            .maskSecondaryFn,
+            .maskNumericPad,
+        ]
+        let deviceIndependentFlags = flags.rawValue & ~UInt64(0xFFFF)
+        if deviceIndependentFlags & ~classifiedFlags.rawValue != 0 {
+            result.insert(.other)
         }
-
-        // Build modifiers
-        var modifiers: UInt32 = 0
-        if event.modifierFlags.contains(.option) {
-            modifiers |= UInt32(optionKey)
-        }
-        if event.modifierFlags.contains(.control) {
-            modifiers |= UInt32(controlKey)
-        }
-        if event.modifierFlags.contains(.shift) {
-            modifiers |= UInt32(shiftKey)
-        }
-        if event.modifierFlags.contains(.command) {
-            modifiers |= UInt32(cmdKey)
-        }
-
-        // Require at least one modifier for most keys (except F-keys)
-        let isFunctionKey = event.keyCode >= UInt16(kVK_F1) && event.keyCode <= UInt16(kVK_F20)
-        if modifiers == 0 && !isFunctionKey {
-            return
-        }
-
-        let newConfig = HotkeyConfig(keyCode: UInt32(event.keyCode), modifiers: modifiers)
-        if let conflict = appState.hotkeyConflictMessage(for: recorderId, pendingConfig: newConfig) {
-            conflictMessage = conflict
-            stopRecording()
-            return
-        }
-
-        config = newConfig
-        stopRecording()
+        return result
     }
 }

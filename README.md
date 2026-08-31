@@ -1,218 +1,140 @@
-# Overwhisper
+# Local Dictation
 
-<p align="center">
-  <img src="docs/icon.png" alt="Overwhisper icon" width="96" height="96">
-</p>
+Local Dictation is a local-first macOS menu-bar dictation app for Apple Silicon. Press Hyper+D, speak, and insert the transcript into the text field you were using. It is MIT licensed and does not require a subscription.
 
-<p align="center">
-  <strong>Fast, private dictation for macOS. Free and open source.</strong>
-</p>
+This repository is an active v1 implementation. The app builds and its 85 unit/contract tests across 16 suites pass on the current development host, but the final speech engine and Raycast cutover are deliberately **not claimed** until the checked-in benchmark and real-use gates pass.
 
-<p align="center">
-  Press a hotkey, speak, and Overwhisper inserts the text wherever your cursor is.
-  It lives in the menu bar, runs local WhisperKit or Parakeet speech-to-text on
-  your Mac by default, and does not ask you to rent access to hardware you
-  already bought.
-</p>
+## Privacy boundary
 
-<p align="center">
-  <a href="https://github.com/OverseedAI/overwhisper/releases/latest">Download</a>
-  ·
-  <a href="#features">Features</a>
-  ·
-  <a href="#building-from-source">Build from source</a>
-  ·
-  <a href="#contributing">Contribute</a>
-</p>
+- Microphone audio always stays on the Mac.
+- Speech recognition uses local FluidAudio or WhisperKit models only.
+- The app contains no telemetry SDK, cloud speech engine, Overseed service, or automatic updater.
+- Optional text cleanup may use Apple Foundation Models or an explicitly configured OpenAI-compatible `/v1/chat/completions` endpoint. A refiner receives transcript text and static rules only—never audio, destination app, browser hostname, field contents, or surrounding text.
+- Non-loopback refinement endpoints require explicit `allow_remote = true` and show a persistent **Remote** badge.
+- Temporary WAV files are deleted after ASR or cancellation. Debug audio retention is off by default.
 
-## Why Overwhisper?
+Run `scripts/privacy-audit.sh` to check the source-level network boundary. The normative invariants are in [docs/privacy-invariants.md](docs/privacy-invariants.md).
 
-There are plenty of dictation apps that run transcription on the user's own
-machine and still charge a subscription for the privilege. Overwhisper takes the
-more obvious deal: your Mac does the work, so the core app is free, local-first,
-and open source.
+## Controls
 
-The goal is not "voice notes". The goal is to make speaking into any Mac text
-field feel as direct as typing:
+The global shortcut is Hyper+D (`Command+Control+Option+Shift+D`):
 
-- Hold a hotkey while writing in Slack, Notes, Linear, your browser, or your IDE.
-- Choose WhisperKit or Parakeet local models for private, low-latency
-  transcription on Apple Silicon.
-- Keep a polished menu bar workflow with onboarding, model management, waveform
-  feedback, recent transcriptions, retry, and sensible failure handling.
-- Choose cloud transcription only when you explicitly want it.
+- Press and release within 350 ms to start toggle recording; press Hyper+D again to finish.
+- Hold longer than 350 ms for push-to-talk; release to finish.
+- Enter finishes in the active profile.
+- Option+Enter forces Literal mode.
+- Shift+Enter opens editable preview.
+- Option+Shift+Enter opens Literal preview.
+- Escape cancels and discards the session.
 
-## Download & Install
+If you type any other key while recording, Enter immediately and permanently returns to the foreground app for that session. The overlay says `Typing detected · Hyper+D to finish`; Hyper+D remains the finisher. Local Dictation never synthesizes Return and cannot auto-submit a form or terminal command.
 
-1. Download the latest signed DMG from
-   [GitHub Releases](https://github.com/OverseedAI/overwhisper/releases/latest).
-2. Open the DMG and drag **Overwhisper.app** into `/Applications`.
-3. Launch Overwhisper from Applications or Spotlight.
-4. Grant the requested permissions:
-   - **Microphone** records your speech.
-   - **Accessibility** lets Overwhisper paste text into the app you are using.
-5. Pick a model in Settings and start dictating.
+The overlay warns at 10 minutes. Recording stops at the hard 15-minute cap and opens preview instead of inserting automatically; configuration may shorten this cap but cannot extend it.
 
-Overwhisper is a menu bar app. It does not show a Dock icon.
+## Source build
 
-### Requirements
+Requirements:
 
-- macOS 14 Sonoma or later
-- Apple Silicon Mac, M1 or newer
-- Microphone and Accessibility permissions
+- Apple Silicon Mac
+- macOS 15 or newer
+- Xcode 16 or newer, including Swift 6 or newer and the macOS 15 SDK
+- Xcode Command Line Tools
+- A working Git installation
+- Internet access on the first setup run to fetch the pinned Swift packages
+- Free disk space for SwiftPM package checkouts and build caches, plus roughly 600 MB for the default local speech model
 
-Release builds are arm64-only.
+From a fresh clone:
 
-## Features
-
-### Local-first transcription
-
-- **WhisperKit** local transcription, optimized for Apple Silicon.
-- **Parakeet** local transcription via FluidAudio, including Parakeet v2 English
-  and Parakeet v3 multilingual model options.
-- **OpenAI Whisper API** as an optional cloud engine when you prefer hosted
-  transcription.
-- Download, select, and delete local models from the settings UI.
-
-### Built for real daily use
-
-- **Two hotkey styles:** `Option+Space` toggles recording, and
-  `Option+Shift+Space` is push-to-talk by default. Both are configurable.
-- **Tap-or-hold behavior:** tap the toggle hotkey to start/stop, or hold it like
-  push-to-talk and release to transcribe.
-- **Cursor-aware insertion:** text is pasted into the active app, not trapped in
-  a separate transcript window.
-- **Floating overlay:** configurable position with live waveform and transcribing
-  state.
-- **Menu bar controls:** start/stop recording, copy recent transcriptions, retry
-  the last failed transcription, open settings, and check for updates.
-- **Input device selection:** use the system default microphone or choose a
-  specific input device.
-
-### Quality-of-life tools
-
-- **Custom vocabulary** for names, acronyms, and project-specific terms.
-- **Text replacements** for fixing predictable mishearings, like
-  `Cloud Code -> Claude Code`.
-- **Language selection** with auto-detect, common Whisper languages, and
-  Parakeet language hints.
-- **Translate to English** when using a model/API mode that supports translation.
-- **Silent recording detection** so accidental empty captures can be skipped.
-- **Optional recording limit** for long-running hotkey mistakes.
-- **Optional system-audio mute** while recording with built-in speakers.
-- **Recent transcription history** and local debug sessions for playback, retry,
-  and troubleshooting.
-- **Sparkle updates** for signed release builds.
-
-## How It Works
-
-1. Focus any text field.
-2. Press your Overwhisper hotkey.
-3. Speak naturally.
-4. Release the push-to-talk hotkey, or press the toggle hotkey again.
-5. Overwhisper transcribes the audio and inserts the result at the cursor.
-
-If Accessibility permission is missing, Overwhisper copies the text to the
-clipboard and tells you to paste manually.
-
-## Privacy
-
-Overwhisper is local-first.
-
-- Audio stays on your Mac when using WhisperKit or Parakeet.
-- Audio is sent to OpenAI only when the OpenAI engine is selected, or when cloud
-  fallback has been enabled in local settings and a local transcription fails.
-- OpenAI API keys are stored in the macOS Keychain.
-- Recent debug sessions are stored locally under Application Support so you can
-  inspect audio, retry failures, and troubleshoot issues. The app keeps a capped
-  set of recent sessions and includes a Clear All control in Settings.
-- Anonymous usage analytics are optional and off until you choose to share them.
-  When enabled, Overwhisper sends app lifecycle events, basic app/device/OS
-  information, model choices, and bucketed dictation outcomes to PostHog through
-  Overseed's first-party proxy. An allowlist strips all other event fields. It never
-  sends audio, transcribed text, API keys, filenames, other app names, or raw errors.
-  You can change this choice at any time in Settings.
-
-## Building From Source
-
-Requires Xcode 15+ and Swift 5.9+.
-
-```bash
-swift build
-swift run Overwhisper
+```sh
+./setup
 ```
 
-Or use the Justfile:
+The setup script:
 
-```bash
-just build          # debug build
-just run            # run debug build
-just build-release  # release build
-just bundle         # create Overwhisper.app
+1. Validates macOS, architecture, Xcode, SDK, Swift, and Git.
+2. Resolves the pinned packages.
+3. Runs the unit and contract tests.
+4. Builds and ad-hoc signs `Local Dictation.app`.
+5. Installs it at `~/Applications/Local Dictation.app` and launches it.
+
+Previous local builds are retained under `.build/installed-app-backups/` rather than beside the installed app, so Launch Services sees only one `com.natemunk.LocalDictation` application in `~/Applications`.
+
+It works around the known local Xcode 26.6 `xcrun` private-framework mismatch by invoking the Xcode toolchain and macOS SDK directly when necessary. SwiftPM keeps its package checkout, cache, and build scratch data under `.build`, which can require substantial additional disk space beyond the app and model. It does not clear quarantine or pretend to notarize the build. Use `./setup --no-launch` in automation or `./setup --skip-tests` only when a test failure has already been investigated.
+
+For signed-app packaging, `./setup` applies the narrow checked-in patch in `patches/` to the exact pinned `swift-transformers` checkout so its fallback tokenizer bundle resolves from the standard macOS `Contents/Resources` directory. The generated checkout is restored when setup exits; project source and the package lock are never rewritten.
+
+On first launch, macOS asks for:
+
+- Microphone access for local capture.
+- Input Monitoring for Hyper+D and the Enter/Escape safety interlock.
+- Accessibility for clipboard plus synthetic Command+V insertion.
+
+The source build is ad-hoc signed, so its code identity changes whenever the executable is rebuilt. macOS may therefore require Input Monitoring and Accessibility to be removed and re-added after an update. Settings → General shows the current permission and Hyper+D listener state, opens both privacy panes, and can retry the listener after permission is restored.
+
+No speech model is downloaded before you choose **Finish Setup & Download Local Model** in onboarding. That explicit action downloads the selected model to the Mac; the default model is roughly 600 MB, and later transcription remains local.
+
+Browser Automation is not required. It is requested per browser only if the optional hostname-profile setting is enabled.
+
+## Configuration
+
+Editable TOML configuration is bootstrapped on first launch:
+
+```text
+~/.config/local-dictation/
+├── app.toml
+├── profiles.toml
+└── vocabulary/
+    ├── global.toml
+    └── packs/
+        └── symphony.toml
 ```
 
-For Xcode:
+Local values override typed defaults. A malformed edit is rejected transactionally and the last-known-good snapshot remains active. The Raycast importer accepts only a comma-separated string you explicitly paste; it never reads Raycast storage.
 
-```bash
-open Package.swift
+Native cutover profiles cover Ghostty, Slack, Linear, Notes, Notion, generic browsers, and a default Clean profile. Browser-hostname profiles are opt-in post-cutover behavior.
+
+## Benchmark
+
+The repository includes a standalone scorer for:
+
+- FluidAudio Parakeet v2 English.
+- FluidAudio Parakeet v3 multilingual.
+- WhisperKit `small.en`.
+- WhisperKit `large-v3_turbo`.
+
+Build and inspect it with:
+
+```sh
+swift build --product local-dictation-benchmark
+Benchmark/verify-fixtures.sh
 ```
 
-When running inside Codex or another Seatbelt sandbox, SwiftPM may fail while
-trying to create its own nested sandbox or write shared caches. Use:
+The synthetic fixtures verify scoring and selection mechanics only. They do not select an engine. Collect at least 20 fresh opt-in recordings and 10 raw-to-ideal cleanup pairs before invoking the real gate. See [Benchmark/README.md](Benchmark/README.md) and [docs/corpus-schema.md](docs/corpus-schema.md).
 
-```bash
-swift build --disable-sandbox --cache-path .swiftpm-cache
-```
-
-## Project Structure
+## Architecture
 
 ```text
 Overwhisper/
-├── App/              # App delegate, app state, onboarding, crash handling
-├── Audio/            # AVAudioEngine recording and device handling
-├── Hotkey/           # Global keyboard shortcuts via HotKey
-├── Logging/          # App logs and local debug session storage
-├── Output/           # Clipboard + synthetic Cmd+V text insertion
-├── Resources/        # App icon and bundled assets
-├── Transcription/    # WhisperKit, Parakeet, and OpenAI engines
-└── UI/               # Settings, overlay, menu bar icon, debug playback
+├── App/             # lifecycle and orchestration
+├── Audio/           # one 16 kHz mono capture and temporary WAV
+├── Cleanup/         # commands, vocabulary, refiners, alignment validator
+├── Configuration/   # TOML defaults, overrides, importer
+├── Core/            # testable dictation state machine
+├── History/         # GRDB, SQLite, and FTS5
+├── Hotkey/          # global event tap and typing interlock
+├── Output/          # destination capture and safe clipboard insertion
+├── Profiles/        # bundle ID, AX role/subrole, optional hostname matching
+├── Streaming/       # live finalized/volatile ASR adapters
+├── Transcription/   # local final-ASR candidates
+└── UI/              # non-activating overlay, preview, settings, history
 ```
 
-The core recording flow is:
+Core dependencies are pinned in `Package.resolved`: FluidAudio, WhisperKit, GRDB, and TOMLKit.
 
-1. `HotkeyManager` receives the global hotkey event.
-2. `AudioRecorder` records a 16 kHz mono WAV through `AVAudioEngine`.
-3. `OverlayWindow` shows recording and transcribing state.
-4. The selected `TranscriptionEngine` produces text.
-5. `TextInserter` pastes the final text into the active app.
+## Status and acceptance
 
-## Dependencies
+The full product requirements, corpus contracts, and acceptance matrix are checked in under [docs](docs). In particular, source compilation is not evidence that latency, accuracy, permissions, sleep/wake recovery, or the one-week Raycast cutover gates have passed.
 
-- [WhisperKit](https://github.com/argmaxinc/WhisperKit) for local Whisper models.
-- [FluidAudio](https://github.com/FluidInference/FluidAudio) for Parakeet ASR.
-- [HotKey](https://github.com/soffes/HotKey) for global shortcuts.
-- [Sparkle](https://github.com/sparkle-project/Sparkle) for app updates.
+## Origin and license
 
-## Contributing
-
-Contributions are welcome. Useful areas include:
-
-- Dictation UX polish and reliability.
-- Model download and setup experience.
-- Better language/model documentation.
-- Accessibility and permission-flow improvements.
-- Bug reports with macOS version, Mac model, selected engine/model, and the
-  relevant error from the menu bar or History tab.
-
-Please keep changes focused, use the existing SwiftUI/SwiftPM style, and prefer
-small pull requests that are easy to review.
-
-## Support
-
-Overwhisper is free and open source. If it saves you time and you want to support
-development, you can do that at
-[buymeacoffee.com/halshin](https://buymeacoffee.com/halshin).
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+Local Dictation was seeded from audited Overwhisper commit `b8ef86eb2fda65d7dcc68ab500fb371469c4d283`. Attribution is preserved in [NOTICE](NOTICE) and [LICENSE](LICENSE). Both the original MIT-licensed portions and new Local Dictation work are distributed under MIT.
