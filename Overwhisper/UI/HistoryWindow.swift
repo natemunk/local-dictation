@@ -10,13 +10,13 @@ final class HistoryWindowController {
         store: HistoryStore,
         onCopy: @escaping (String) -> Void,
         onRepaste: @escaping (String) -> Void,
-        onRetryPolish: @escaping (HistoryEntry) -> Void
+        onAddVocabularyCorrection: @escaping (HistoryEntry) -> Void
     ) {
         viewModel = HistoryViewModel(
             store: store,
             onCopy: onCopy,
             onRepaste: onRepaste,
-            onRetryPolish: onRetryPolish
+            onAddVocabularyCorrection: onAddVocabularyCorrection
         )
     }
 
@@ -59,18 +59,20 @@ private final class HistoryViewModel: ObservableObject {
     let store: HistoryStore
     let onCopy: (String) -> Void
     let onRepaste: (String) -> Void
-    let onRetryPolish: (HistoryEntry) -> Void
+    let onAddVocabularyCorrection: (HistoryEntry) -> Void
+    private var loadGeneration: UInt64 = 0
+    private var loadTask: Task<Void, Never>?
 
     init(
         store: HistoryStore,
         onCopy: @escaping (String) -> Void,
         onRepaste: @escaping (String) -> Void,
-        onRetryPolish: @escaping (HistoryEntry) -> Void
+        onAddVocabularyCorrection: @escaping (HistoryEntry) -> Void
     ) {
         self.store = store
         self.onCopy = onCopy
         self.onRepaste = onRepaste
-        self.onRetryPolish = onRetryPolish
+        self.onAddVocabularyCorrection = onAddVocabularyCorrection
     }
 
     var selectedEntry: HistoryEntry? {
@@ -78,37 +80,60 @@ private final class HistoryViewModel: ObservableObject {
     }
 
     func reload() {
-        do {
-            entries = query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                ? try store.fetchRecent(limit: 500)
-                : try store.search(query, limit: 500)
-            if !entries.contains(where: { $0.id == selection }) {
-                selection = entries.first?.id
+        loadGeneration &+= 1
+        let generation = loadGeneration
+        let requestedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        loadTask?.cancel()
+        loadTask = Task { @MainActor [weak self, store] in
+            do {
+                let loaded: [HistoryEntry]
+                if requestedQuery.isEmpty {
+                    loaded = try await store.fetchRecent(limit: 500)
+                } else {
+                    loaded = try await store.search(requestedQuery, limit: 500)
+                }
+                guard !Task.isCancelled,
+                      let self,
+                      self.loadGeneration == generation
+                else { return }
+                self.entries = loaded
+                if !loaded.contains(where: { $0.id == self.selection }) {
+                    self.selection = loaded.first?.id
+                }
+                self.errorMessage = nil
+            } catch is CancellationError {
+                return
+            } catch {
+                guard let self, self.loadGeneration == generation else { return }
+                self.errorMessage = error.localizedDescription
             }
-            errorMessage = nil
-        } catch {
-            errorMessage = error.localizedDescription
         }
     }
 
     func deleteSelected() {
         guard let selection else { return }
-        do {
-            _ = try store.delete(id: selection)
-            self.selection = nil
-            reload()
-        } catch {
-            errorMessage = error.localizedDescription
+        Task { @MainActor [weak self, store] in
+            do {
+                _ = try await store.delete(id: selection)
+                guard let self else { return }
+                self.selection = nil
+                self.reload()
+            } catch {
+                self?.errorMessage = error.localizedDescription
+            }
         }
     }
 
     func deleteAll() {
-        do {
-            _ = try store.deleteAll()
-            selection = nil
-            reload()
-        } catch {
-            errorMessage = error.localizedDescription
+        Task { @MainActor [weak self, store] in
+            do {
+                _ = try await store.deleteAll()
+                guard let self else { return }
+                self.selection = nil
+                self.reload()
+            } catch {
+                self?.errorMessage = error.localizedDescription
+            }
         }
     }
 }
@@ -192,16 +217,15 @@ private struct HistoryView: View {
                 Button("Copy") { viewModel.onCopy(entry.deliveredText) }
                 Button("Repaste Here") { viewModel.onRepaste(entry.deliveredText) }
                     .buttonStyle(.borderedProminent)
+                Button("Add Vocabulary Correction…") {
+                    viewModel.onAddVocabularyCorrection(entry)
+                }
             }
 
             if entry.refinementStatus == .failed {
-                HStack {
-                    Label("Polish failed; deterministic text was retained", systemImage: "exclamationmark.triangle")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                    Spacer()
-                    Button("Retry Polish") { viewModel.onRetryPolish(entry) }
-                }
+                Label("Model cleanup failed; deterministic text was retained", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
             }
 
             HSplitView {

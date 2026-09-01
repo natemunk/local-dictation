@@ -16,12 +16,14 @@ struct AppStatePreferencesTests {
         first.selectedInputDeviceUID = "test-microphone"
         first.asrSelection = .whisperLargeV3Turbo
         first.privateClipboardMode = true
+        first.experimentalModelCleanupEnabled = true
 
         let restored = AppState(preferences: defaults)
         #expect(restored.overlayPosition == .topRight)
         #expect(restored.selectedInputDeviceUID == "test-microphone")
         #expect(restored.asrSelection == .whisperLargeV3Turbo)
         #expect(restored.privateClipboardMode)
+        #expect(restored.experimentalModelCleanupEnabled)
     }
 
     @Test("unknown persisted values fall back to safe defaults")
@@ -37,6 +39,58 @@ struct AppStatePreferencesTests {
         let state = AppState(preferences: defaults)
         #expect(state.overlayPosition == .bottomCenter)
         #expect(state.asrSelection == .parakeetV2)
+        #expect(!state.experimentalModelCleanupEnabled)
+    }
+
+    @Test("Keychain identity is constant and legacy migration writes before deleting")
+    func keychainMigrationIsScopedAndOrdered() throws {
+        #expect(KeychainStore.service == "com.natemunk.LocalDictation")
+
+        let account = LocalDictationKeychainAccount.openAICompatibleRefiner
+        var values = ["legacy.dev": "secret"]
+        var events: [String] = []
+        let value = KeychainStore.migrateValue(
+            account: account,
+            legacyServices: ["legacy.dev"],
+            read: { values["\($0)|\($1)"] ?? values[$0] },
+            write: { value, service, account in
+                events.append("write:\(service):\(account)")
+                values["\(service)|\(account)"] = value
+            },
+            delete: { service, account in
+                events.append("delete:\(service):\(account)")
+                values.removeValue(forKey: service)
+            }
+        )
+
+        #expect(value == "secret")
+        #expect(events == [
+            "write:com.natemunk.LocalDictation:\(account)",
+            "delete:legacy.dev:\(account)",
+        ])
+        #expect(values["com.natemunk.LocalDictation|\(account)"] == "secret")
+        #expect(values["legacy.dev"] == nil)
+    }
+
+    @Test("a failed Keychain migration never deletes the legacy item")
+    func failedKeychainMigrationPreservesLegacy() {
+        struct WriteFailure: Error {}
+        var deleted = false
+
+        do {
+            _ = try KeychainStore.migrateValue(
+                account: "refiner",
+                legacyServices: ["legacy.dev"],
+                read: { service, _ in service == "legacy.dev" ? "secret" : nil },
+                write: { _, _, _ in throw WriteFailure() },
+                delete: { _, _ in deleted = true }
+            )
+            Issue.record("Expected the migration write to fail")
+        } catch is WriteFailure {
+            #expect(!deleted)
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
     }
 
     @Test("legacy engine and model preferences migrate once")

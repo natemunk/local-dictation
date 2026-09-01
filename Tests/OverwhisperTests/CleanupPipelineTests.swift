@@ -237,6 +237,19 @@ struct CleanupPipelineTests {
         }
     }
 
+    @Test("malformed protected expressions fail without a forced regex crash")
+    func malformedProtectedExpression() {
+        let processor = CleanupVocabularyProcessor(
+            protectedPatterns: [
+                CleanupProtectedPattern(name: "broken", expression: "[")
+            ]
+        )
+
+        #expect(throws: CleanupVocabularyError.self) {
+            try processor.process("safe transcript")
+        }
+    }
+
     @Test("standard patterns protect paths tickets acronyms and identifiers without overlaps")
     func standardProtectedPatterns() throws {
         let source = #"MYE-2076 keeps AI and D196 at "/Users/nmunk/Library/Application Support/LocalDictation/config.toml"; cache ~/Library/Caches/LocalDictation; use URLSession, TextRefiner, and allow_remote."#
@@ -267,7 +280,17 @@ struct CleanupPipelineTests {
             protectedSpans: vocabulary.protectedSpans
         )
         let validator = RefinementValidator()
-        #expect(try validator.validate(generated: "• \(source)", against: input) == "• \(source)")
+        #expect(try validator.validate(generated: source, against: input) == source)
+
+        do {
+            try validator.validate(generated: "• \(source)", against: input)
+            Issue.record("Expected inferred bullet formatting to be rejected")
+        } catch let failure as RefinementValidationFailure {
+            guard case .inferredBulletFormatting = failure else {
+                Issue.record("Unexpected failure: \(failure)")
+                return
+            }
+        }
 
         do {
             try validator.validate(
@@ -406,6 +429,41 @@ struct CleanupPipelineTests {
 
         #expect(result.text == "we should ship.")
         #expect(result.outcome == .accepted)
+    }
+
+    @Test("one enclosing code fence is unwrapped after output normalization")
+    func wholeResponseFenceIsUnwrapped() async throws {
+        let pipeline = CleanupPipeline(
+            refiner: FixedCleanupRefiner(
+                output: "\u{FEFF}```text\r\nwe should ship\r\n```\r\n"
+            )
+        )
+
+        let result = try await pipeline.process("we should ship", mode: .clean)
+
+        #expect(result.text == "we should ship")
+        #expect(result.outcome == .accepted)
+    }
+
+    @Test("preambles and malformed fences reject the whole model output")
+    func modelWrappersFailClosed() async throws {
+        for output in [
+            "Here is the cleaned text: we should ship",
+            "Result:\n```text\nwe should ship\n```",
+            "```text\nwe should ship\n```\n```",
+            "we\u{202E} should ship",
+            String(repeating: ".", count: 5_000) + "we should ship",
+        ] {
+            let result = try await CleanupPipeline(
+                refiner: FixedCleanupRefiner(output: output)
+            ).process("we should ship", mode: .clean)
+
+            #expect(result.text == "we should ship")
+            guard case .deterministicFallback = result.outcome else {
+                Issue.record("Expected model output wrapper rejection for \(output)")
+                continue
+            }
+        }
     }
 
     @Test("invalid generated text falls back deterministically with the validation failure")

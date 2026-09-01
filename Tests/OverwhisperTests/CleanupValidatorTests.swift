@@ -6,7 +6,7 @@ import Testing
 struct CleanupValidatorTests {
     private let validator = RefinementValidator()
 
-    @Test("case punctuation apostrophes whitespace line breaks and bullets are permitted")
+    @Test("case punctuation apostrophes whitespace and line breaks are permitted")
     func formattingOnlyChanges() throws {
         let source = "dont ship um OpenRouter today"
         let input = TextRefinementInput(
@@ -15,7 +15,7 @@ struct CleanupValidatorTests {
             protectedSpans: [protected("OpenRouter", in: source)]
         )
 
-        let generated = "• Don't ship OpenRouter\nTODAY!"
+        let generated = "Don't ship OpenRouter\nTODAY!"
         #expect(try validator.validate(generated: generated, against: input) == generated)
     }
 
@@ -191,6 +191,49 @@ struct CleanupValidatorTests {
             #expect(name == "test")
             #expect(expected == 1)
             #expect(actual == 2)
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+    }
+
+    @Test("protected terms align atomically instead of matching inside longer words")
+    func protectedAtomicAlignment() throws {
+        let source = "API and APIs"
+        let input = TextRefinementInput(
+            transcript: source,
+            candidateDisfluencies: [],
+            protectedSpans: [protected("API", in: source)]
+        )
+
+        #expect(try validator.validate(generated: source, against: input) == source)
+    }
+
+    @Test("bullet formatting requires and preserves an explicit command result")
+    func bulletsStayExplicit() {
+        let prose = TextRefinementInput(
+            transcript: "alpha beta",
+            candidateDisfluencies: [],
+            protectedSpans: []
+        )
+        do {
+            try validator.validate(generated: "- alpha\n- beta", against: prose)
+            Issue.record("Expected inferred bullet formatting to fail")
+        } catch let failure as RefinementValidationFailure {
+            #expect(failure == .inferredBulletFormatting)
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+
+        let bullets = TextRefinementInput(
+            transcript: "- alpha\n- beta",
+            candidateDisfluencies: [],
+            protectedSpans: []
+        )
+        do {
+            try validator.validate(generated: "alpha beta", against: bullets)
+            Issue.record("Expected explicit bullet formatting removal to fail")
+        } catch let failure as RefinementValidationFailure {
+            #expect(failure == .explicitBulletFormattingRemoved)
         } catch {
             Issue.record("Unexpected error: \(error)")
         }

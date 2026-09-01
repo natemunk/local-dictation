@@ -20,6 +20,12 @@ private struct ActiveDictationSession {
     var deliveredText = ""
     var historyID: UUID?
     var refinementStatus: HistoryRefinementStatus = .notRequested
+    var asrOutcome = "final"
+    var refinerBackend: String?
+    var refinementOutcome: String?
+    var validationFailureKind: String?
+    var refinementError: String?
+    var stoppedAt: Date?
     var pastedRaw = false
     var cleanupMode: CleanupMode = .clean
     var deliveryCommitted = false
@@ -41,7 +47,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let coordinator = DictationCoordinator(tapHoldThreshold: 0.350)
     private let configurationStore = ConfigurationStore()
-    private let browserHostnameProvider = BrowserAutomationHostnameProvider()
     private let pasteAgainQueue = SerializedPasteAgainQueue()
     private var configuration = ConfigurationSnapshot.typedDefaults
     private var profileResolver = ProfileResolver(catalog: .nativeDefaults)
@@ -69,6 +74,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var cancellables = Set<AnyCancellable>()
     private var engineTask: Task<Void, Never>?
+    private var historyMaintenanceTask: Task<Void, Never>?
     private var engineReloadPending = false
     private var historyRepasteDestination: DictationDestination?
     private var activeSession: ActiveDictationSession?
@@ -76,6 +82,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let onboardingKey = "LocalDictation.hasCompletedOnboarding.v1"
     private static let configurationDirectory = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".config/local-dictation", isDirectory: true)
+    private static let fallbackCompiledVocabulary = (
+        try? VocabularyCatalog.nativeDefaults
+            .selection(including: [])
+            .compileForCleanup()
+    ) ?? .empty
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         cleanupOrphanedTemporaryAudio()
@@ -99,6 +110,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         engineTask?.cancel()
+        historyMaintenanceTask?.cancel()
         pasteAgainQueue.cancelPending()
         if let session = activeSession {
             session.finalizationTask?.cancel()
@@ -169,7 +181,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 store: historyStore,
                 onCopy: { [weak self] text in self?.textInserter.copyOnly(text) },
                 onRepaste: { [weak self] text in self?.repasteHistoryText(text) },
-                onRetryPolish: { [weak self] entry in self?.retryPolish(entry) }
+                onAddVocabularyCorrection: { [weak self] entry in
+                    self?.promptForVocabularyCorrection(from: entry)
+                }
             )
         }
         previewWindow = PreviewWindowController(
@@ -247,6 +261,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 } catch {
                     self?.appState.lastError = "Could not update the refiner key: \(error.localizedDescription)"
                 }
+            }
+            .store(in: &cancellables)
+
+        appState.$experimentalModelCleanupEnabled
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                self?.updateRefinerPrivacyState()
             }
             .store(in: &cancellables)
 
@@ -451,7 +473,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 Task { @MainActor [weak self] in
                     await Task.yield()
-                    self?.cancelActiveSession(token: token)
+                    await self?.cancelActiveSession(token: token)
                 }
             case .interleavedTypingChanged(let token, let detected):
                 guard isCurrent(token) else { continue }
@@ -648,7 +670,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func beginFinalization(_ request: DictationFinishRequest) {
         guard isCurrent(request.token) else { return }
-        updateSession(request.token) { $0.state = .finalizing }
+        updateSession(request.token) {
+            $0.state = .finalizing
+            $0.stoppedAt = Date()
+        }
         appState.endRecordingClock()
         appState.phase = .finalizing
         appState.overlayMessage = "Finalizing"
@@ -723,9 +748,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 await self?.finishStreamingTranscript(token: request.token)
             }
             do {
-                let resolvedProfile = await self.resolveProfileIncludingHostname(
-                    for: destination
-                )
+                let resolvedProfile = self.resolveProfile(for: destination)
                 try Task.checkCancellation()
                 guard self.isCurrent(request.token) else { return }
                 self.updateSession(request.token) { $0.profile = resolvedProfile.profile }
@@ -777,7 +800,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         error: "Batch ASR failed; opened the local EOU transcript in preview",
                         token: request.token
                     )
-                    self.handleEOUFallback(
+                    await self.handleEOUFallback(
                         fallback.transcript,
                         batchError: error,
                         token: request.token,
@@ -805,20 +828,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         batchError: Error,
         token: DictationSessionToken,
         asrLatency: Double
-    ) {
+    ) async {
         guard isCurrent(token), !raw.text.isEmpty else { return }
         updateSession(token) { session in
             session.rawText = raw.text
             session.deliveredText = raw.text
             session.cleanupMode = .literal
             session.refinementStatus = .notRequested
+            session.asrOutcome = "eou_preview_fallback"
+            session.refinerBackend = "none"
+            session.refinementOutcome = "not_requested"
             session.pastedRaw = true
         }
         appState.lastTranscription = raw.text
         lastTextMenuItem?.isEnabled = true
         pasteLastMenuItem?.isEnabled = true
 
-        guard saveRawHistory(
+        guard await saveRawHistory(
             token: token,
             mode: .literal,
             asrLatency: asrLatency,
@@ -838,7 +864,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         do {
-            _ = try historyStore.finalize(
+            _ = try await historyStore.finalize(
                 id: id,
                 with: HistoryFinalization(
                     polishedText: raw.text,
@@ -848,7 +874,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     totalLatency: activeSession.map {
                         Date().timeIntervalSince($0.startedAt)
                     },
-                    error: "Batch ASR failed; EOU preview fallback: \(batchError.localizedDescription)"
+                    error: "Batch ASR failed; EOU preview fallback: \(batchError.localizedDescription)",
+                    asrSelection: activeSession?.asrSelection.rawValue,
+                    asrOutcome: "eou_preview_fallback",
+                    refinerBackend: "none",
+                    refinementOutcome: "not_requested"
                 )
             )
         } catch {
@@ -892,7 +922,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 recognizedCommands: [],
                 unrecognizedCommandCandidates: []
             )
-        guard saveRawHistory(
+        guard await saveRawHistory(
             token: token,
             mode: cleanupMode,
             asrLatency: asrLatency,
@@ -910,6 +940,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let refinementStarted = Date()
+        let refinerBackend = cleanupMode == .clean
+            ? configuredRefinerBackendName()
+            : "none"
         if cleanupMode == .clean {
             guard coordinator.transition(token: token, to: .polishing) else { return }
             updateSession(token) { $0.state = .polishing }
@@ -926,19 +959,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard isCurrent(token) else { return }
             updateSession(token) { session in
                 session.deliveredText = result.text
+                session.refinerBackend = refinerBackend
+                session.validationFailureKind = nil
+                session.refinementError = nil
                 switch result.outcome {
                 case .skippedLiteralMode:
                     session.refinementStatus = .notRequested
+                    session.refinementOutcome = "not_requested"
                     session.pastedRaw = false
                 case .accepted:
                     session.refinementStatus = .succeeded
+                    session.refinementOutcome = refinerBackend == "deterministic"
+                        ? "deterministic"
+                        : "accepted"
                     session.pastedRaw = false
-                case .deterministicFallback:
+                case .deterministicFallback(let reason):
                     session.refinementStatus = .failed
+                    session.refinementOutcome = "deterministic_fallback"
+                    switch reason {
+                    case .refinerFailure(let message):
+                        session.refinementError = message
+                    case .validationFailure(let failure):
+                        session.refinementError = failure.description
+                        session.validationFailureKind = Self.historyValidationFailureKind(failure)
+                    }
                     session.pastedRaw = true
                 }
             }
-            finalizeHistoryBeforeDelivery(
+            await finalizeHistoryBeforeDelivery(
                 token: token,
                 refinementLatency: Date().timeIntervalSince(refinementStarted)
             )
@@ -949,12 +997,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             updateSession(token) {
                 $0.deliveredText = $0.rawText
                 $0.refinementStatus = cleanupMode == .literal ? .notRequested : .failed
+                $0.refinerBackend = refinerBackend
+                $0.refinementOutcome = cleanupMode == .literal
+                    ? "not_requested"
+                    : "failed"
+                $0.refinementError = error.localizedDescription
                 $0.pastedRaw = cleanupMode == .clean
             }
             if cleanupMode == .clean {
-                markHistoryPolishFailed(token: token, error.localizedDescription)
+                await markHistoryPolishFailed(
+                    token: token,
+                    error.localizedDescription,
+                    refinementLatency: Date().timeIntervalSince(refinementStarted)
+                )
             } else {
-                finalizeHistoryBeforeDelivery(
+                await finalizeHistoryBeforeDelivery(
                     token: token,
                     refinementLatency: Date().timeIntervalSince(refinementStarted)
                 )
@@ -1018,7 +1075,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch outcome {
         case .pasteEventSent:
             appState.overlayMessage = showRawLabel ? "Paste sent · raw" : "Paste sent"
-            updateHistoryDelivery(
+            await updateHistoryDelivery(
                 token: token,
                 status: .pasteEventSent,
                 deliveredText: insertionText
@@ -1027,7 +1084,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .clipboardOnly(let reason):
             appState.overlayMessage = "Copied to clipboard"
             appState.lastError = reason
-            updateHistoryDelivery(
+            await updateHistoryDelivery(
                 token: token,
                 status: .clipboardOnly,
                 deliveredText: insertionText,
@@ -1037,7 +1094,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .historyOnly(let reason):
             appState.overlayMessage = "Saved to history"
             appState.lastError = reason
-            updateHistoryDelivery(
+            await updateHistoryDelivery(
                 token: token,
                 status: .historyOnly,
                 deliveredText: insertionText,
@@ -1045,7 +1102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             updateSession(token) { $0.deliveryCommitted = true }
         case .cancelled:
-            updateHistoryDelivery(
+            await updateHistoryDelivery(
                 token: token,
                 status: .cancelled,
                 deliveredText: insertionText,
@@ -1082,9 +1139,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !textInserter.copyOnly(text) {
             appState.lastError = "Could not copy the preview text to the clipboard"
         }
-        updateHistoryDelivery(token: token, status: .previewed, deliveredText: text)
         previewWindow.close(token: token)
-        completeSession(token: token)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.updateHistoryDelivery(
+                token: token,
+                status: .previewed,
+                deliveredText: text
+            )
+            guard self.isCurrent(token) else { return }
+            self.completeSession(token: token)
+        }
     }
 
     private func cancelPreview(token: DictationSessionToken) {
@@ -1096,7 +1161,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         execute(coordinator.escapePressed().effects)
     }
 
-    private func cancelActiveSession(token: DictationSessionToken) {
+    private func cancelActiveSession(token: DictationSessionToken) async {
         guard let session = activeSession, session.token == token else { return }
         let pasteMayHaveBeenCommitted = appState.phase == .pasting
         session.finalizationTask?.cancel()
@@ -1105,7 +1170,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !session.deliveryCommitted,
            let historyID = session.historyID,
            let historyStore {
-            _ = try? historyStore.updateDelivery(
+            _ = try? await historyStore.updateDelivery(
                 id: historyID,
                 with: HistoryDeliveryUpdate(
                     status: .cancelled,
@@ -1269,8 +1334,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         configuration = result.snapshot
         profileResolver = ProfileResolver(
             catalog: configuration.profiles,
-            defaultProfileID: configuration.app.defaultProfileID,
-            hostnameMatchingEnabled: configuration.app.hostnameMatchingEnabled
+            defaultProfileID: configuration.app.defaultProfileID
         )
         coordinator.updateTapHoldThreshold(
             Double(configuration.app.tapHoldThresholdMilliseconds) / 1_000
@@ -1285,16 +1349,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appState.retainDebugAudio = preferences.bool(
             forKey: LocalDictationPreferenceKey.retainDebugAudio
         )
+        updateRefinerPrivacyState()
+        appState.configurationDiagnostic = result.diagnostic?.message
+        appState.configurationNotices = result.notices.map(\.message)
+        if let historyStore {
+            startHistoryMaintenance(for: historyStore)
+        }
+    }
+
+    private func updateRefinerPrivacyState() {
         appState.isRemoteRefiner = configuredRefinerIsRemote
         remoteMenuItem?.isHidden = !appState.isRemoteRefiner
         statusItem?.button?.toolTip = appState.isRemoteRefiner
             ? "Local Dictation · REMOTE text refiner active"
             : "Local Dictation"
-        if let diagnostic = result.diagnostic {
-            appState.lastError = "Configuration not applied: \(diagnostic.message)"
-        } else if !bootstrap {
-            appState.lastError = nil
-        }
     }
 
     private func setupHistoryStore() {
@@ -1310,14 +1378,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 isDirectory: true
             )
             let store = try HistoryStore(databaseURL: directory.appendingPathComponent("history.sqlite"))
-            _ = try store.pruneSuccessfulEntries(
-                policy: HistoryRetentionPolicy(
-                    successRetentionDays: configuration.app.historySuccessRetentionDays
-                )
-            )
             historyStore = store
+            startHistoryMaintenance(for: store)
         } catch {
             appState.lastError = "History is unavailable: \(error.localizedDescription)"
+        }
+    }
+
+    private func startHistoryMaintenance(for store: HistoryStore) {
+        historyMaintenanceTask?.cancel()
+        let policy = HistoryRetentionPolicy(
+            retentionDays: configuration.app.historySuccessRetentionDays
+        )
+        historyMaintenanceTask = Task { @MainActor [weak self, store] in
+            while !Task.isCancelled {
+                do {
+                    _ = try await store.pruneEntries(policy: policy)
+                } catch is CancellationError {
+                    return
+                } catch {
+                    self?.appState.lastError = "History retention failed: \(error.localizedDescription)"
+                }
+
+                do {
+                    try await Task.sleep(for: .seconds(24 * 60 * 60))
+                } catch {
+                    return
+                }
+            }
         }
     }
 
@@ -1336,25 +1424,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
         }
         return profileResolver.resolve(profileContext(for: destination))
-    }
-
-    private func resolveProfileIncludingHostname(
-        for destination: DictationDestination?
-    ) async -> ResolvedProfile {
-        if destination?.isTerminal == true {
-            return resolveProfile(for: destination)
-        }
-        let context = profileContext(for: destination)
-        do {
-            return try await profileResolver.resolve(
-                context,
-                using: browserHostnameProvider
-            )
-        } catch {
-            // Browser profiles are optional. Permission denial and adapter
-            // errors always retain the generic native browser profile.
-            return profileResolver.resolve(context)
-        }
     }
 
     private func profileContext(
@@ -1398,38 +1467,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func makeCleanupPipeline(for profile: DictationProfile) -> CleanupPipeline {
-        let vocabulary = selectedVocabulary(for: profile)
-        var replacements: [CleanupVocabularyReplacement] = vocabulary.replacements.map {
-            CleanupVocabularyReplacement(
-                spokenForm: $0.key,
-                writtenForm: $0.value,
-                isProtected: true
+        let compiled = configurationStore.compiledVocabulary(forProfileID: profile.id)
+            ?? configurationStore.compiledVocabulary(
+                forProfileID: configuration.app.defaultProfileID
             )
-        }
-        replacements.append(contentsOf: vocabulary.literalPhrases.map {
-            CleanupVocabularyReplacement(spokenForm: $0, writtenForm: $0, isProtected: true)
-        })
-        replacements.append(contentsOf: vocabulary.protectedTerms.map {
-            CleanupVocabularyReplacement(spokenForm: $0, writtenForm: $0, isProtected: true)
-        })
-
-        let configuredPatterns = vocabulary.patterns.map { pattern in
-            CleanupProtectedPattern(
-                name: pattern.name,
-                expression: #"\b"#
-                    + NSRegularExpression.escapedPattern(for: pattern.prefix)
-                    + #"\d+\b"#,
-                isCaseInsensitive: true
-            )
-        }
+            ?? Self.fallbackCompiledVocabulary
         return CleanupPipeline(
-            vocabularyReplacements: replacements,
-            protectedPatterns: CleanupProtectedPattern.standard + configuredPatterns,
-            refiner: configuredTextRefiner(for: profile)
+            compiledVocabulary: compiled,
+            refiner: configuredTextRefiner()
         )
     }
 
-    private func configuredTextRefiner(for profile: DictationProfile) -> any TextRefiner {
+    private func configuredTextRefiner() -> any TextRefiner {
+        guard appState.experimentalModelCleanupEnabled else {
+            return DeterministicRefiner()
+        }
         let app = configuration.app
         let deadline = Duration.milliseconds(
             Int64(max(1, (app.refinementDeadlineSeconds * 1_000).rounded()))
@@ -1454,11 +1506,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        return ProfileFormattingRefiner(
-            base: base,
-            allowInferredBullets: false,
-            preserveParagraphBreakCount: profile.formattingStyle != .structured
-        )
+        return base
+    }
+
+    private func configuredRefinerBackendName() -> String {
+        guard appState.experimentalModelCleanupEnabled else {
+            return "deterministic"
+        }
+        switch configuration.app.refinerMode {
+        case .deterministic:
+            return "deterministic"
+        case .openAICompatible:
+            return configuration.app.refinerEndpoint != nil
+                && configuration.app.refinerModel != nil
+                ? "openai_compatible"
+                : "deterministic"
+        case .auto:
+            if configuration.app.refinerEndpoint != nil,
+               configuration.app.refinerModel != nil {
+                return "openai_compatible"
+            }
+            return SystemAppleFoundationModelAdapter().availability() == .available
+                ? "apple_foundation"
+                : "deterministic"
+        }
+    }
+
+    private static func historyValidationFailureKind(
+        _ failure: RefinementValidationFailure
+    ) -> String {
+        switch failure {
+        case .invalidCandidateRange:
+            "invalid_candidate_range"
+        case .invalidProtectedRange:
+            "invalid_protected_range"
+        case .protectedSpanSourceMismatch:
+            "protected_span_source_mismatch"
+        case .overlappingProtectedSpans:
+            "overlapping_protected_spans"
+        case .protectedSpanCountMismatch:
+            "protected_span_count_mismatch"
+        case .protectedSpanOrderChanged:
+            "protected_span_order_changed"
+        case .inferredBulletFormatting:
+            "inferred_bullet_formatting"
+        case .explicitBulletFormattingRemoved:
+            "explicit_bullet_formatting_removed"
+        case .unexpectedLexicalToken:
+            "unexpected_lexical_token"
+        case .deletionOutsideCandidate:
+            "deletion_outside_candidate"
+        case .excessiveLexicalDeletion:
+            "excessive_lexical_deletion"
+        }
     }
 
     private func openAICompatibleRefiner(deadline: Duration) -> OpenAICompatibleRefiner? {
@@ -1478,7 +1578,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var configuredRefinerIsRemote: Bool {
-        guard configuration.app.refinerMode != .deterministic,
+        guard appState.experimentalModelCleanupEnabled,
+              configuration.app.refinerMode != .deterministic,
               let host = configuration.app.refinerEndpoint?.host?.lowercased()
         else { return false }
         if host == "localhost" || host.hasSuffix(".localhost") || host == "::1" {
@@ -1526,7 +1627,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mode: CleanupMode,
         asrLatency: TimeInterval,
         unrecognizedCommands: [String]
-    ) -> Bool {
+    ) async -> Bool {
         guard let historyStore,
               let session = activeSession,
               session.token == token
@@ -1536,7 +1637,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let id = token.id
         do {
-            _ = try historyStore.saveRaw(
+            _ = try await historyStore.saveRaw(
                 HistoryRawCapture(
                     id: id,
                     rawText: session.rawText,
@@ -1546,13 +1647,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     ),
                     mode: mode == .literal ? .literal : .clean,
                     asrLatency: asrLatency,
-                    unrecognizedCommandCandidates: unrecognizedCommands
+                    unrecognizedCommandCandidates: unrecognizedCommands,
+                    asrSelection: session.asrSelection.rawValue,
+                    asrOutcome: session.asrOutcome
                 )
             )
+            guard let current = activeSession,
+                  current.token == token,
+                  !current.cancellationRequested
+            else {
+                _ = try? await historyStore.updateDelivery(
+                    id: id,
+                    with: HistoryDeliveryUpdate(
+                        status: .cancelled,
+                        error: "Dictation was cancelled before delivery"
+                    )
+                )
+                return false
+            }
             updateSession(token) { $0.historyID = id }
             return true
         } catch {
-            appState.lastError = "Could not save raw history: \(error.localizedDescription)"
+            if isCurrent(token) {
+                appState.lastError = "Could not save raw history: \(error.localizedDescription)"
+            }
             return false
         }
     }
@@ -1560,45 +1678,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func finalizeHistoryBeforeDelivery(
         token: DictationSessionToken,
         refinementLatency: TimeInterval
-    ) {
+    ) async {
         guard let historyStore,
               let session = activeSession,
               session.token == token,
               let id = session.historyID
         else { return }
         do {
-            _ = try historyStore.finalize(
+            _ = try await historyStore.finalize(
                 id: id,
                 with: HistoryFinalization(
                     polishedText: session.deliveredText,
                     refinementStatus: session.refinementStatus,
                     deliveryStatus: .pending,
                     refinementLatency: refinementLatency,
-                    totalLatency: Date().timeIntervalSince(session.startedAt)
+                    totalLatency: Date().timeIntervalSince(session.startedAt),
+                    error: session.refinementError,
+                    asrSelection: session.asrSelection.rawValue,
+                    asrOutcome: session.asrOutcome,
+                    refinerBackend: session.refinerBackend,
+                    refinementOutcome: session.refinementOutcome,
+                    validationFailureKind: session.validationFailureKind
                 )
             )
         } catch {
-            appState.lastError = "Could not update history: \(error.localizedDescription)"
+            if isCurrent(token) {
+                appState.lastError = "Could not update history: \(error.localizedDescription)"
+            }
         }
     }
 
     private func markHistoryPolishFailed(
         token: DictationSessionToken,
-        _ error: String
-    ) {
+        _ error: String,
+        refinementLatency: TimeInterval? = nil
+    ) async {
         guard let historyStore,
               let session = activeSession,
               session.token == token,
               let id = session.historyID
         else { return }
         do {
-            _ = try historyStore.markPolishFailed(
+            _ = try await historyStore.markPolishFailed(
                 id: id,
                 error: error,
-                totalLatency: Date().timeIntervalSince(session.startedAt)
+                refinementLatency: refinementLatency,
+                totalLatency: Date().timeIntervalSince(session.startedAt),
+                asrSelection: session.asrSelection.rawValue,
+                asrOutcome: session.asrOutcome,
+                refinerBackend: session.refinerBackend,
+                refinementOutcome: session.refinementOutcome,
+                validationFailureKind: session.validationFailureKind
             )
         } catch {
-            appState.lastError = "Could not mark failed polish: \(error.localizedDescription)"
+            if isCurrent(token) {
+                appState.lastError = "Could not mark failed polish: \(error.localizedDescription)"
+            }
         }
     }
 
@@ -1607,24 +1742,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         status: HistoryDeliveryStatus,
         deliveredText: String,
         error: String? = nil
-    ) {
+    ) async {
         guard let historyStore,
               let session = activeSession,
               session.token == token,
               let id = session.historyID
         else { return }
+        let stopToPasteLatency = status == .pasteEventSent
+            ? session.stoppedAt.map { Date().timeIntervalSince($0) }
+            : nil
         do {
-            _ = try historyStore.updateDelivery(
+            _ = try await historyStore.updateDelivery(
                 id: id,
                 with: HistoryDeliveryUpdate(
                     status: status,
                     deliveredText: deliveredText,
                     totalLatency: Date().timeIntervalSince(session.startedAt),
-                    error: error
+                    error: error,
+                    asrSelection: session.asrSelection.rawValue,
+                    asrOutcome: session.asrOutcome,
+                    refinerBackend: session.refinerBackend,
+                    refinementOutcome: session.refinementOutcome,
+                    validationFailureKind: session.validationFailureKind,
+                    stopToPasteLatency: stopToPasteLatency
                 )
             )
         } catch {
-            appState.lastError = "Could not finalize history: \(error.localizedDescription)"
+            if isCurrent(token) {
+                appState.lastError = "Could not finalize history: \(error.localizedDescription)"
+            }
         }
     }
 
@@ -1663,43 +1809,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func retryPolish(_ entry: HistoryEntry) {
-        guard entry.refinementStatus == .failed, let historyStore else { return }
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                let retry = try historyStore.beginPolishRetry(id: entry.id)
-                let started = Date()
-                let profile = self.resolveCurrentProfile().profile
-                let result = try await self.makeCleanupPipeline(for: profile).process(
-                    retry.rawText,
-                    mode: .clean
-                )
-                let refinementStatus: HistoryRefinementStatus
-                switch result.outcome {
-                case .accepted:
-                    refinementStatus = .succeeded
-                case .deterministicFallback, .skippedLiteralMode:
-                    refinementStatus = .failed
-                }
-                _ = try historyStore.finalize(
-                    id: entry.id,
-                    with: HistoryFinalization(
-                        polishedText: result.text,
-                        refinementStatus: refinementStatus,
-                        deliveryStatus: entry.deliveryStatus,
-                        refinementLatency: Date().timeIntervalSince(started),
-                        totalLatency: entry.totalLatency,
-                        error: refinementStatus == .failed ? "Retry used deterministic fallback" : nil
-                    )
-                )
-                self.historyWindow?.refresh()
-            } catch {
-                _ = try? historyStore.markPolishFailed(id: entry.id, error: error.localizedDescription)
-                self.appState.lastError = "Polish retry failed: \(error.localizedDescription)"
-                self.historyWindow?.refresh()
-            }
+    private func promptForVocabularyCorrection(from entry: HistoryEntry) {
+        let spokenField = NSTextField(string: "")
+        spokenField.placeholderString = "What Local Dictation heard"
+        let writtenField = NSTextField(string: "")
+        writtenField.placeholderString = "What it should write"
+
+        let stack = NSStackView(views: [
+            NSTextField(labelWithString: "Spoken form"),
+            spokenField,
+            NSTextField(labelWithString: "Written form"),
+            writtenField,
+        ])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 6
+        stack.setFrameSize(NSSize(width: 390, height: 108))
+        spokenField.widthAnchor.constraint(equalToConstant: 390).isActive = true
+        writtenField.widthAnchor.constraint(equalToConstant: 390).isActive = true
+
+        let alert = NSAlert()
+        alert.messageText = "Add a personal vocabulary correction?"
+        alert.informativeText = "Nothing is learned automatically. Enter one exact phrase mapping, then confirm it. History context: \(Self.historyCorrectionPreview(entry.rawText))"
+        alert.accessoryView = stack
+        alert.addButton(withTitle: "Add Correction")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        do {
+            let result = try PersonalVocabularyEditor(
+                paths: configurationStore.paths
+            ).addCorrection(
+                spokenForm: spokenField.stringValue,
+                writtenForm: writtenField.stringValue
+            )
+            loadConfiguration(bootstrap: false)
+            let confirmation = NSAlert()
+            confirmation.messageText = result.replacedExisting
+                ? "Personal correction updated"
+                : "Personal correction added"
+            confirmation.informativeText = "\(result.spokenForm) → \(result.writtenForm)"
+            confirmation.alertStyle = .informational
+            confirmation.runModal()
+        } catch {
+            let failure = NSAlert()
+            failure.messageText = "Vocabulary correction was not saved"
+            failure.informativeText = error.localizedDescription
+            failure.alertStyle = .warning
+            failure.runModal()
         }
+    }
+
+    private static func historyCorrectionPreview(_ text: String) -> String {
+        let collapsed = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        return collapsed.count > 120 ? "\(collapsed.prefix(117))…" : collapsed
     }
 
     private func initializeEngine(onCompletion: ((Bool) -> Void)? = nil) {

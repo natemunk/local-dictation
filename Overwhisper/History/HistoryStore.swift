@@ -1,14 +1,17 @@
 import Foundation
 import GRDB
 
-/// Thread-safe SQLite persistence for dictation history.
+/// Actor-isolated SQLite persistence for dictation history.
 ///
-/// `DatabaseQueue` serializes every access on its protected queue. All public
-/// operations complete synchronously, so saving the raw transcript can finish
-/// before refinement or insertion begins.
-final class HistoryStore: @unchecked Sendable {
+/// `DatabaseQueue` still serializes the synchronous database implementation,
+/// while this actor keeps every public history operation off `MainActor`.
+/// Saving the raw transcript can therefore finish before refinement or
+/// insertion begins without exposing the database to UI code.
+actor HistoryStore {
     static let schemaMigrationIdentifier = "history_v1"
     static let searchMigrationIdentifier = "history_fts_v1"
+    static let searchBundleMigrationIdentifier = "history_fts_v2"
+    static let metadataMigrationIdentifier = "history_metadata_v2"
 
     private static let tableName = "dictation_history"
     private static let searchTableName = "dictation_history_fts"
@@ -31,6 +34,12 @@ final class HistoryStore: @unchecked Sendable {
         static let error = "error"
         static let polishRetryCount = "polish_retry_count"
         static let lastPolishAttemptAt = "last_polish_attempt_at"
+        static let asrSelection = "asr_selection"
+        static let asrOutcome = "asr_outcome"
+        static let refinerBackend = "refiner_backend"
+        static let refinementOutcome = "refinement_outcome"
+        static let validationFailureKind = "validation_failure_kind"
+        static let stopToPasteLatency = "stop_to_paste_latency"
     }
 
     private let database: DatabaseQueue
@@ -42,7 +51,9 @@ final class HistoryStore: @unchecked Sendable {
             withIntermediateDirectories: true
         )
 
-        let database = try DatabaseQueue(path: databaseURL.path)
+        var configuration = Configuration()
+        configuration.journalMode = .wal
+        let database = try DatabaseQueue(path: databaseURL.path, configuration: configuration)
         self.database = database
         try Self.makeMigrator().migrate(database)
     }
@@ -78,8 +89,10 @@ final class HistoryStore: @unchecked Sendable {
                         \(Column.deliveryStatus),
                         \(Column.refinementStatus),
                         \(Column.asrLatency),
-                        \(Column.unrecognizedCommandCandidatesJSON)
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        \(Column.unrecognizedCommandCandidatesJSON),
+                        \(Column.asrSelection),
+                        \(Column.asrOutcome)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                 arguments: [
                     capture.id.uuidString.lowercased(),
@@ -92,6 +105,8 @@ final class HistoryStore: @unchecked Sendable {
                     refinementStatus.rawValue,
                     capture.asrLatency,
                     candidatesJSON,
+                    capture.asrSelection,
+                    capture.asrOutcome,
                 ]
             )
 
@@ -113,7 +128,13 @@ final class HistoryStore: @unchecked Sendable {
                         \(Column.deliveryStatus) = ?,
                         \(Column.refinementLatency) = ?,
                         \(Column.totalLatency) = ?,
-                        \(Column.error) = ?
+                        \(Column.error) = ?,
+                        \(Column.asrSelection) = COALESCE(?, \(Column.asrSelection)),
+                        \(Column.asrOutcome) = COALESCE(?, \(Column.asrOutcome)),
+                        \(Column.refinerBackend) = COALESCE(?, \(Column.refinerBackend)),
+                        \(Column.refinementOutcome) = COALESCE(?, \(Column.refinementOutcome)),
+                        \(Column.validationFailureKind) = COALESCE(?, \(Column.validationFailureKind)),
+                        \(Column.stopToPasteLatency) = COALESCE(?, \(Column.stopToPasteLatency))
                     WHERE \(Column.id) = ?
                     """,
                 arguments: [
@@ -123,6 +144,12 @@ final class HistoryStore: @unchecked Sendable {
                     finalization.refinementLatency,
                     finalization.totalLatency,
                     finalization.error,
+                    finalization.asrSelection,
+                    finalization.asrOutcome,
+                    finalization.refinerBackend,
+                    finalization.refinementOutcome,
+                    finalization.validationFailureKind,
+                    finalization.stopToPasteLatency,
                     id.uuidString.lowercased(),
                 ]
             )
@@ -142,7 +169,13 @@ final class HistoryStore: @unchecked Sendable {
                     SET \(Column.polishedText) = COALESCE(?, \(Column.polishedText)),
                         \(Column.deliveryStatus) = ?,
                         \(Column.totalLatency) = COALESCE(?, \(Column.totalLatency)),
-                        \(Column.error) = ?
+                        \(Column.error) = ?,
+                        \(Column.asrSelection) = COALESCE(?, \(Column.asrSelection)),
+                        \(Column.asrOutcome) = COALESCE(?, \(Column.asrOutcome)),
+                        \(Column.refinerBackend) = COALESCE(?, \(Column.refinerBackend)),
+                        \(Column.refinementOutcome) = COALESCE(?, \(Column.refinementOutcome)),
+                        \(Column.validationFailureKind) = COALESCE(?, \(Column.validationFailureKind)),
+                        \(Column.stopToPasteLatency) = COALESCE(?, \(Column.stopToPasteLatency))
                     WHERE \(Column.id) = ?
                     """,
                 arguments: [
@@ -150,6 +183,12 @@ final class HistoryStore: @unchecked Sendable {
                     update.status.rawValue,
                     update.totalLatency,
                     update.error,
+                    update.asrSelection,
+                    update.asrOutcome,
+                    update.refinerBackend,
+                    update.refinementOutcome,
+                    update.validationFailureKind,
+                    update.stopToPasteLatency,
                     id.uuidString.lowercased(),
                 ]
             )
@@ -165,7 +204,13 @@ final class HistoryStore: @unchecked Sendable {
         deliveryStatus: HistoryDeliveryStatus = .failed,
         refinementLatency: TimeInterval? = nil,
         totalLatency: TimeInterval? = nil,
-        at attemptedAt: Date = Date()
+        at attemptedAt: Date = Date(),
+        asrSelection: String? = nil,
+        asrOutcome: String? = nil,
+        refinerBackend: String? = nil,
+        refinementOutcome: String? = nil,
+        validationFailureKind: String? = nil,
+        stopToPasteLatency: TimeInterval? = nil
     ) throws -> HistoryEntry {
         try database.write { db in
             _ = try Self.requireEntry(id, in: db)
@@ -177,7 +222,13 @@ final class HistoryStore: @unchecked Sendable {
                         \(Column.refinementLatency) = ?,
                         \(Column.totalLatency) = COALESCE(?, \(Column.totalLatency)),
                         \(Column.error) = ?,
-                        \(Column.lastPolishAttemptAt) = ?
+                        \(Column.lastPolishAttemptAt) = ?,
+                        \(Column.asrSelection) = COALESCE(?, \(Column.asrSelection)),
+                        \(Column.asrOutcome) = COALESCE(?, \(Column.asrOutcome)),
+                        \(Column.refinerBackend) = COALESCE(?, \(Column.refinerBackend)),
+                        \(Column.refinementOutcome) = COALESCE(?, \(Column.refinementOutcome)),
+                        \(Column.validationFailureKind) = COALESCE(?, \(Column.validationFailureKind)),
+                        \(Column.stopToPasteLatency) = COALESCE(?, \(Column.stopToPasteLatency))
                     WHERE \(Column.id) = ?
                     """,
                 arguments: [
@@ -187,6 +238,12 @@ final class HistoryStore: @unchecked Sendable {
                     totalLatency,
                     error,
                     attemptedAt,
+                    asrSelection,
+                    asrOutcome,
+                    refinerBackend,
+                    refinementOutcome,
+                    validationFailureKind,
+                    stopToPasteLatency,
                     id.uuidString.lowercased(),
                 ]
             )
@@ -217,7 +274,11 @@ final class HistoryStore: @unchecked Sendable {
                         \(Column.lastPolishAttemptAt) = ?,
                         \(Column.refinementLatency) = NULL,
                         \(Column.totalLatency) = NULL,
-                        \(Column.error) = NULL
+                        \(Column.error) = NULL,
+                        \(Column.refinerBackend) = NULL,
+                        \(Column.refinementOutcome) = NULL,
+                        \(Column.validationFailureKind) = NULL,
+                        \(Column.stopToPasteLatency) = NULL
                     WHERE \(Column.id) = ?
                     """,
                 arguments: [
@@ -256,26 +317,50 @@ final class HistoryStore: @unchecked Sendable {
     }
 
     func search(_ query: String, limit: Int = 50) throws -> [HistoryEntry] {
-        guard limit > 0,
-              let pattern = FTS5Pattern(matchingAllTokensIn: query)
-        else {
-            return []
-        }
+        guard limit > 0 else { return [] }
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedQuery.isEmpty else { return [] }
 
         return try database.read { db in
+            if Self.canRepresentInFTS(normalizedQuery),
+               let pattern = FTS5Pattern(matchingAllTokensIn: normalizedQuery) {
+                let rows = try Row.fetchAll(
+                    db,
+                    sql: """
+                        SELECT history.*
+                        FROM \(Self.tableName) AS history
+                        JOIN \(Self.searchTableName)
+                          ON \(Self.searchTableName).rowid = history.\(Column.rowID)
+                        WHERE \(Self.searchTableName) MATCH ?
+                        ORDER BY \(Self.searchTableName).rank,
+                                 history.\(Column.timestamp) DESC
+                        LIMIT ?
+                        """,
+                    arguments: [pattern, limit]
+                )
+                return try rows.map(Self.decodeEntry)
+            }
+
+            let likePattern = "%\(Self.escapeLikePattern(normalizedQuery))%"
             let rows = try Row.fetchAll(
                 db,
                 sql: """
-                    SELECT history.*
-                    FROM \(Self.tableName) AS history
-                    JOIN \(Self.searchTableName)
-                      ON \(Self.searchTableName).rowid = history.\(Column.rowID)
-                    WHERE \(Self.searchTableName) MATCH ?
-                    ORDER BY \(Self.searchTableName).rank,
-                             history.\(Column.timestamp) DESC
+                    SELECT *
+                    FROM \(Self.tableName)
+                    WHERE LOWER(COALESCE(\(Column.rawText), '')) LIKE LOWER(?) ESCAPE '\\'
+                       OR LOWER(COALESCE(\(Column.polishedText), '')) LIKE LOWER(?) ESCAPE '\\'
+                       OR LOWER(COALESCE(\(Column.destinationDisplayName), '')) LIKE LOWER(?) ESCAPE '\\'
+                       OR LOWER(COALESCE(\(Column.destinationBundleIdentifier), '')) LIKE LOWER(?) ESCAPE '\\'
+                    ORDER BY \(Column.timestamp) DESC, \(Column.rowID) DESC
                     LIMIT ?
                     """,
-                arguments: [pattern, limit]
+                arguments: [
+                    likePattern,
+                    likePattern,
+                    likePattern,
+                    likePattern,
+                    limit,
+                ]
             )
             return try rows.map(Self.decodeEntry)
         }
@@ -318,46 +403,44 @@ final class HistoryStore: @unchecked Sendable {
         }
     }
 
-    /// Removes every successful delivery older than the policy cutoff,
-    /// regardless of refinement outcome. Pending, failed, and cancelled
-    /// deliveries remain.
+    /// Removes every history entry older than the policy cutoff, regardless of
+    /// delivery or refinement outcome. Callers can use this at launch and from
+    /// a daily maintenance task.
+    @discardableResult
+    func pruneEntries(
+        policy: HistoryRetentionPolicy = .default,
+        relativeTo now: Date = Date()
+    ) throws -> Int {
+        guard policy.retentionDays >= 0 else {
+            throw HistoryStoreError.invalidRetentionDays(policy.retentionDays)
+        }
+
+        let cutoff = now.addingTimeInterval(
+            -TimeInterval(policy.retentionDays) * 24 * 60 * 60
+        )
+
+        return try database.write { db in
+            let count = try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM \(Self.tableName) WHERE \(Column.timestamp) < ?",
+                arguments: [cutoff]
+            ) ?? 0
+            try db.execute(
+                sql: "DELETE FROM \(Self.tableName) WHERE \(Column.timestamp) < ?",
+                arguments: [cutoff]
+            )
+            return count
+        }
+    }
+
+    /// Compatibility shim for the pre-v2 successful-delivery-only name. The
+    /// retention policy now applies to all entry states.
     @discardableResult
     func pruneSuccessfulEntries(
         policy: HistoryRetentionPolicy = .default,
         relativeTo now: Date = Date()
     ) throws -> Int {
-        guard policy.successRetentionDays >= 0 else {
-            throw HistoryStoreError.invalidRetentionDays(policy.successRetentionDays)
-        }
-
-        let cutoff = now.addingTimeInterval(
-            -TimeInterval(policy.successRetentionDays) * 24 * 60 * 60
-        )
-
-        return try database.write { db in
-            let arguments: StatementArguments = [
-                cutoff,
-                HistoryDeliveryStatus.delivered.rawValue,
-                HistoryDeliveryStatus.previewed.rawValue,
-                HistoryDeliveryStatus.pastedRaw.rawValue,
-                HistoryDeliveryStatus.pasteEventSent.rawValue,
-                HistoryDeliveryStatus.clipboardOnly.rawValue,
-            ]
-            let predicate = """
-                \(Column.timestamp) < ?
-                AND \(Column.deliveryStatus) IN (?, ?, ?, ?, ?)
-                """
-            let count = try Int.fetchOne(
-                db,
-                sql: "SELECT COUNT(*) FROM \(Self.tableName) WHERE \(predicate)",
-                arguments: arguments
-            ) ?? 0
-            try db.execute(
-                sql: "DELETE FROM \(Self.tableName) WHERE \(predicate)",
-                arguments: arguments
-            )
-            return count
-        }
+        try pruneEntries(policy: policy, relativeTo: now)
     }
 
     // MARK: - Migration and schema diagnostics
@@ -400,6 +483,29 @@ final class HistoryStore: @unchecked Sendable {
             }
         }
 
+        migrator.registerMigration(searchBundleMigrationIdentifier) { db in
+            try db.drop(table: searchTableName)
+            try db.dropFTS5SynchronizationTriggers(forTable: searchTableName)
+            try db.create(virtualTable: searchTableName, using: FTS5()) { table in
+                table.synchronize(withTable: tableName)
+                table.column(Column.rawText)
+                table.column(Column.polishedText)
+                table.column(Column.destinationDisplayName)
+                table.column(Column.destinationBundleIdentifier)
+            }
+        }
+
+        migrator.registerMigration(metadataMigrationIdentifier) { db in
+            try db.alter(table: tableName) { table in
+                table.add(column: Column.asrSelection, .text)
+                table.add(column: Column.asrOutcome, .text)
+                table.add(column: Column.refinerBackend, .text)
+                table.add(column: Column.refinementOutcome, .text)
+                table.add(column: Column.validationFailureKind, .text)
+                table.add(column: Column.stopToPasteLatency, .double)
+            }
+        }
+
         return migrator
     }
 
@@ -408,6 +514,30 @@ final class HistoryStore: @unchecked Sendable {
             try String.fetchAll(
                 db,
                 sql: "SELECT identifier FROM grdb_migrations ORDER BY rowid"
+            )
+        }
+    }
+
+    /// Returns only operational metadata. No transcript, destination text, or
+    /// error text is included, so this can be used for launch diagnostics.
+    func health(policy: HistoryRetentionPolicy = .default) throws -> HistoryStoreHealth {
+        try database.read { db in
+            let journalMode = (
+                try String.fetchOne(db, sql: "PRAGMA journal_mode") ?? "unknown"
+            ).lowercased()
+            let migrations = try String.fetchAll(
+                db,
+                sql: "SELECT identifier FROM grdb_migrations ORDER BY rowid"
+            )
+            let entryCount = try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM \(Self.tableName)"
+            ) ?? 0
+            return HistoryStoreHealth(
+                journalMode: journalMode,
+                appliedMigrationIdentifiers: migrations,
+                retentionPolicy: policy,
+                entryCount: entryCount
             )
         }
     }
@@ -501,8 +631,31 @@ final class HistoryStore: @unchecked Sendable {
             unrecognizedCommandCandidates: candidates,
             error: row[Column.error],
             polishRetryCount: row[Column.polishRetryCount],
-            lastPolishAttemptAt: row[Column.lastPolishAttemptAt]
+            lastPolishAttemptAt: row[Column.lastPolishAttemptAt],
+            asrSelection: row[Column.asrSelection],
+            asrOutcome: row[Column.asrOutcome],
+            refinerBackend: row[Column.refinerBackend],
+            refinementOutcome: row[Column.refinementOutcome],
+            validationFailureKind: row[Column.validationFailureKind],
+            stopToPasteLatency: row[Column.stopToPasteLatency]
         )
+    }
+
+    /// FTS tokenization intentionally handles ordinary words. Punctuation,
+    /// quotes, and wildcard characters require literal substring semantics so
+    /// they are handled by the escaped LIKE fallback below.
+    private static func canRepresentInFTS(_ query: String) -> Bool {
+        query.unicodeScalars.allSatisfy { scalar in
+            CharacterSet.alphanumerics.contains(scalar)
+                || CharacterSet.whitespacesAndNewlines.contains(scalar)
+        }
+    }
+
+    private static func escapeLikePattern(_ query: String) -> String {
+        query
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%")
+            .replacingOccurrences(of: "_", with: "\\_")
     }
 
     private static func encodeCandidates(_ candidates: [String]) throws -> String {

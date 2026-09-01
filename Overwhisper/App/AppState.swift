@@ -105,6 +105,8 @@ final class AppState: ObservableObject {
 
     @Published var lastTranscription = ""
     @Published var lastError: String?
+    @Published var configurationDiagnostic: String?
+    @Published var configurationNotices: [String] = []
     @Published var microphonePermissionGranted = false
     @Published var inputMonitoringGranted = false
     @Published var accessibilityGranted = false
@@ -120,9 +122,15 @@ final class AppState: ObservableObject {
             )
         }
     }
-    @Published var refinerAPIKey = KeychainStore.load(
-        account: LocalDictationKeychainAccount.openAICompatibleRefiner
-    ) ?? ""
+    @Published var experimentalModelCleanupEnabled: Bool {
+        didSet {
+            preferences.set(
+                experimentalModelCleanupEnabled,
+                forKey: LocalDictationPreferenceKey.experimentalModelCleanupEnabled
+            )
+        }
+    }
+    @Published var refinerAPIKey: String
 
     let debugSessionStore = DebugSessionStore()
 
@@ -162,6 +170,12 @@ final class AppState: ObservableObject {
         privateClipboardMode = preferences.bool(
             forKey: LocalDictationPreferenceKey.privateClipboardMode
         )
+        experimentalModelCleanupEnabled = preferences.bool(
+            forKey: LocalDictationPreferenceKey.experimentalModelCleanupEnabled
+        )
+        refinerAPIKey = KeychainStore.loadMigratingLegacyServices(
+            account: LocalDictationKeychainAccount.openAICompatibleRefiner
+        ) ?? ""
     }
 
     private static func migratedASRSelection(from preferences: UserDefaults) -> ASRSelection {
@@ -252,6 +266,7 @@ enum LocalDictationPreferenceKey {
     static let whisperModel = "LocalDictation.whisperModel.v1"
     static let retainDebugAudio = "LocalDictation.retainDebugAudio.v1"
     static let privateClipboardMode = "LocalDictation.privateClipboardMode.v1"
+    static let experimentalModelCleanupEnabled = "LocalDictation.experimentalModelCleanupEnabled.v1"
 }
 
 enum LocalDictationKeychainAccount {
@@ -259,11 +274,71 @@ enum LocalDictationKeychainAccount {
 }
 
 enum KeychainStore {
-    private static var service: String {
-        Bundle.main.bundleIdentifier ?? "com.natemunk.LocalDictation"
+    static let service = "com.natemunk.LocalDictation"
+
+    static var legacyServices: [String] {
+        var values = [
+            "com.overseed.overwhisper",
+            "com.natemunk.LocalDictation.dev",
+        ]
+        if let bundleService = Bundle.main.bundleIdentifier,
+           bundleService != service
+        {
+            values.insert(bundleService, at: 0)
+        }
+        var seen = Set<String>()
+        return values.filter { seen.insert($0).inserted }
     }
 
     static func save(_ value: String, account: String) throws {
+        try save(value, service: service, account: account)
+    }
+
+    static func load(account: String) -> String? {
+        load(service: service, account: account)
+    }
+
+    static func loadMigratingLegacyServices(account: String) -> String? {
+        do {
+            return try migrateValue(
+                account: account,
+                legacyServices: legacyServices,
+                read: { load(service: $0, account: $1) },
+                write: { try save($0, service: $1, account: $2) },
+                delete: { delete(service: $0, account: $1) }
+            )
+        } catch {
+            // Leave the legacy item intact and keep it usable. A later launch
+            // can retry without risking key loss.
+            return legacyServices.lazy.compactMap {
+                load(service: $0, account: account)
+            }.first
+        }
+    }
+
+    static func migrateValue(
+        account: String,
+        currentService: String = service,
+        legacyServices: [String],
+        read: (_ service: String, _ account: String) -> String?,
+        write: (_ value: String, _ service: String, _ account: String) throws -> Void,
+        delete: (_ service: String, _ account: String) -> Void
+    ) rethrows -> String? {
+        if let current = read(currentService, account) { return current }
+        for legacyService in legacyServices where legacyService != currentService {
+            guard let value = read(legacyService, account) else { continue }
+            try write(value, currentService, account)
+            delete(legacyService, account)
+            return value
+        }
+        return nil
+    }
+
+    static func delete(account: String) {
+        delete(service: service, account: account)
+    }
+
+    private static func save(_ value: String, service: String, account: String) throws {
         let base: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -278,7 +353,7 @@ enum KeychainStore {
         }
     }
 
-    static func load(account: String) -> String? {
+    private static func load(service: String, account: String) -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -293,7 +368,7 @@ enum KeychainStore {
         return String(data: data, encoding: .utf8)
     }
 
-    static func delete(account: String) {
+    private static func delete(service: String, account: String) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,

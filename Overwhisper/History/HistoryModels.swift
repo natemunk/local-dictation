@@ -56,6 +56,8 @@ struct HistoryRawCapture: Equatable, Sendable {
     var refinementRequested: Bool
     var asrLatency: TimeInterval?
     var unrecognizedCommandCandidates: [String]
+    var asrSelection: String?
+    var asrOutcome: String?
 
     init(
         id: UUID = UUID(),
@@ -65,7 +67,9 @@ struct HistoryRawCapture: Equatable, Sendable {
         mode: HistoryDictationMode,
         refinementRequested: Bool? = nil,
         asrLatency: TimeInterval? = nil,
-        unrecognizedCommandCandidates: [String] = []
+        unrecognizedCommandCandidates: [String] = [],
+        asrSelection: String? = nil,
+        asrOutcome: String? = nil
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -75,6 +79,8 @@ struct HistoryRawCapture: Equatable, Sendable {
         self.refinementRequested = refinementRequested ?? (mode == .clean)
         self.asrLatency = asrLatency
         self.unrecognizedCommandCandidates = unrecognizedCommandCandidates
+        self.asrSelection = asrSelection
+        self.asrOutcome = asrOutcome
     }
 }
 
@@ -85,6 +91,12 @@ struct HistoryFinalization: Equatable, Sendable {
     var refinementLatency: TimeInterval?
     var totalLatency: TimeInterval?
     var error: String?
+    var asrSelection: String?
+    var asrOutcome: String?
+    var refinerBackend: String?
+    var refinementOutcome: String?
+    var validationFailureKind: String?
+    var stopToPasteLatency: TimeInterval?
 
     init(
         polishedText: String?,
@@ -92,7 +104,13 @@ struct HistoryFinalization: Equatable, Sendable {
         deliveryStatus: HistoryDeliveryStatus,
         refinementLatency: TimeInterval? = nil,
         totalLatency: TimeInterval? = nil,
-        error: String? = nil
+        error: String? = nil,
+        asrSelection: String? = nil,
+        asrOutcome: String? = nil,
+        refinerBackend: String? = nil,
+        refinementOutcome: String? = nil,
+        validationFailureKind: String? = nil,
+        stopToPasteLatency: TimeInterval? = nil
     ) {
         self.polishedText = polishedText
         self.refinementStatus = refinementStatus
@@ -100,6 +118,12 @@ struct HistoryFinalization: Equatable, Sendable {
         self.refinementLatency = refinementLatency
         self.totalLatency = totalLatency
         self.error = error
+        self.asrSelection = asrSelection
+        self.asrOutcome = asrOutcome
+        self.refinerBackend = refinerBackend
+        self.refinementOutcome = refinementOutcome
+        self.validationFailureKind = validationFailureKind
+        self.stopToPasteLatency = stopToPasteLatency
     }
 }
 
@@ -108,17 +132,35 @@ struct HistoryDeliveryUpdate: Equatable, Sendable {
     var deliveredText: String?
     var totalLatency: TimeInterval?
     var error: String?
+    var asrSelection: String?
+    var asrOutcome: String?
+    var refinerBackend: String?
+    var refinementOutcome: String?
+    var validationFailureKind: String?
+    var stopToPasteLatency: TimeInterval?
 
     init(
         status: HistoryDeliveryStatus,
         deliveredText: String? = nil,
         totalLatency: TimeInterval? = nil,
-        error: String? = nil
+        error: String? = nil,
+        asrSelection: String? = nil,
+        asrOutcome: String? = nil,
+        refinerBackend: String? = nil,
+        refinementOutcome: String? = nil,
+        validationFailureKind: String? = nil,
+        stopToPasteLatency: TimeInterval? = nil
     ) {
         self.status = status
         self.deliveredText = deliveredText
         self.totalLatency = totalLatency
         self.error = error
+        self.asrSelection = asrSelection
+        self.asrOutcome = asrOutcome
+        self.refinerBackend = refinerBackend
+        self.refinementOutcome = refinementOutcome
+        self.validationFailureKind = validationFailureKind
+        self.stopToPasteLatency = stopToPasteLatency
     }
 }
 
@@ -136,14 +178,40 @@ struct HistoryPolishRetry: Equatable, Sendable {
 }
 
 struct HistoryRetentionPolicy: Equatable, Sendable {
-    static let defaultSuccessRetentionDays = 90
+    static let defaultRetentionDays = 90
+    /// Compatibility name retained for callers that still describe the old
+    /// successful-delivery-only policy.
+    static let defaultSuccessRetentionDays = defaultRetentionDays
     static let `default` = HistoryRetentionPolicy()
 
-    var successRetentionDays: Int
+    var retentionDays: Int
 
-    init(successRetentionDays: Int = defaultSuccessRetentionDays) {
-        self.successRetentionDays = successRetentionDays
+    /// Compatibility property for the pre-v2 API. Retention now applies to
+    /// every entry status, not only successful deliveries.
+    var successRetentionDays: Int {
+        get { retentionDays }
+        set { retentionDays = newValue }
     }
+
+    init(retentionDays: Int = defaultRetentionDays) {
+        self.retentionDays = retentionDays
+    }
+
+    init(successRetentionDays: Int) {
+        self.init(retentionDays: successRetentionDays)
+    }
+}
+
+/// Privacy-safe store diagnostics. It contains schema/runtime metadata and a
+/// count only; transcript, destination text, and error text are excluded.
+struct HistoryStoreHealth: Equatable, Sendable {
+    let journalMode: String
+    let appliedMigrationIdentifiers: [String]
+    let retentionPolicy: HistoryRetentionPolicy
+    let entryCount: Int
+
+    var migrations: [String] { appliedMigrationIdentifiers }
+    var retentionDays: Int { retentionPolicy.retentionDays }
 }
 
 struct HistoryEntry: Equatable, Identifiable, Sendable {
@@ -163,6 +231,12 @@ struct HistoryEntry: Equatable, Identifiable, Sendable {
     let error: String?
     let polishRetryCount: Int
     let lastPolishAttemptAt: Date?
+    let asrSelection: String?
+    let asrOutcome: String?
+    let refinerBackend: String?
+    let refinementOutcome: String?
+    let validationFailureKind: String?
+    let stopToPasteLatency: TimeInterval?
 
     var destination: HistoryDestination {
         HistoryDestination(

@@ -20,23 +20,12 @@ extension ProfileCatalog {
                 )
             ),
             DictationProfile(
-                id: "ghostty",
-                mode: .literal,
-                formattingStyle: .terminal,
-                cleanupEnabled: false,
-                vocabularyPackIDs: ["symphony"],
-                match: ProfileMatch(bundleIdentifiers: ["com.mitchellh.ghostty"])
-            ),
-            DictationProfile(
                 id: "slack",
                 mode: .clean,
-                formattingStyle: .chat,
+                formattingStyle: .prose,
                 cleanupEnabled: true,
                 vocabularyPackIDs: ["symphony"],
-                match: ProfileMatch(
-                    bundleIdentifiers: ["com.tinyspeck.slackmacgap"],
-                    hostnames: ["app.slack.com"]
-                )
+                match: ProfileMatch(bundleIdentifiers: ["com.tinyspeck.slackmacgap"])
             ),
             DictationProfile(
                 id: "linear",
@@ -44,10 +33,7 @@ extension ProfileCatalog {
                 formattingStyle: .structured,
                 cleanupEnabled: true,
                 vocabularyPackIDs: ["symphony"],
-                match: ProfileMatch(
-                    bundleIdentifiers: ["com.linear"],
-                    hostnames: ["linear.app"]
-                )
+                match: ProfileMatch(bundleIdentifiers: ["com.linear"])
             ),
             DictationProfile(
                 id: "notes",
@@ -59,35 +45,9 @@ extension ProfileCatalog {
             DictationProfile(
                 id: "notion",
                 mode: .clean,
-                formattingStyle: .structured,
-                cleanupEnabled: true,
-                match: ProfileMatch(
-                    bundleIdentifiers: ["notion.id", "com.notion.id"],
-                    hostnames: ["notion.so"]
-                )
-            ),
-            DictationProfile(
-                id: "chatgpt-web",
-                mode: .clean,
-                formattingStyle: .structured,
-                cleanupEnabled: true,
-                vocabularyPackIDs: ["symphony"],
-                match: ProfileMatch(hostnames: ["chatgpt.com"])
-            ),
-            DictationProfile(
-                id: "claude-web",
-                mode: .clean,
-                formattingStyle: .structured,
-                cleanupEnabled: true,
-                vocabularyPackIDs: ["symphony"],
-                match: ProfileMatch(hostnames: ["claude.ai"])
-            ),
-            DictationProfile(
-                id: "gmail-web",
-                mode: .clean,
                 formattingStyle: .prose,
                 cleanupEnabled: true,
-                match: ProfileMatch(hostnames: ["mail.google.com"])
+                match: ProfileMatch(bundleIdentifiers: ["notion.id", "com.notion.id"])
             ),
             DictationProfile(
                 id: "browser",

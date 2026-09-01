@@ -7,6 +7,8 @@ enum RefinementValidationFailure: Error, Equatable, CustomStringConvertible, Sen
     case overlappingProtectedSpans(first: String, second: String)
     case protectedSpanCountMismatch(name: String, text: String, expected: Int, actual: Int)
     case protectedSpanOrderChanged(name: String, text: String)
+    case inferredBulletFormatting
+    case explicitBulletFormattingRemoved
     case unexpectedLexicalToken(token: String, outputTokenIndex: Int)
     case deletionOutsideCandidate(token: String, sourceRange: CleanupTextRange)
     case excessiveLexicalDeletion(deleted: Int, sourceTokenCount: Int, maximumAllowed: Int)
@@ -25,6 +27,10 @@ enum RefinementValidationFailure: Error, Equatable, CustomStringConvertible, Sen
             "Protected span '\(name)' was not preserved byte-identically exactly once per source occurrence: expected \(expected) occurrence(s) of '\(text)', found \(actual)."
         case let .protectedSpanOrderChanged(name, text):
             "Protected span '\(name)' ('\(text)') was reordered."
+        case .inferredBulletFormatting:
+            "Output introduced bullet formatting without an explicit bullet command in the normalized source."
+        case .explicitBulletFormattingRemoved:
+            "Output removed bullet formatting produced by an explicit bullet command."
         case let .unexpectedLexicalToken(token, outputTokenIndex):
             "Output lexical token #\(outputTokenIndex + 1) ('\(token)') is not a case-insensitive, in-order source token; additions, substitutions, and reordering are forbidden."
         case let .deletionOutsideCandidate(token, sourceRange):
@@ -41,9 +47,33 @@ struct RefinementValidator: Sendable {
     @discardableResult
     func validate(generated: String, against input: TextRefinementInput) throws -> String {
         try validateRanges(in: input)
+        try validateBulletFormatting(generated: generated, input: input)
         try validateProtectedSpans(generated: generated, input: input)
         try validateLexicalAlignment(generated: generated, input: input)
         return generated
+    }
+
+    private func validateBulletFormatting(
+        generated: String,
+        input: TextRefinementInput
+    ) throws {
+        let sourceHasBullets = containsBulletLine(input.transcript)
+        let outputHasBullets = containsBulletLine(generated)
+        if !sourceHasBullets, outputHasBullets {
+            throw RefinementValidationFailure.inferredBulletFormatting
+        }
+        if sourceHasBullets, !outputHasBullets {
+            throw RefinementValidationFailure.explicitBulletFormattingRemoved
+        }
+    }
+
+    private func containsBulletLine(_ text: String) -> Bool {
+        text.split(separator: "\n", omittingEmptySubsequences: false).contains { line in
+            let trimmed = line.drop(while: { $0 == " " || $0 == "\t" })
+            return trimmed.hasPrefix("- ")
+                || trimmed.hasPrefix("* ")
+                || trimmed.hasPrefix("• ")
+        }
     }
 
     private func validateRanges(in input: TextRefinementInput) throws {
@@ -90,13 +120,19 @@ struct RefinementValidator: Sendable {
         guard !sorted.isEmpty else { return }
 
         let outputBytes = Array(generated.utf8)
-        var checked: Set<Data> = []
+        var matchesByText: [Data: [CleanupTextRange]] = [:]
         for span in sorted {
-            let needle = Array(span.text.utf8)
-            let key = Data(needle)
-            guard checked.insert(key).inserted else { continue }
-            let expected = sorted.lazy.filter { Array($0.text.utf8) == needle }.count
-            let actual = occurrenceCount(of: needle, in: outputBytes)
+            let key = Data(span.text.utf8)
+            guard matchesByText[key] == nil else { continue }
+            let expected = sorted.lazy.filter {
+                Data($0.text.utf8) == key
+            }.count
+            let matches = atomicMatches(
+                of: span.text,
+                in: generated,
+                outputBytes: outputBytes
+            )
+            let actual = matches.count
             guard expected == actual else {
                 throw RefinementValidationFailure.protectedSpanCountMismatch(
                     name: span.name,
@@ -105,19 +141,82 @@ struct RefinementValidator: Sendable {
                     actual: actual
                 )
             }
+            matchesByText[key] = matches
         }
 
+        var consumedByText: [Data: Int] = [:]
         var cursor = 0
         for span in sorted {
-            let needle = Array(span.text.utf8)
-            guard let offset = firstOffset(of: needle, in: outputBytes, startingAt: cursor) else {
+            let key = Data(span.text.utf8)
+            let consumed = consumedByText[key, default: 0]
+            guard let matches = matchesByText[key],
+                  consumed < matches.count,
+                  matches[consumed].lowerBound >= cursor
+            else {
                 throw RefinementValidationFailure.protectedSpanOrderChanged(
                     name: span.name,
                     text: span.text
                 )
             }
-            cursor = offset + needle.count
+            cursor = matches[consumed].upperBound
+            consumedByText[key] = consumed + 1
         }
+    }
+
+    /// Finds byte-identical, non-overlapping occurrences while treating a
+    /// lexical protected term as one atomic span. For example, `API` is not an
+    /// occurrence inside `APIs`, so a longer neighboring identifier cannot
+    /// create a false duplicate-count failure.
+    private func atomicMatches(
+        of text: String,
+        in generated: String,
+        outputBytes: [UInt8]
+    ) -> [CleanupTextRange] {
+        let needle = Array(text.utf8)
+        guard !needle.isEmpty else { return [] }
+
+        var result: [CleanupTextRange] = []
+        var cursor = 0
+        while let offset = firstOffset(
+            of: needle,
+            in: outputBytes,
+            startingAt: cursor
+        ) {
+            let range = CleanupTextRange(offset, offset + needle.count)
+            if let stringRange = CleanupText.stringRange(in: generated, for: range),
+               isAtomic(stringRange, protectedText: text, in: generated)
+            {
+                result.append(range)
+                cursor = range.upperBound
+            } else {
+                cursor = offset + 1
+            }
+        }
+        return result
+    }
+
+    private func isAtomic(
+        _ range: Range<String.Index>,
+        protectedText: String,
+        in generated: String
+    ) -> Bool {
+        if protectedText.first.map(isLexicalBoundaryCharacter) == true,
+           range.lowerBound > generated.startIndex
+        {
+            let previous = generated[generated.index(before: range.lowerBound)]
+            if isLexicalBoundaryCharacter(previous) { return false }
+        }
+        if protectedText.last.map(isLexicalBoundaryCharacter) == true,
+           range.upperBound < generated.endIndex,
+           isLexicalBoundaryCharacter(generated[range.upperBound])
+        {
+            return false
+        }
+        return true
+    }
+
+    private func isLexicalBoundaryCharacter(_ character: Character) -> Bool {
+        character.isLetter || character.isNumber || character == "_"
     }
 
     private func validateLexicalAlignment(generated: String, input: TextRefinementInput) throws {
@@ -235,17 +334,6 @@ struct RefinementValidator: Sendable {
             }
         }
         return invalid.min { $0.range.lowerBound < $1.range.lowerBound }
-    }
-
-    private func occurrenceCount(of needle: [UInt8], in haystack: [UInt8]) -> Int {
-        guard !needle.isEmpty, needle.count <= haystack.count else { return 0 }
-        var count = 0
-        var cursor = 0
-        while let offset = firstOffset(of: needle, in: haystack, startingAt: cursor) {
-            count += 1
-            cursor = offset + needle.count
-        }
-        return count
     }
 
     private func firstOffset(

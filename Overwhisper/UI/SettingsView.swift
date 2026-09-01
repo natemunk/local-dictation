@@ -102,6 +102,18 @@ struct SettingsView: View {
                     Spacer()
                     Button("History…", action: onOpenHistory)
                 }
+                if let diagnostic = appState.configurationDiagnostic {
+                    Label(diagnostic, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                }
+                ForEach(appState.configurationNotices, id: \.self) { notice in
+                    Label(notice, systemImage: "info.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .textSelection(.enabled)
+                }
             }
 
             Section("Raycast vocabulary import") {
@@ -207,12 +219,25 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("Optional text refinement") {
-                SecureField("OpenAI-compatible API key (optional)", text: $appState.refinerAPIKey)
-                    .textContentType(.password)
-                Text("A configured refiner receives transcript text and static cleanup rules only. It never receives audio, app identity, browser hostname, field contents, or surrounding text. Non-loopback hosts require explicit remote opt-in and display a persistent Remote badge.")
+            Section("Advanced cleanup") {
+                Toggle(
+                    "Experimental model cleanup",
+                    isOn: $appState.experimentalModelCleanupEnabled
+                )
+                Text("Off by default. Deterministic local cleanup remains active when this experiment is disabled.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                if appState.experimentalModelCleanupEnabled {
+                    SecureField(
+                        "OpenAI-compatible API key (optional)",
+                        text: $appState.refinerAPIKey
+                    )
+                    .textContentType(.password)
+                    Text("A configured model receives transcript text, static cleanup rules, and transcript-derived allowed-deletion ranges only. It never receives audio, app identity, browser data, field contents, or surrounding text. Non-loopback hosts require explicit remote opt-in and display a persistent Remote badge.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section("Audio retention") {

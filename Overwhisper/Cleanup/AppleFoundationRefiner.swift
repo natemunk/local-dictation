@@ -48,8 +48,6 @@ protocol AppleFoundationModelAdapter: Sendable {
 }
 
 struct AppleFoundationRefiner: TextRefiner, Sendable {
-    static let staticRules = CleanupRefinementRules.text
-
     private let adapter: any AppleFoundationModelAdapter
     private let deadline: Duration
     private let platformSupportsFoundationModels: @Sendable () -> Bool
@@ -79,10 +77,11 @@ struct AppleFoundationRefiner: TextRefiner, Sendable {
         }
 
         let transcript = input.transcript
+        let rules = CleanupRefinementRules.text(for: input)
         return try await CleanupDeadline.run(for: deadline) { [adapter] in
             try await adapter.generate(
                 transcript: transcript,
-                staticRules: Self.staticRules
+                staticRules: rules
             )
         }
     }

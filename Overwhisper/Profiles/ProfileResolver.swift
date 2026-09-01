@@ -1,97 +1,23 @@
 import Foundation
 
-/// A normalized browser hostname. The original URL, path, query, and fragment
-/// are deliberately discarded at construction time.
-struct BrowserHostname: Equatable, Hashable, Sendable {
-    let value: String
-
-    init?(_ rawValue: String) {
-        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-
-        let candidate = trimmed.contains("://") ? trimmed : "https://\(trimmed)"
-        guard let host = URLComponents(string: candidate)?.host,
-              let normalized = Self.normalize(host)
-        else {
-            return nil
-        }
-
-        value = normalized
-    }
-
-    static func approvedDomain(from rawValue: String) -> String? {
-        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty,
-              !trimmed.contains("://"),
-              !trimmed.contains("/"),
-              !trimmed.contains("?"),
-              !trimmed.contains("#"),
-              !trimmed.contains(":")
-        else {
-            return nil
-        }
-
-        return normalize(trimmed)
-    }
-
-    private static func normalize(_ hostname: String) -> String? {
-        let normalized = hostname
-            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
-            .lowercased()
-        guard !normalized.isEmpty, normalized.count <= 253 else { return nil }
-
-        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-"))
-        let labels = normalized.split(separator: ".", omittingEmptySubsequences: false)
-        guard !labels.isEmpty else { return nil }
-
-        for label in labels {
-            guard !label.isEmpty,
-                  label.count <= 63,
-                  label.first != "-",
-                  label.last != "-",
-                  label.unicodeScalars.allSatisfy({ allowed.contains($0) })
-            else {
-                return nil
-            }
-        }
-
-        return normalized
-    }
-}
-
 struct ProfileResolutionContext: Equatable, Sendable {
     var bundleIdentifier: String?
     var accessibilityRole: String?
     var accessibilitySubrole: String?
-    var browserHostname: BrowserHostname?
 
     init(
         bundleIdentifier: String?,
         accessibilityRole: String? = nil,
-        accessibilitySubrole: String? = nil,
-        browserHostname: BrowserHostname? = nil
+        accessibilitySubrole: String? = nil
     ) {
         self.bundleIdentifier = bundleIdentifier
         self.accessibilityRole = accessibilityRole
         self.accessibilitySubrole = accessibilitySubrole
-        self.browserHostname = browserHostname
     }
-}
-
-struct BrowserHostnameRequest: Equatable, Sendable {
-    let browserBundleIdentifier: String
-    let approvedDomains: [String]
-}
-
-/// The platform-specific browser permission/automation adapter belongs outside
-/// profile resolution. Implementations return only a hostname, never a URL.
-protocol BrowserHostnameProviding: Sendable {
-    func hostname(for request: BrowserHostnameRequest) async throws -> BrowserHostname?
 }
 
 enum ProfileMatchSource: String, Equatable, Sendable {
     case bundleIdentifier
-    case hostname
     case accessibility
     case genericBrowser
     case defaultProfile
@@ -105,52 +31,22 @@ struct ResolvedProfile: Equatable, Sendable {
 struct ProfileResolver: Sendable {
     let catalog: ProfileCatalog
     let defaultProfileID: String
-    let browserProfilesEnabled: Bool
-
-    /// Source-compatible alias for integrations using the original name.
-    var hostnameMatchingEnabled: Bool { browserProfilesEnabled }
 
     init(
         catalog: ProfileCatalog,
-        defaultProfileID: String = "default",
-        browserProfilesEnabled: Bool = false
+        defaultProfileID: String = "default"
     ) {
         self.catalog = catalog
         self.defaultProfileID = defaultProfileID
-        self.browserProfilesEnabled = browserProfilesEnabled
-    }
-
-    init(
-        catalog: ProfileCatalog,
-        defaultProfileID: String = "default",
-        hostnameMatchingEnabled: Bool
-    ) {
-        self.init(
-            catalog: catalog,
-            defaultProfileID: defaultProfileID,
-            browserProfilesEnabled: hostnameMatchingEnabled
-        )
-    }
-
-    var approvedHostnameDomains: [String] {
-        Array(
-            Set(
-                catalog.profiles.values
-                    .flatMap(\.match.hostnames)
-                    .compactMap(BrowserHostname.approvedDomain(from:))
-            )
-        ).sorted()
     }
 
     func resolve(_ context: ProfileResolutionContext) -> ResolvedProfile {
-        let browserContext = context.bundleIdentifier.map(isBrowserBundleIdentifier) ?? false
         var best: Candidate?
 
         for profile in catalog.profiles.values where profile.id != defaultProfileID {
             guard let candidate = candidate(
                 for: profile,
-                context: context,
-                isBrowserContext: browserContext
+                context: context
             ) else {
                 continue
             }
@@ -170,32 +66,9 @@ struct ProfileResolver: Sendable {
         return ResolvedProfile(profile: fallback, source: .defaultProfile)
     }
 
-    func resolve(
-        _ context: ProfileResolutionContext,
-        using hostnameProvider: any BrowserHostnameProviding
-    ) async throws -> ResolvedProfile {
-        guard browserProfilesEnabled,
-              context.browserHostname == nil,
-              let bundleIdentifier = context.bundleIdentifier,
-              isBrowserBundleIdentifier(bundleIdentifier),
-              !approvedHostnameDomains.isEmpty
-        else {
-            return resolve(context)
-        }
-
-        let request = BrowserHostnameRequest(
-            browserBundleIdentifier: bundleIdentifier,
-            approvedDomains: approvedHostnameDomains
-        )
-        var enriched = context
-        enriched.browserHostname = try await hostnameProvider.hostname(for: request)
-        return resolve(enriched)
-    }
-
     private func candidate(
         for profile: DictationProfile,
-        context: ProfileResolutionContext,
-        isBrowserContext: Bool
+        context: ProfileResolutionContext
     ) -> Candidate? {
         let match = profile.match
         guard !match.isEmpty else { return nil }
@@ -215,20 +88,7 @@ struct ProfileResolver: Sendable {
             )
         }
 
-        if browserProfilesEnabled,
-           isBrowserContext,
-           let hostname = context.browserHostname,
-           match.hostnames.contains(where: { hostnameMatches(hostname.value, approvedDomain: $0) })
-        {
-            return Candidate(
-                profile: profile,
-                source: .hostname,
-                score: MatchScore(identityWeight: 300, accessibilitySpecificity: roleSpecificity)
-            )
-        }
-
         if match.bundleIdentifiers.isEmpty,
-           match.hostnames.isEmpty,
            match.hasAccessibilityConstraint
         {
             return Candidate(
@@ -264,23 +124,9 @@ struct ProfileResolver: Sendable {
         return specificity
     }
 
-    private func isBrowserBundleIdentifier(_ bundleIdentifier: String) -> Bool {
-        catalog.profiles.values.contains { profile in
-            profile.match.isGenericBrowser
-                && matches(bundleIdentifier, anyOf: profile.match.bundleIdentifiers)
-        }
-    }
-
     private func matches(_ value: String?, anyOf candidates: [String]) -> Bool {
         guard let value else { return false }
         return candidates.contains { $0.caseInsensitiveCompare(value) == .orderedSame }
-    }
-
-    private func hostnameMatches(_ hostname: String, approvedDomain: String) -> Bool {
-        guard let domain = BrowserHostname.approvedDomain(from: approvedDomain) else {
-            return false
-        }
-        return hostname == domain || hostname.hasSuffix(".\(domain)")
     }
 }
 

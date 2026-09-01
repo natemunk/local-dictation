@@ -10,7 +10,7 @@ This repository is an active v1 implementation. The app builds and its automated
 - Speech recognition uses local FluidAudio or WhisperKit models only.
 - First-time ASR and optional EOU-preview model downloads contact the documented model host, then models run from versioned Local Dictation-owned storage. Download requests contain no audio or transcript data.
 - The app contains no telemetry SDK, cloud speech engine, Overseed service, or automatic updater.
-- Optional text cleanup may use Apple Foundation Models or an explicitly configured OpenAI-compatible `/v1/chat/completions` endpoint. A refiner receives transcript text and static rules only—never audio, destination app, browser hostname, field contents, or surrounding text.
+- Deterministic cleanup is the default. An Advanced, off-by-default experiment may use Apple Foundation Models or an explicitly configured OpenAI-compatible `/v1/chat/completions` endpoint. A refiner receives transcript text, static rules, and transcript-derived allowed-deletion ranges only—never audio, destination app, browser data, field contents, or surrounding text.
 - Non-loopback refinement endpoints require explicit `allow_remote = true` and show a persistent **Remote** badge.
 - Temporary WAV files are deleted after ASR or cancellation. Debug audio retention is off by default.
 
@@ -84,7 +84,7 @@ After the first stable-signed install, setup guides one final removal and re-add
 
 No speech model is downloaded before you choose **Prepare & Finish Setup** in onboarding. Onboarding completes only after Microphone, Input Monitoring, Accessibility, the Hyper+D event tap, and the selected local model are all ready. That explicit action downloads the selected model from `huggingface.co` into `~/Library/Application Support/Local Dictation/Models/v1/`; the default model is roughly 600 MB, and later transcription remains local. Verify and Repair operate only on that owned model tree.
 
-Browser Automation is not required. It is requested per browser only if the optional hostname-profile setting is enabled.
+Browser Automation is not used or requested. Browser behavior is selected only by bundle ID, with no page URL or hostname access.
 
 ## Configuration
 
@@ -100,9 +100,11 @@ Editable TOML configuration is bootstrapped on first launch:
         └── symphony.toml
 ```
 
-Local values override typed defaults. A malformed edit is rejected transactionally and the last-known-good snapshot remains active. The Raycast importer accepts only a comma-separated string you explicitly paste; it never reads Raycast storage. Its `personal` pack is applied to every profile immediately after a successful reload.
+Local values override typed defaults. A malformed edit is rejected transactionally and the last-known-good snapshot—including its immutable, precompiled vocabulary—is retained. Persistent configuration diagnostics are shown separately from runtime errors. The Raycast importer accepts only a comma-separated string you explicitly paste; it never reads Raycast storage. Its `personal` pack is compiled and applied to every profile immediately after a successful reload. History can add a correction only after an explicit two-field confirmation; the app never learns vocabulary silently.
 
-Native cutover profiles cover Ghostty, Slack, Linear, Notes, Notion, generic browsers, and a default Clean profile. Browser-hostname profiles are opt-in post-cutover behavior.
+Runtime behavior is intentionally small: terminals use Literal mode, ordinary apps use Clean prose with explicit formatting only, and Linear uses Clean structured paragraphs with protected ticket IDs. Friendly app matches cover Slack, Notes, Notion, and generic browsers without duplicating policy. Legacy hostname settings are parsed as ignored values and surfaced as a configuration notice.
+
+History is actor-isolated GRDB/SQLite with WAL and FTS5. Raw text is saved before cleanup/delivery for every nonsecure session; successful, failed, pending, and cancelled rows share the configurable 90-day default retention. Search falls back to escaped literal matching when an FTS query cannot represent punctuation.
 
 ## Benchmark
 
@@ -134,7 +136,7 @@ Overwhisper/
 ├── History/         # GRDB, SQLite, and FTS5
 ├── Hotkey/          # global event tap and typing interlock
 ├── Output/          # destination capture and safe clipboard insertion
-├── Profiles/        # bundle ID, AX role/subrole, optional hostname matching
+├── Profiles/        # bundle ID and AX role/subrole matching
 ├── Streaming/       # live finalized/volatile ASR adapters
 ├── Transcription/   # local final-ASR candidates
 └── UI/              # non-activating overlay, preview, settings, history

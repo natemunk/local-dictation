@@ -30,8 +30,6 @@
     <string>Copyright 2026 Nate Munk. Overwhisper portions copyright their original contributors.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>Local Dictation records your microphone locally so it can transcribe your speech on this Mac.</string>
-    <key>NSAppleEventsUsageDescription</key>
-    <string>Local Dictation can optionally read a browser hostname for an app-specific local profile.</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
 </dict>

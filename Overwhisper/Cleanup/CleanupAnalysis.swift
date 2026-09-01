@@ -2,14 +2,20 @@ import Foundation
 
 enum CleanupVocabularyError: Error, Equatable, CustomStringConvertible, Sendable {
     case emptySpokenForm(index: Int)
+    case invalidReplacementPattern(index: Int, expression: String)
     case invalidProtectedPattern(name: String, expression: String)
+    case invalidTypedPattern(name: String, expression: String)
 
     var description: String {
         switch self {
         case let .emptySpokenForm(index):
             "Vocabulary replacement at index \(index) has an empty spoken form."
+        case let .invalidReplacementPattern(index, expression):
+            "Vocabulary replacement at index \(index) could not be compiled: \(expression)"
         case let .invalidProtectedPattern(name, expression):
             "Protected pattern '\(name)' is not a valid regular expression: \(expression)"
+        case let .invalidTypedPattern(name, expression):
+            "Vocabulary pattern '\(name)' could not be compiled: \(expression)"
         }
     }
 }
@@ -92,6 +98,9 @@ struct CleanupCommandProcessor: Sendable {
     private static let unsupportedExpression = try! NSRegularExpression(
         pattern: #"(?<![\p{L}\p{N}_])(?:make[ \t]+that[ \t]+a[ \t]+numbered[ \t]+list|make[ \t]+that[ \t]+(?:bold|italic)|numbered[ \t]+list|new[ \t]+sentence|next[ \t]+(?:line|paragraph)|delete[ \t]+that|scratch[ \t]+this|undo[ \t]+that|redo[ \t]+that|bold[ \t]+that|italicize[ \t]+that|all[ \t]+caps)(?![\p{L}\p{N}_])"#,
         options: [.caseInsensitive]
+    )
+    private static let bulletItemSplitter = try! NSRegularExpression(
+        pattern: #"(?<=[.!?;])[ \t]+|\n+"#
     )
 
     func analyze(_ text: String) -> CleanupCommandResult {
@@ -527,8 +536,7 @@ struct CleanupCommandProcessor: Sendable {
         let paragraphStart = boundary?.upperBound ?? text.startIndex
         let prefix = boundary.map { String(text[..<$0.lowerBound]) } ?? ""
         let paragraph = String(text[paragraphStart...])
-        let splitter = try! NSRegularExpression(pattern: #"(?<=[.!?;])[ \t]+|\n+"#)
-        let normalized = splitter.stringByReplacingMatches(
+        let normalized = Self.bulletItemSplitter.stringByReplacingMatches(
             in: paragraph,
             range: NSRange(paragraph.startIndex..<paragraph.endIndex, in: paragraph),
             withTemplate: "\n"
@@ -536,13 +544,9 @@ struct CleanupCommandProcessor: Sendable {
         let items = normalized
             .split(separator: "\n")
             .map { item in
-                String(item)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                    .replacingOccurrences(
-                        of: #"^[-*•][ \t]+"#,
-                        with: "",
-                        options: .regularExpression
-                    )
+                Self.strippingBulletPrefix(
+                    from: String(item).trimmingCharacters(in: .whitespacesAndNewlines)
+                )
             }
             .filter { !$0.isEmpty }
 
@@ -550,23 +554,53 @@ struct CleanupCommandProcessor: Sendable {
         let bullets = items.map { "- \($0)" }.joined(separator: "\n")
         text = prefix.isEmpty ? bullets : "\(prefix)\n\n\(bullets)"
     }
+
+    private static func strippingBulletPrefix(from text: String) -> String {
+        guard let first = text.first,
+              first == "-" || first == "*" || first == "•"
+        else { return text }
+        let remainder = text.dropFirst()
+        guard remainder.first == " " || remainder.first == "\t" else { return text }
+        return String(remainder.drop(while: { $0 == " " || $0 == "\t" }))
+    }
 }
 
 struct CleanupVocabularyProcessor: Sendable {
-    let replacements: [CleanupVocabularyReplacement]
-    let protectedPatterns: [CleanupProtectedPattern]
+    private let compiledVocabulary: CompiledVocabulary
+    private let compilationError: CleanupVocabularyError?
 
     init(
         replacements: [CleanupVocabularyReplacement] = [],
         protectedPatterns: [CleanupProtectedPattern] = CleanupProtectedPattern.standard
     ) {
-        self.replacements = replacements
-        self.protectedPatterns = protectedPatterns
+        do {
+            compiledVocabulary = try CompiledVocabulary(
+                replacements: replacements,
+                protectedPatterns: protectedPatterns
+            )
+            compilationError = nil
+        } catch let error as CleanupVocabularyError {
+            compiledVocabulary = .empty
+            compilationError = error
+        } catch {
+            compiledVocabulary = .empty
+            compilationError = .invalidTypedPattern(
+                name: "unknown",
+                expression: String(describing: error)
+            )
+        }
+    }
+
+    init(compiledVocabulary: CompiledVocabulary) {
+        self.compiledVocabulary = compiledVocabulary
+        compilationError = nil
     }
 
     func process(_ text: String) throws -> CleanupVocabularyResult {
-        let replacementResult = try applyReplacements(to: text)
-        let patternSpans = try protectedPatternSpans(in: replacementResult.text)
+        if let compilationError { throw compilationError }
+        let normalized = compiledVocabulary.normalizeTypedPatterns(in: text)
+        let replacementResult = applyReplacements(to: normalized)
+        let patternSpans = protectedPatternSpans(in: replacementResult.text)
         let protectedSpans = coalesceOverlaps(
             replacementResult.protectedSpans + patternSpans,
             in: replacementResult.text
@@ -590,20 +624,12 @@ struct CleanupVocabularyProcessor: Sendable {
         let protectedSpans: [CleanupProtectedSpan]
     }
 
-    private func applyReplacements(to text: String) throws -> ReplacementStageResult {
+    private func applyReplacements(to text: String) -> ReplacementStageResult {
         var candidates: [ReplacementMatch] = []
         let fullRange = NSRange(text.startIndex..<text.endIndex, in: text)
 
-        for (index, replacement) in replacements.enumerated() {
-            let words = replacement.spokenForm.split(whereSeparator: \Character.isWhitespace)
-            guard !words.isEmpty else { throw CleanupVocabularyError.emptySpokenForm(index: index) }
-            let escaped = words
-                .map { NSRegularExpression.escapedPattern(for: String($0)) }
-                .joined(separator: #"[ \t]+"#)
-            let pattern = #"(?<![\p{L}\p{N}_])"# + escaped + #"(?![\p{L}\p{N}_])"#
-            let options: NSRegularExpression.Options = replacement.isCaseSensitive ? [] : [.caseInsensitive]
-            let expression = try! NSRegularExpression(pattern: pattern, options: options)
-            for match in expression.matches(in: text, range: fullRange) {
+        for (index, replacement) in compiledVocabulary.replacements.enumerated() {
+            for match in replacement.expression.matches(in: text, range: fullRange) {
                 guard let range = Range(match.range, in: text) else { continue }
                 candidates.append(
                     ReplacementMatch(
@@ -638,7 +664,7 @@ struct CleanupVocabularyProcessor: Sendable {
         var protectedSpans: [CleanupProtectedSpan] = []
         for match in selected {
             output.append(contentsOf: text[cursor..<match.range.lowerBound])
-            let replacement = replacements[match.replacementIndex]
+            let replacement = compiledVocabulary.replacements[match.replacementIndex].definition
             let outputLower = output.utf8.count
             output.append(replacement.writtenForm)
             let outputRange = CleanupTextRange(outputLower, output.utf8.count)
@@ -665,22 +691,15 @@ struct CleanupVocabularyProcessor: Sendable {
         return ReplacementStageResult(text: output, applied: applied, protectedSpans: protectedSpans)
     }
 
-    private func protectedPatternSpans(in text: String) throws -> [CleanupProtectedSpan] {
+    private func protectedPatternSpans(in text: String) -> [CleanupProtectedSpan] {
         var spans: [CleanupProtectedSpan] = []
         let fullRange = NSRange(text.startIndex..<text.endIndex, in: text)
-        for pattern in protectedPatterns {
-            let options: NSRegularExpression.Options = pattern.isCaseInsensitive ? [.caseInsensitive] : []
-            guard let expression = try? NSRegularExpression(pattern: pattern.expression, options: options) else {
-                throw CleanupVocabularyError.invalidProtectedPattern(
-                    name: pattern.name,
-                    expression: pattern.expression
-                )
-            }
-            for match in expression.matches(in: text, range: fullRange) {
+        for pattern in compiledVocabulary.protectedPatterns {
+            for match in pattern.expression.matches(in: text, range: fullRange) {
                 guard let range = Range(match.range, in: text), !range.isEmpty else { continue }
                 spans.append(
                     CleanupProtectedSpan(
-                        name: pattern.name,
+                        name: pattern.definition.name,
                         text: String(text[range]),
                         range: CleanupText.byteRange(in: text, for: range)
                     )

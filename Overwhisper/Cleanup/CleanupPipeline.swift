@@ -41,6 +41,20 @@ struct CleanupPipeline: Sendable {
         self.validator = RefinementValidator()
     }
 
+    init(
+        compiledVocabulary: CompiledVocabulary,
+        refiner: any TextRefiner = DeterministicRefiner()
+    ) {
+        self.commandProcessor = CleanupCommandProcessor()
+        self.vocabularyProcessor = CleanupVocabularyProcessor(
+            compiledVocabulary: compiledVocabulary
+        )
+        self.disfluencyDetector = CleanupDisfluencyDetector()
+        self.refiner = refiner
+        self.deterministicFallback = DeterministicRefiner()
+        self.validator = RefinementValidator()
+    }
+
     func process(_ transcript: String, mode: CleanupMode) async throws -> CleanupResult {
         try await process(FinalTranscript(text: transcript), mode: mode)
     }
@@ -83,7 +97,10 @@ struct CleanupPipeline: Sendable {
             )
 
             do {
-                let generated = try await refiner.refine(input)
+                let generated = try RefinerOutputSanitizer.sanitize(
+                    try await refiner.refine(input),
+                    sourceUTF8Count: input.transcript.utf8.count
+                )
                 do {
                     try validator.validate(generated: generated, against: input)
                     let normalized = deterministicFallback.normalizeAccepted(

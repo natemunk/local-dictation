@@ -76,8 +76,9 @@ struct ConfigurationStoreTests {
 
         #expect(result.applied)
         #expect(result.snapshot.app.defaultProfileID == "notes")
-        #expect(result.snapshot.app.browserProfilesEnabled)
-        #expect(result.snapshot.app.hostnameMatchingEnabled)
+        #expect(!result.snapshot.app.browserProfilesEnabled)
+        #expect(!result.snapshot.app.hostnameMatchingEnabled)
+        #expect(result.notices.contains { $0.kind == .legacyIgnored })
         #expect(result.snapshot.app.tapHoldThresholdMilliseconds == 425)
         #expect(result.snapshot.app.maximumRecordingDurationSeconds == 900)
         #expect(result.snapshot.app.refinerMode == .openAICompatible)
@@ -90,11 +91,10 @@ struct ConfigurationStoreTests {
 
         let slack = try #require(result.snapshot.profiles["slack"])
         #expect(slack.mode == .literal)
-        #expect(slack.formattingStyle == .chat)
+        #expect(slack.formattingStyle == .prose)
         #expect(slack.priority == 25)
         #expect(slack.match.bundleIdentifiers == ["com.example.LocalSlack"])
         #expect(slack.match.accessibilityRoles == ["AXTextArea"])
-        #expect(slack.match.hostnames == ["app.slack.com"])
 
         let custom = try #require(result.snapshot.profiles["focused_editor"])
         #expect(custom.formattingStyle == .plain)
@@ -110,8 +110,8 @@ struct ConfigurationStoreTests {
         #expect(symphony.patterns.contains { $0.name == "mye_ticket" })
     }
 
-    @Test("browser hostname matching is disabled until explicitly opted in")
-    func hostnameMatchingDefaultsDisabled() throws {
+    @Test("browser hostname settings are absent from fresh defaults")
+    func hostnameSettingsAreLegacyOnly() throws {
         let temporary = try TemporaryConfigurationDirectory()
         defer { temporary.remove() }
 
@@ -133,13 +133,56 @@ struct ConfigurationStoreTests {
 
         #expect(!result.snapshot.app.browserProfilesEnabled)
         let generated = try String(contentsOf: paths.appFile, encoding: .utf8)
-        #expect(generated.contains("browser_profiles_enabled = false"))
+        #expect(!generated.contains("browser_profiles_enabled"))
+        #expect(!generated.contains("hostname_matching_enabled"))
         #expect(generated.contains("refiner_mode = \"auto\""))
         #expect(generated.contains("allow_remote = false"))
         #expect(generated.contains("refinement_deadline_seconds = 2.0"))
-        #expect(generated.contains("history_success_retention_days = 90"))
+        #expect(generated.contains("history_retention_days = 90"))
+        #expect(!generated.contains("history_success_retention_days"))
         #expect(generated.contains("debug_audio_retention = false"))
         #expect(!generated.lowercased().contains("api_key"))
+    }
+
+    @Test("legacy hostname settings are ignored with a nonfatal notice")
+    func legacyHostnameSettingsAreIgnored() throws {
+        let temporary = try TemporaryConfigurationDirectory()
+        defer { temporary.remove() }
+        let paths = ConfigurationPaths(rootDirectory: temporary.url)
+        let store = ConfigurationStore(paths: paths)
+        #expect(store.bootstrapAndReload().applied)
+
+        try Self.write(
+            """
+            version = 1
+            browser_profiles_enabled = true
+            hostname_matching_enabled = true
+            """,
+            to: paths.appFile
+        )
+        try Self.write(
+            """
+            version = 1
+
+            [profiles.legacy_browser]
+            mode = "clean"
+
+            [profiles.legacy_browser.match]
+            bundle_identifiers = ["com.google.Chrome"]
+            hostnames = ["https://bad.example/private/path"]
+            """,
+            to: paths.profilesFile
+        )
+
+        let result = store.reload()
+
+        #expect(result.applied)
+        #expect(!result.snapshot.app.browserProfilesEnabled)
+        #expect(result.notices.count == 2)
+        #expect(result.notices.allSatisfy { $0.kind == .legacyIgnored })
+        let legacy = try #require(result.snapshot.profiles["legacy_browser"])
+        #expect(legacy.match.bundleIdentifiers == ["com.google.Chrome"])
+        #expect(store.currentNotices == result.notices)
     }
 
     @Test("remote refiner endpoints require opt-in and HTTPS while loopback HTTP remains local")
@@ -299,6 +342,58 @@ struct ConfigurationStoreTests {
                 to: "Check mye-2076 in my educator, not someyeducator."
             ) == "Check MYE-2076 in MyEducator, not someyeducator."
         )
+    }
+
+    @Test("compiled vocabulary is reused within one configuration generation")
+    func compiledVocabularyGeneration() throws {
+        let temporary = try TemporaryConfigurationDirectory()
+        defer { temporary.remove() }
+
+        let paths = ConfigurationPaths(rootDirectory: temporary.url)
+        let store = ConfigurationStore(paths: paths)
+        #expect(store.bootstrapAndReload().applied)
+        let firstGeneration = store.generation
+        let first = try #require(store.compiledVocabulary(forProfileID: "linear"))
+        let same = try #require(store.compiledVocabulary(forProfileID: "linear"))
+        #expect(first.compilationID == same.compilationID)
+
+        let normalized = try CleanupVocabularyProcessor(
+            compiledVocabulary: first
+        ).process("check mye-2076 in my educator")
+        #expect(normalized.text == "check MYE-2076 in MyEducator")
+
+        #expect(store.reload().applied)
+        let recompiled = try #require(store.compiledVocabulary(forProfileID: "linear"))
+        #expect(store.generation == firstGeneration + 1)
+        #expect(recompiled.compilationID != first.compilationID)
+    }
+
+    @Test("large personal packs compile once and apply to every profile")
+    func largePersonalVocabularyPack() throws {
+        let temporary = try TemporaryConfigurationDirectory()
+        defer { temporary.remove() }
+
+        let paths = ConfigurationPaths(rootDirectory: temporary.url)
+        let store = ConfigurationStore(paths: paths)
+        #expect(store.bootstrapAndReload().applied)
+
+        let mappings = (0..<300).map {
+            "\"spoken phrase \($0)\" = \"WrittenPhrase\($0)\""
+        }.joined(separator: "\n")
+        try Self.write(
+            "version = 1\n\n[replacements]\n\(mappings)\n",
+            to: paths.personalVocabularyFile
+        )
+
+        let result = store.reload()
+        #expect(result.applied)
+        for profileID in ["terminal", "linear", "notes", "browser", "default"] {
+            let compiled = try #require(store.compiledVocabulary(forProfileID: profileID))
+            let output = try CleanupVocabularyProcessor(
+                compiledVocabulary: compiled
+            ).process("spoken phrase 299")
+            #expect(output.text == "WrittenPhrase299")
+        }
     }
 
     private static func write(_ text: String, to url: URL) throws {

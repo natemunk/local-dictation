@@ -81,8 +81,9 @@ struct CleanupAppleFoundationRefinerTests {
         #expect(try await refiner.refine(input) == "OpenRouter")
         #expect(adapter.calls.count == 1)
         #expect(adapter.calls.first?.transcript == "OpenRouter um")
-        #expect(adapter.calls.first?.staticRules == CleanupRefinementRules.text)
+        #expect(adapter.calls.first?.staticRules == CleanupRefinementRules.text(for: input))
         #expect(!adapter.calls.first!.staticRules.contains("PRIVATE_"))
+        #expect(adapter.calls.first!.staticRules.contains("UTF-8 bytes 11..<13"))
     }
 }
 private func emptyInput(_ transcript: String) -> TextRefinementInput {

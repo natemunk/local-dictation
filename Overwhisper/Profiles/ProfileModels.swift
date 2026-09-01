@@ -12,20 +12,17 @@ struct ProfileMatch: Equatable, Sendable {
     var bundleIdentifiers: [String]
     var accessibilityRoles: [String]
     var accessibilitySubroles: [String]
-    var hostnames: [String]
     var isGenericBrowser: Bool
 
     init(
         bundleIdentifiers: [String] = [],
         accessibilityRoles: [String] = [],
         accessibilitySubroles: [String] = [],
-        hostnames: [String] = [],
         isGenericBrowser: Bool = false
     ) {
         self.bundleIdentifiers = bundleIdentifiers
         self.accessibilityRoles = accessibilityRoles
         self.accessibilitySubroles = accessibilitySubroles
-        self.hostnames = hostnames
         self.isGenericBrowser = isGenericBrowser
     }
 
@@ -37,7 +34,6 @@ struct ProfileMatch: Equatable, Sendable {
         bundleIdentifiers.isEmpty
             && accessibilityRoles.isEmpty
             && accessibilitySubroles.isEmpty
-            && hostnames.isEmpty
             && !isGenericBrowser
     }
 }

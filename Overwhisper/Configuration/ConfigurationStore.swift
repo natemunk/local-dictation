@@ -6,6 +6,7 @@ enum ConfigurationDiagnosticKind: String, Equatable, Sendable {
     case parse
     case decode
     case validation
+    case legacyIgnored = "legacy_ignored"
 }
 
 struct ConfigurationDiagnostic: Equatable, Sendable {
@@ -18,6 +19,7 @@ struct ConfigurationReloadResult: Equatable, Sendable {
     let applied: Bool
     let snapshot: ConfigurationSnapshot
     let diagnostic: ConfigurationDiagnostic?
+    let notices: [ConfigurationDiagnostic]
 }
 
 /// Owns a transactional, last-known-good configuration snapshot.
@@ -27,11 +29,14 @@ struct ConfigurationReloadResult: Equatable, Sendable {
 final class ConfigurationStore {
     let paths: ConfigurationPaths
     private(set) var snapshot: ConfigurationSnapshot
+    private(set) var generation: UInt64 = 0
     private(set) var currentDiagnostic: ConfigurationDiagnostic?
+    private(set) var currentNotices: [ConfigurationDiagnostic] = []
     private(set) var diagnosticHistory: [ConfigurationDiagnostic] = []
 
     private let fileManager: FileManager
     private let typedDefaults: ConfigurationSnapshot
+    private var compiledVocabularyByProfileID: [String: CompiledVocabulary]
 
     init(
         paths: ConfigurationPaths = .userDefault,
@@ -42,6 +47,9 @@ final class ConfigurationStore {
         self.fileManager = fileManager
         self.typedDefaults = typedDefaults
         snapshot = typedDefaults
+        compiledVocabularyByProfileID = (
+            try? Self.compileVocabularyByProfile(in: typedDefaults)
+        ) ?? [:]
     }
 
     @discardableResult
@@ -63,13 +71,19 @@ final class ConfigurationStore {
     @discardableResult
     func reload() -> ConfigurationReloadResult {
         do {
-            let candidate = try loadCandidate()
+            let loaded = try loadCandidate()
+            let candidate = loaded.snapshot
+            let compiled = try Self.compileVocabularyByProfile(in: candidate)
             snapshot = candidate
+            compiledVocabularyByProfileID = compiled
+            generation &+= 1
             currentDiagnostic = nil
+            currentNotices = loaded.notices
             return ConfigurationReloadResult(
                 applied: true,
                 snapshot: snapshot,
-                diagnostic: nil
+                diagnostic: nil,
+                notices: currentNotices
             )
         } catch let error as ConfigurationDocumentError {
             let kind: ConfigurationDiagnosticKind
@@ -96,6 +110,14 @@ final class ConfigurationStore {
                     message: error.message
                 )
             )
+        } catch let error as CleanupVocabularyError {
+            return reject(
+                ConfigurationDiagnostic(
+                    kind: .validation,
+                    fileURL: paths.vocabularyDirectory,
+                    message: error.description
+                )
+            )
         } catch {
             return reject(
                 ConfigurationDiagnostic(
@@ -113,11 +135,33 @@ final class ConfigurationStore {
         return ConfigurationReloadResult(
             applied: false,
             snapshot: snapshot,
-            diagnostic: diagnostic
+            diagnostic: diagnostic,
+            notices: currentNotices
         )
     }
 
-    private func loadCandidate() throws -> ConfigurationSnapshot {
+    func compiledVocabulary(forProfileID profileID: String) -> CompiledVocabulary? {
+        compiledVocabularyByProfileID[profileID]
+    }
+
+    private static func compileVocabularyByProfile(
+        in snapshot: ConfigurationSnapshot
+    ) throws -> [String: CompiledVocabulary] {
+        var compiled: [String: CompiledVocabulary] = [:]
+        compiled.reserveCapacity(snapshot.profiles.profiles.count)
+        for (profileID, profile) in snapshot.profiles.profiles {
+            let selection = snapshot.vocabulary.selection(
+                including: profile.vocabularyPackIDs
+            )
+            compiled[profileID] = try selection.compileForCleanup()
+        }
+        return compiled
+    }
+
+    private func loadCandidate() throws -> (
+        snapshot: ConfigurationSnapshot,
+        notices: [ConfigurationDiagnostic]
+    ) {
         let appFile = try TOMLDocumentCodec.decode(AppConfigurationFile.self, from: paths.appFile)
         try validateVersion(appFile.version, fileURL: paths.appFile)
         let app: AppConfiguration
@@ -155,7 +199,52 @@ final class ConfigurationStore {
             vocabulary: vocabulary
         )
         try validate(candidate, packSourceURLs: packSourceURLs)
-        return candidate
+        return (
+            candidate,
+            legacyNotices(appFile: appFile, profilesFile: profilesFile)
+        )
+    }
+
+    private func legacyNotices(
+        appFile: AppConfigurationFile,
+        profilesFile: ProfilesFile
+    ) -> [ConfigurationDiagnostic] {
+        var notices: [ConfigurationDiagnostic] = []
+        if appFile.browserProfilesEnabled != nil
+            || appFile.hostnameMatchingEnabled != nil
+        {
+            notices.append(
+                ConfigurationDiagnostic(
+                    kind: .legacyIgnored,
+                    fileURL: paths.appFile,
+                    message: "Legacy browser_profiles_enabled/hostname_matching_enabled is ignored. Browsers now use bundle-ID profiles without Automation permission."
+                )
+            )
+        }
+        if appFile.historySuccessRetentionDays != nil {
+            notices.append(
+                ConfigurationDiagnostic(
+                    kind: .legacyIgnored,
+                    fileURL: paths.appFile,
+                    message: "history_success_retention_days is a legacy key. Its value still applies to all history states; rename it to history_retention_days."
+                )
+            )
+        }
+
+        let hostnameProfiles = (profilesFile.profiles ?? [:])
+            .filter { !($0.value.match?.hostnames ?? []).isEmpty }
+            .map(\.key)
+            .sorted()
+        if !hostnameProfiles.isEmpty {
+            notices.append(
+                ConfigurationDiagnostic(
+                    kind: .legacyIgnored,
+                    fileURL: paths.profilesFile,
+                    message: "Ignored legacy hostname matches for profile(s): \(hostnameProfiles.joined(separator: ", ")). Generic browser bundle matching remains active."
+                )
+            )
+        }
+        return notices
     }
 
     private func vocabularyPackFiles() throws -> [URL] {
@@ -208,7 +297,7 @@ final class ConfigurationStore {
         guard (0...3_650).contains(app.historySuccessRetentionDays) else {
             throw ConfigurationValidationError(
                 fileURL: paths.appFile,
-                message: "history_success_retention_days must be between 0 and 3650"
+                message: "history_retention_days must be between 0 and 3650"
             )
         }
         if let model = app.refinerModel,
@@ -260,14 +349,6 @@ final class ConfigurationStore {
                     fileURL: paths.profilesFile,
                     message: "Generic browser profile '\(id)' requires at least one bundle identifier"
                 )
-            }
-            for domain in profile.match.hostnames {
-                guard BrowserHostname.approvedDomain(from: domain) != nil else {
-                    throw ConfigurationValidationError(
-                        fileURL: paths.profilesFile,
-                        message: "Profile '\(id)' hostname '\(domain)' must contain only a hostname, not a URL or path"
-                    )
-                }
             }
             for packID in profile.vocabularyPackIDs where candidate.vocabulary.packs[packID] == nil {
                 throw ConfigurationValidationError(
@@ -506,11 +587,10 @@ private enum InitialConfigurationFiles {
         version = 1
 
         # default_profile = "default"
-        browser_profiles_enabled = false
         refiner_mode = "auto"
         allow_remote = false
         refinement_deadline_seconds = 2.0
-        history_success_retention_days = 90
+        history_retention_days = 90
         debug_audio_retention = false
 
         # refiner_endpoint = "http://127.0.0.1:8080/v1/chat/completions"

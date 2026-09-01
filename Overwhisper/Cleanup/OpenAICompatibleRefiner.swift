@@ -55,10 +55,9 @@ enum OpenAICompatibleRefinerError: Error, Equatable, CustomStringConvertible, Se
 }
 
 /// A minimal OpenAI-compatible text generator. It sends no app context,
-/// candidate ranges, protected-span metadata, vocabulary list, or history.
+/// protected-span metadata, vocabulary list, or history. Allowed deletion
+/// ranges are derived exclusively from the transcript sent in the same request.
 final class OpenAICompatibleRefiner: TextRefiner, @unchecked Sendable {
-    static let staticRules = CleanupRefinementRules.text
-
     private let configuration: OpenAICompatibleRefinerConfiguration
     private let session: URLSession
     private let redirectDelegate = CleanupRedirectBlockingDelegate()
@@ -87,7 +86,10 @@ final class OpenAICompatibleRefiner: TextRefiner, @unchecked Sendable {
             ChatCompletionRequest(
                 model: configuration.model,
                 messages: [
-                    ChatMessage(role: "system", content: Self.staticRules),
+                    ChatMessage(
+                        role: "system",
+                        content: CleanupRefinementRules.text(for: input)
+                    ),
                     ChatMessage(role: "user", content: input.transcript),
                 ],
                 temperature: 0,

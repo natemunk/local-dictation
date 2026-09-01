@@ -1,6 +1,6 @@
 # Local Dictation v1 acceptance matrix
 
-Snapshot: 2026-08-31. “Implemented” refers only to source in this checkout. “Automated-verified” refers to the 143-test SwiftPM run across 24 suites on this host. “Fixture-verified” refers only to synthetic scorer fixtures. “Pending” and “blocked” rows are not product claims.
+Snapshot: 2026-08-31. “Implemented” refers only to source in this checkout. “Automated-verified” refers to the 149-test SwiftPM run across 23 suites on this host. “Fixture-verified” refers only to synthetic scorer fixtures. “Pending” and “blocked” rows are not product claims.
 
 ## Evidence states
 
@@ -59,14 +59,14 @@ Snapshot: 2026-08-31. “Implemented” refers only to source in this checkout. 
 | ASR-003 | Models may remain warm but perform no idle inference/polling. | Instruments plus network/process observation. | Pending benchmark/manual. |
 | CLN-001 | Literal mode skips commands, inferred formatting, fillers, and model cleanup. | Cleanup unit corpus. | Automated-verified. |
 | CLN-002 | Clean mode implements only the five approved initial commands and preserves unknown command-like speech. | Cleanup pair tests and history metadata assertion. | Automated-verified, including `scratch that` against ASR pause/segment boundaries. |
-| CLN-003 | Refiner returns text; alignment validator rejects additions/substitutions/reordering and protected-span changes. | Positive/negative alignment corpus. | Automated-verified, including protected spans and deletion-volume limits. |
-| CLN-004 | Two-second deadline falls back to deterministic output and marks `pasted_raw`. | Fake delayed refiner contract test. | Automated-verified at cleanup/history contract boundaries; end-to-end timing pending. |
-| CFG-001 | Defaults and local TOML overrides merge with local precedence; invalid reload preserves last-known-good. | Configuration unit tests. | Automated-verified. |
-| CFG-002 | Raycast vocabulary importer accepts only user-supplied comma-separated text and never reads Raycast storage. | Importer unit test and source audit. | Automated-verified. |
+| CLN-003 | Refiner returns plain text; sanitizer and alignment validator reject malformed wrappers, control/bidirectional text, additions/substitutions/reordering, inferred bullets, and protected-span changes. | Positive/negative sanitizer and alignment corpus. | Automated-verified, including atomic protected spans, output-size bounds, explicit-bullet gating, and deletion-volume limits. |
+| CLN-004 | Experimental model cleanup is off by default; its two-second deadline or invalid result falls back to deterministic output with structured outcome metadata. | Settings state plus fake delayed/malformed refiner contracts. | Automated-verified at cleanup/history contract boundaries; end-to-end timing pending. |
+| CFG-001 | Defaults and local TOML overrides merge with local precedence; invalid reload preserves the last-known-good snapshot and compiled vocabulary. | Configuration unit tests. | Automated-verified, including same-generation cache reuse and a 300-entry personal pack. |
+| CFG-002 | Raycast import and history corrections require explicit user input, update the personal pack transactionally, and never read/learn silently. | Importer/editor unit tests and source audit. | Automated-verified. |
 | CFG-003 | Native profile precedence uses bundle ID and AX role/subrole; generic browser fallback is safe. | Profile resolution unit matrix. | Automated-verified. |
-| CFG-004 | Hostname profiles are opt-in, permission-denial-safe, and discard URL paths immediately. | Browser adapter contract and permission manual matrix. | Automated-verified at adapter/profile boundaries; real Automation permission matrix pending. |
+| CFG-004 | Browser matching uses bundle IDs only; browser Apple Events/hostname execution and permission UI are absent. Legacy hostname settings are ignored with a diagnostic. | Source-surface and configuration/profile contracts. | Automated-verified; no Browser Automation permission matrix is required. |
 | HIS-001 | Raw transcript is saved before cleanup/insertion in GRDB/SQLite FTS5. | Transaction-order integration and crash injection. | Source-observed with automated raw-recovery/history contracts; process-crash injection pending. |
-| HIS-002 | 90-day retention, search, retry, delete-entry, and delete-all behave correctly. | Migration/search/clock tests. | Automated-verified. |
+| HIS-002 | Actor-isolated WAL history applies 90-day retention to every state at launch/daily and supports FTS/escaped search, copy/Paste Again, delete-entry, and delete-all. | Migration, actor-concurrency, WAL-health, search, and clock tests. | Automated-verified; daily scheduler is source-observed. |
 
 ## Privacy and reliability
 
@@ -74,7 +74,7 @@ Snapshot: 2026-08-31. “Implemented” refers only to source in this checkout. 
 |---|---|---|---|
 | PRV-001 | No audio, telemetry, automatic updater, or cloud ASR traffic. | Dependency/source audit plus runtime network capture. | Static privacy audit passes; runtime network capture pending. |
 | PRV-002 | Remote cleanup is explicit, text-only, allowlisted by `allow_remote`, and visibly Remote. | Request-body contract tests and UI/manual network capture. | Automated request/privacy contracts pass and UI is source-observed; live capture pending. |
-| PRV-003 | Browser paths/hostnames never enter logs/history/refiner requests. | Adapter unit tests, database inspection, request capture. | Automated adapter/schema/request contracts pass; live request capture pending. |
+| PRV-003 | Browser paths/hostnames have no runtime adapter and never enter history/refiner requests. | Source-surface tests, database inspection, request capture. | Automated profile/schema/request contracts pass; live request capture pending. |
 | PRV-004 | Temporary WAV deletion and crash-orphan cleanup are reliable; debug retention is explicit and capped at 10. | File-system integration/crash tests. | Source-observed; launch/cancellation/crash file-system exercise pending. |
 | PRV-005 | API keys remain in Keychain and are redacted from every artifact. | Keychain test double and repository/log scan. | Keychain storage and static source audit observed; end-to-end log/artifact exercise pending. |
 | REL-001 | Sleep/wake and microphone unplug/switch recover without relaunch. | Repeated manual matrix on supported hardware. | Pending manual. |
@@ -102,14 +102,14 @@ Snapshot: 2026-08-31. “Implemented” refers only to source in this checkout. 
 | CUT-005 | Developer coworker with supported Apple Silicon/Xcode reaches first dictation via documented `./setup` in under 15 minutes. | Clean-machine timed source build. | `./setup` completed in an isolated temporary home on this host and produced a strict-code-sign-valid arm64 app with the expected bundle ID/minimum OS; fresh coworker timing and first dictation remain pending. Notarization is not required. |
 | CUT-006 | One week and at least 50 real dictations achieve `>=90%` usable without re-dictation or Raycast fallback. | Local usage log and user review. | Pending; keep Raycast. |
 | V1-001 | Live volatile/finalized transcript is complete. | Streaming engine/UI acceptance. | Source-observed with automated buffer/lifecycle contracts; live-model UI acceptance pending. |
-| V1-002 | Opt-in hostname profiles satisfy permission/privacy matrix. | Chrome/Chromium and Safari manual/contract tests. | Automated adapter contracts pass; real Chrome/Safari permission matrix pending. |
+| V1-002 | Chrome/Chromium and Safari use generic bundle-only Clean behavior without Browser Automation permission. | Profile contracts plus manual browser insertion matrix. | Bundle-only profile contracts pass; real browser insertion matrix remains pending. |
 
 ## Current toolchain state
 
 | ID | Observation | Evidence | Consequence |
 |---|---|---|---|
 | TOOL-001 | Host is macOS 26.6.2 with Xcode 26.6 (17F113). Normal `xcrun --sdk macosx --find swiftc` fails while loading `libxcodebuildLoader.dylib`: `CoreDevice.framework` references `_XPCTypeBool`, expected in `Mercury.framework`. | Reproduced during this benchmark work. | Normal developer-tool resolution is unreliable. |
-| TOOL-002 | Direct SwiftPM invocation through the Xcode toolchain works when supplied the SDK plus Developer Framework search paths, even though `xcrun` remains broken. | Current run built the app and passed 143 tests in 24 suites. | Automated source contracts are usable on this host; the documented setup script contains the workaround. Repairing Xcode remains advisable for normal tooling. |
+| TOOL-002 | Direct SwiftPM invocation through the Xcode toolchain works when supplied the SDK plus Developer Framework search paths, even though `xcrun` remains broken. | Current run built the app and passed 149 tests in 23 suites. | Automated source contracts are usable on this host; the documented setup script contains the workaround. Repairing Xcode remains advisable for normal tooling. |
 | TOOL-003 | Pure benchmark sources compile with direct `swiftc`, explicit SDK, target `arm64-apple-macosx15.0`, and a writable module cache. | `Benchmark/verify-fixtures.sh` passed. | Scorer mechanics are independently verifiable; this does not clear TOOL-001/002 for the application. |
 | TOOL-004 | Source packaging puts required SwiftPM resource bundles under `Contents/Resources`, signs nested code before the app, and restores its generated dependency checkout. | Reusable app-bundle verifier plus isolated-home CI packaging with an explicit CI-only ad-hoc requirement. | Source implementation present; real per-machine identity creation and two-build TCC retention remain manual gates. Notarization and downloadable binary distribution remain deferred. |
 

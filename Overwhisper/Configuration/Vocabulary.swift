@@ -57,36 +57,17 @@ struct VocabularyPack: Equatable, Sendable {
         self.patterns = patterns
     }
 
-    /// Applies configured replacements and typed patterns in a stable order.
-    /// Literal phrases and protected terms are exposed as metadata for the ASR
-    /// and cleanup layers; they do not mutate text by themselves.
+    /// Applies the same precompiled replacement, normalization, and protection
+    /// rules used by the cleanup pipeline. Runtime callers reuse the compiled
+    /// value owned by `ConfigurationStore`; this helper is for one-off tools
+    /// and tests.
     func applyingDeterministicRules(to text: String) -> String {
-        var result = text
-
-        let orderedReplacements = replacements.sorted { lhs, rhs in
-            if lhs.key.count != rhs.key.count { return lhs.key.count > rhs.key.count }
-            let foldedComparison = lhs.key.lowercased().compare(rhs.key.lowercased())
-            if foldedComparison != .orderedSame { return foldedComparison == .orderedAscending }
-            return lhs.key < rhs.key
-        }
-
-        for (source, replacement) in orderedReplacements {
-            result = Self.replacingPhrase(
-                source,
-                with: replacement,
-                in: result
-            )
-        }
-
-        let orderedPatterns = patterns.sorted { lhs, rhs in
-            if lhs.prefix.count != rhs.prefix.count { return lhs.prefix.count > rhs.prefix.count }
-            return lhs.name < rhs.name
-        }
-        for pattern in orderedPatterns {
-            result = pattern.applying(to: result)
-        }
-
-        return result
+        guard let compiled = try? compileForCleanup(),
+              let result = try? CleanupVocabularyProcessor(
+                compiledVocabulary: compiled
+              ).process(text)
+        else { return text }
+        return result.text
     }
 
     func combining(_ laterPack: VocabularyPack) -> VocabularyPack {
@@ -116,35 +97,6 @@ struct VocabularyPack: Equatable, Sendable {
             combined.patterns.append(pattern)
         }
         return combined
-    }
-
-    private static func replacingPhrase(
-        _ source: String,
-        with replacement: String,
-        in text: String
-    ) -> String {
-        guard !source.isEmpty else { return text }
-        let startsWithWordCharacter = source.first.map { $0.isLetter || $0.isNumber || $0 == "_" } ?? false
-        let endsWithWordCharacter = source.last.map { $0.isLetter || $0.isNumber || $0 == "_" } ?? false
-        let leadingBoundary = startsWithWordCharacter ? "(?<![\\p{L}\\p{N}_])" : ""
-        let trailingBoundary = endsWithWordCharacter ? "(?![\\p{L}\\p{N}_])" : ""
-        let pattern = leadingBoundary
-            + NSRegularExpression.escapedPattern(for: source)
-            + trailingBoundary
-
-        guard let expression = try? NSRegularExpression(
-            pattern: pattern,
-            options: [.caseInsensitive]
-        ) else {
-            return text
-        }
-
-        let range = NSRange(text.startIndex..<text.endIndex, in: text)
-        return expression.stringByReplacingMatches(
-            in: text,
-            range: range,
-            withTemplate: NSRegularExpression.escapedTemplate(for: replacement)
-        )
     }
 
     private static func appendingUnique(_ values: [String], to existing: [String]) -> [String] {
@@ -284,51 +236,6 @@ extension VocabularyPack {
             }
         }
         return merged
-    }
-}
-
-private extension VocabularyPattern {
-    func applying(to text: String) -> String {
-        switch kind {
-        case .prefixedDigits:
-            return applyingPrefixedDigits(to: text)
-        }
-    }
-
-    func applyingPrefixedDigits(to text: String) -> String {
-        let expressionPattern = "(?<![\\p{L}\\p{N}_])"
-            + NSRegularExpression.escapedPattern(for: prefix)
-            + "([0-9]+)(?![\\p{L}\\p{N}_])"
-        guard let expression = try? NSRegularExpression(
-            pattern: expressionPattern,
-            options: [.caseInsensitive]
-        ) else {
-            return text
-        }
-
-        let normalizedPrefix: String
-        switch outputCase {
-        case .uppercase:
-            normalizedPrefix = prefix.uppercased()
-        case .lowercase:
-            normalizedPrefix = prefix.lowercased()
-        case .preserve:
-            normalizedPrefix = prefix
-        }
-
-        var output = text
-        let fullRange = NSRange(output.startIndex..<output.endIndex, in: output)
-        let matches = expression.matches(in: output, range: fullRange)
-        for match in matches.reversed() {
-            guard let matchRange = Range(match.range(at: 0), in: output),
-                  let digitsRange = Range(match.range(at: 1), in: output)
-            else {
-                continue
-            }
-            let digits = output[digitsRange]
-            output.replaceSubrange(matchRange, with: normalizedPrefix + digits)
-        }
-        return output
     }
 }
 

@@ -118,6 +118,7 @@ struct AppConfigurationFile: Codable, Equatable {
     var refinerModel: String?
     var allowRemote: Bool?
     var refinementDeadlineSeconds: Double?
+    var historyRetentionDays: Int?
     var historySuccessRetentionDays: Int?
     var debugAudioRetentionEnabled: Bool?
 
@@ -133,6 +134,7 @@ struct AppConfigurationFile: Codable, Equatable {
         refinerModel: String? = nil,
         allowRemote: Bool? = nil,
         refinementDeadlineSeconds: Double? = nil,
+        historyRetentionDays: Int? = nil,
         historySuccessRetentionDays: Int? = nil,
         debugAudioRetentionEnabled: Bool? = nil
     ) {
@@ -147,6 +149,7 @@ struct AppConfigurationFile: Codable, Equatable {
         self.refinerModel = refinerModel
         self.allowRemote = allowRemote
         self.refinementDeadlineSeconds = refinementDeadlineSeconds
+        self.historyRetentionDays = historyRetentionDays
         self.historySuccessRetentionDays = historySuccessRetentionDays
         self.debugAudioRetentionEnabled = debugAudioRetentionEnabled
     }
@@ -163,6 +166,7 @@ struct AppConfigurationFile: Codable, Equatable {
         case refinerModel = "refiner_model"
         case allowRemote = "allow_remote"
         case refinementDeadlineSeconds = "refinement_deadline_seconds"
+        case historyRetentionDays = "history_retention_days"
         case historySuccessRetentionDays = "history_success_retention_days"
         case debugAudioRetentionEnabled = "debug_audio_retention"
     }
@@ -172,11 +176,9 @@ extension AppConfiguration {
     func applying(_ file: AppConfigurationFile) throws -> AppConfiguration {
         var merged = self
         if let value = file.defaultProfileID { merged.defaultProfileID = value }
-        if let value = file.browserProfilesEnabled {
-            merged.browserProfilesEnabled = value
-        } else if let legacyValue = file.hostnameMatchingEnabled {
-            merged.browserProfilesEnabled = legacyValue
-        }
+        // Browser-hostname flags remain decodable for backwards compatibility
+        // but are intentionally ignored. Browser profiles now use bundle IDs.
+        merged.browserProfilesEnabled = false
         if let value = file.tapHoldThresholdMilliseconds {
             merged.tapHoldThresholdMilliseconds = value
         }
@@ -196,7 +198,7 @@ extension AppConfiguration {
         if let value = file.refinementDeadlineSeconds {
             merged.refinementDeadlineSeconds = value
         }
-        if let value = file.historySuccessRetentionDays {
+        if let value = file.historyRetentionDays ?? file.historySuccessRetentionDays {
             merged.historySuccessRetentionDays = value
         }
         if let value = file.debugAudioRetentionEnabled {
@@ -324,7 +326,6 @@ private extension ProfileMatch {
         if let value = file.bundleIdentifiers { bundleIdentifiers = value }
         if let value = file.accessibilityRoles { accessibilityRoles = value }
         if let value = file.accessibilitySubroles { accessibilitySubroles = value }
-        if let value = file.hostnames { hostnames = value }
         if let value = file.isGenericBrowser { isGenericBrowser = value }
     }
 }

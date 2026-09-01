@@ -57,7 +57,10 @@ struct CleanupOpenAICompatibleRefinerTests {
         #expect(object["model"] as? String == "local-cleaner")
         let messages = try #require(object["messages"] as? [[String: String]])
         #expect(messages.count == 2)
-        #expect(messages[0] == ["role": "system", "content": CleanupRefinementRules.text])
+        #expect(messages[0] == [
+            "role": "system",
+            "content": CleanupRefinementRules.text(for: input),
+        ])
         #expect(messages[1] == ["role": "user", "content": "OpenRouter um"])
 
         let bodyText = String(decoding: body, as: UTF8.self)
@@ -66,6 +69,7 @@ struct CleanupOpenAICompatibleRefinerTests {
         #expect(!bodyText.contains("TOP_SECRET_API_KEY"))
         #expect(!bodyText.contains("candidateDisfluencies"))
         #expect(!bodyText.contains("protectedSpans"))
+        #expect(bodyText.contains("UTF-8 bytes 11..<13"))
     }
 
     @Test("malformed chat-completion responses fail clearly")

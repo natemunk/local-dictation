@@ -20,7 +20,7 @@ The normative source is Nate's approved Local Dictation v1 implementation plan f
 - V1 targets Apple Silicon and macOS 15 or newer.
 - The app is a public, MIT-licensed, source-build macOS menu-bar application.
 - Audio remains local. Telemetry, cloud speech-to-text, Overseed services, and automatic update checks are removed rather than hidden behind settings.
-- Optional cleanup may use Apple Foundation Models or an explicitly configured OpenAI-compatible endpoint. A refiner receives transcript text and static cleanup rules only, never audio or destination context.
+- Deterministic cleanup is the shipped default. An Advanced, off-by-default experiment may use Apple Foundation Models or an explicitly configured OpenAI-compatible endpoint. A refiner receives transcript text, static cleanup rules, and transcript-derived candidate-deletion ranges only, never audio or destination context.
 - Source-build sharing is sufficient for developer coworkers. Source installs use a stable, per-machine self-signed identity so TCC permissions survive rebuilds. Developer ID signing, notarization, and downloadable binaries are deferred; they are not silently simulated by clearing quarantine.
 
 ## Recording controls and state
@@ -116,7 +116,7 @@ Refiners return ordinary cleaned text. The alignment validator then requires:
 - URLs, email addresses, paths, identifiers, acronyms, and ticket IDs remain byte-identical, appear exactly once, and preserve order.
 - Output lexical tokens are a case-insensitive subsequence of input lexical tokens.
 - No new, substituted, or reordered lexical words.
-- Case, punctuation, apostrophes, whitespace, line breaks, and bullet markers may change.
+- Case, punctuation, apostrophes, whitespace, and line breaks may change. Bullet markers may appear only when the normalized source already contains bullets created by an explicit spoken command.
 - Deletion only inside candidate disfluency ranges derived from fillers, correction markers, repeated starts, or ASR pause boundaries.
 - Malformed alignment, excessive deletion, or any protected-span violation rejects the entire refinement.
 
@@ -125,11 +125,13 @@ Structured edit-plan generation is explicitly deferred unless later benchmark ev
 ## Refiner policy
 
 - `DeterministicRefiner` is the universal fallback.
+- Model-backed cleanup is disabled until the user enables **Experimental model cleanup** in Advanced settings. Deterministic cleanup remains active while it is off.
 - `AppleFoundationRefiner` is eligible in `auto` mode only on macOS 26+ when Apple Intelligence and the system model report availability.
 - `OpenAICompatibleRefiner` uses a configured `/v1/chat/completions` endpoint and an optional Keychain credential.
 - An explicitly configured endpoint overrides `auto`.
 - Only loopback hosts count as local. Every other host requires `allow_remote = true` and a persistent Remote badge.
-- The default refinement deadline is two seconds. Timeout or invalid output cancels refinement, delivers deterministic output, marks history `pasted_raw`, and offers retry only for that failed polish.
+- The prompt identifies the exact candidate spans that may be deleted and prohibits other deletion, additions, reordering, explanations, preambles, and Markdown wrappers. Output normalization accepts one whole-response code fence only; malformed wrappers, control/bidirectional text, oversized output, or validator failure reject the whole result.
+- The default refinement deadline is two seconds. Timeout or invalid output cancels refinement, delivers deterministic output, and records the fallback metadata. Retry-polish runtime/UI is removed; compatibility columns remain in existing databases.
 
 Availability, quality, and latency for both model-backed refiners remain unbenchmarked.
 
@@ -147,20 +149,19 @@ Editable configuration lives under:
 ```
 
 - Bundled defaults merge with local overrides; local values win.
-- Invalid edits retain the last-known-good configuration and surface a non-blocking diagnostic.
+- Invalid edits retain the last-known-good configuration and its compiled vocabulary. Persistent configuration diagnostics are separate from transient runtime errors.
 - A one-time importer accepts a user-supplied comma-separated Raycast vocabulary string and writes a personal pack. It never reads Raycast storage. The personal pack is applied last to every profile immediately after a successful reload.
-- Vocabulary supports literal phrases, deterministic replacements, protected terms, and patterns such as `MYE-` followed by digits forced uppercase.
+- Vocabulary supports literal phrases, deterministic replacements, protected terms, and patterns such as `MYE-` followed by digits forced uppercase. Literal replacements and protected expressions compile once per successful configuration generation and are reused across dictations; malformed expressions cannot replace the last-known-good compiled state.
+- History may write a personal correction only after explicit user confirmation. No transcript is mined or learned silently.
 
 Cutover profile matching uses bundle ID plus focused Accessibility role/subrole:
 
 - Ghostty, Terminal, iTerm2, Warp, and confidently identified VS Code integrated terminals: forced Literal; commands and inferred bullets off; line breaks collapsed before automatic insertion.
-- Slack: casual Clean; explicit bullets only.
-- Linear native: structured Clean; conservative inference; ticket IDs protected.
-- Apple Notes and native Notion: light cleanup with longer paragraphs.
-- Browsers: generic paragraph-preserving Clean.
+- Slack, Apple Notes, native Notion, browsers, and the default profile: Clean prose with explicit formatting only.
+- Linear native: Clean structured paragraphs with protected ticket IDs and explicit formatting only. Automatic enumeration/bullet inference is deferred.
 - Everything else: default Clean.
 
-Hostname profiles are post-cutover v1 work. They are opt-in because Chrome/Chromium and Safari require per-browser Apple Events Automation permission. Denial falls back to the generic browser profile without repeated prompts. URLs are reduced immediately to hostname; paths never leave the adapter. Initial hostname matches are `chatgpt.com`, `claude.ai`, `mail.google.com`, `notion.so`, and `linear.app`.
+Browser hostname profiles and Apple Events execution are removed from v1. Generic browser matching uses bundle IDs only. Legacy hostname keys remain decodable solely so old configuration can be ignored with a visible diagnostic; no URL is requested or resolved.
 
 ## Insertion, history, and retention
 
@@ -173,9 +174,9 @@ Hostname profiles are post-cutover v1 work. They are opt-in because Chrome/Chrom
 - Paste failure leaves the result on the clipboard when clipboard ownership is still verified and in history otherwise.
 - Direct `AXSelectedText` insertion is post-cutover and enabled per app only after rich-text, selection, and undo tests pass.
 - Raw text is saved immediately after ASR and before cleanup or insertion.
-- GRDB/SQLite with FTS5 stores timestamp, raw text, polished/delivered text, destination app, mode, delivery/refinement state and latency, and unrecognized command candidates.
+- Actor-isolated GRDB/SQLite uses WAL plus FTS5 and stores timestamp, raw text, polished/delivered text, destination app, mode, ASR/refiner outcomes, validation-failure kind, delivery/refinement state and latency, and unrecognized command candidates.
 - History never stores browser hostname or page information.
-- Successful history retention defaults to 90 days and supports search, copy, serialized Paste Again, raw-versus-polished inspection, failed-polish retry, delete entry, and delete all.
+- All successful, failed, pending, and cancelled history defaults to 90-day retention, pruned at launch and daily. History supports FTS plus escaped literal fallback, copy, serialized Paste Again, raw-versus-polished inspection, explicit vocabulary correction, delete entry, and delete all.
 - Temporary audio is deleted after ASR or cancellation, and crash orphans are cleaned on launch. Debug audio retention is explicit and capped at the latest 10 recordings.
 
 ## Distribution and non-goals

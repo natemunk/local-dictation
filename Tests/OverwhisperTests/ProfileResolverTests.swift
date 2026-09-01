@@ -7,7 +7,7 @@ struct ProfileResolverTests {
     func nativeAppDefaults() {
         let resolver = ProfileResolver(catalog: .nativeDefaults)
         let cases = [
-            ("com.mitchellh.ghostty", "ghostty"),
+            ("com.mitchellh.ghostty", "terminal"),
             ("com.tinyspeck.slackmacgap", "slack"),
             ("com.linear", "linear"),
             ("com.apple.Notes", "notes"),
@@ -95,84 +95,20 @@ struct ProfileResolverTests {
         #expect(safe.vocabularyPackIDs == ["personal"])
     }
 
-    @Test("approved hostname can refine a browser without retaining its path")
-    func hostnameFallback() throws {
-        let resolver = ProfileResolver(
-            catalog: .nativeDefaults,
-            browserProfilesEnabled: true
-        )
-        let hostname = try #require(
-            BrowserHostname("https://linear.app/acme/issue/MYE-2076?view=full")
-        )
-        #expect(hostname.value == "linear.app")
-        #expect(!hostname.value.contains("/"))
+    @Test("generic browsers resolve only by bundle identifier")
+    func genericBrowserBundleFallback() {
+        let resolver = ProfileResolver(catalog: .nativeDefaults)
 
-        let linear = resolver.resolve(
-            ProfileResolutionContext(
-                bundleIdentifier: "com.google.Chrome",
-                browserHostname: hostname
-            )
+        let chrome = resolver.resolve(
+            ProfileResolutionContext(bundleIdentifier: "com.google.Chrome")
         )
-        #expect(linear.profile.id == "linear")
-        #expect(linear.source == .hostname)
+        #expect(chrome.profile.id == "browser")
+        #expect(chrome.source == .genericBrowser)
 
-        let unknown = resolver.resolve(
-            ProfileResolutionContext(
-                bundleIdentifier: "com.google.Chrome",
-                browserHostname: BrowserHostname("https://example.com/private/path")
-            )
+        let lookalike = resolver.resolve(
+            ProfileResolutionContext(bundleIdentifier: "com.google.Chrome.helper")
         )
-        #expect(unknown.profile.id == "browser")
-        #expect(unknown.source == .genericBrowser)
-
-        let nativeAppWins = resolver.resolve(
-            ProfileResolutionContext(
-                bundleIdentifier: "com.mitchellh.ghostty",
-                browserHostname: hostname
-            )
-        )
-        #expect(nativeAppWins.profile.id == "ghostty")
-
-        let disabled = ProfileResolver(catalog: .nativeDefaults).resolve(
-            ProfileResolutionContext(
-                bundleIdentifier: "com.google.Chrome",
-                browserHostname: hostname
-            )
-        )
-        #expect(disabled.profile.id == "browser")
-    }
-
-    @Test("hostname acquisition remains behind a pure protocol")
-    func hostnameProviderBoundary() async throws {
-        let resolver = ProfileResolver(
-            catalog: .nativeDefaults,
-            browserProfilesEnabled: true
-        )
-        let result = try await resolver.resolve(
-            ProfileResolutionContext(bundleIdentifier: "com.apple.Safari"),
-            using: StubHostnameProvider(hostname: BrowserHostname("docs.notion.so/private/page"))
-        )
-
-        #expect(result.profile.id == "notion")
-        #expect(result.source == .hostname)
-        #expect(
-            resolver.approvedHostnameDomains == [
-                "app.slack.com",
-                "chatgpt.com",
-                "claude.ai",
-                "linear.app",
-                "mail.google.com",
-                "notion.so",
-            ]
-        )
-    }
-}
-
-private struct StubHostnameProvider: BrowserHostnameProviding {
-    let hostname: BrowserHostname?
-
-    func hostname(for request: BrowserHostnameRequest) async throws -> BrowserHostname? {
-        #expect(request.approvedDomains.allSatisfy { !$0.contains("/") })
-        return hostname
+        #expect(lookalike.profile.id == "default")
+        #expect(lookalike.source == .defaultProfile)
     }
 }
