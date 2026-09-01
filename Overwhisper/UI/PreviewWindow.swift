@@ -4,14 +4,15 @@ import SwiftUI
 @MainActor
 final class PreviewWindowController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
-    private let onDeliver: (String) -> Void
-    private let onCopy: (String) -> Void
-    private let onCancel: () -> Void
+    private var token: DictationSessionToken?
+    private let onDeliver: (DictationSessionToken, String) -> Void
+    private let onCopy: (DictationSessionToken, String) -> Void
+    private let onCancel: (DictationSessionToken) -> Void
 
     init(
-        onDeliver: @escaping (String) -> Void,
-        onCopy: @escaping (String) -> Void,
-        onCancel: @escaping () -> Void
+        onDeliver: @escaping (DictationSessionToken, String) -> Void,
+        onCopy: @escaping (DictationSessionToken, String) -> Void,
+        onCancel: @escaping (DictationSessionToken) -> Void
     ) {
         self.onDeliver = onDeliver
         self.onCopy = onCopy
@@ -19,15 +20,21 @@ final class PreviewWindowController: NSObject, NSWindowDelegate {
         super.init()
     }
 
-    func show(text: String, rawText: String, isRemoteRefiner: Bool) {
+    func show(
+        text: String,
+        rawText: String,
+        isRemoteRefiner: Bool,
+        token: DictationSessionToken
+    ) {
         close()
+        self.token = token
         let view = PreviewEditorView(
             initialText: text,
             rawText: rawText,
             isRemoteRefiner: isRemoteRefiner,
-            onDeliver: { [weak self] value in self?.onDeliver(value) },
-            onCopy: { [weak self] value in self?.onCopy(value) },
-            onCancel: { [weak self] in self?.onCancel() }
+            onDeliver: { [weak self] value in self?.onDeliver(token, value) },
+            onCopy: { [weak self] value in self?.onCopy(token, value) },
+            onCancel: { [weak self] in self?.onCancel(token) }
         )
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 620, height: 420),
@@ -50,15 +57,23 @@ final class PreviewWindowController: NSObject, NSWindowDelegate {
         window?.delegate = nil
         window?.orderOut(nil)
         window = nil
+        token = nil
+    }
+
+    func close(token: DictationSessionToken) {
+        guard self.token == token else { return }
+        close()
     }
 
     func windowWillClose(_ notification: Notification) {
         guard let closingWindow = notification.object as? NSWindow,
               closingWindow === window
         else { return }
+        let closingToken = token
         closingWindow.delegate = nil
         window = nil
-        onCancel()
+        token = nil
+        if let closingToken { onCancel(closingToken) }
     }
 }
 

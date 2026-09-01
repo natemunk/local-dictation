@@ -8,6 +8,33 @@ enum AppEnvironment {
     static let isDevBuild = Bundle.main.bundleIdentifier == nil
 }
 
+private struct ActiveDictationSession {
+    let token: DictationSessionToken
+    let startedAt: Date
+    let engine: (any TranscriptionEngine)?
+    let streamingTranscriber: (any StreamingTranscriber)?
+    var state: DictationPhase = .recording
+    var destination: DictationDestination?
+    var profile: DictationProfile
+    var rawText = ""
+    var deliveredText = ""
+    var historyID: UUID?
+    var refinementStatus: HistoryRefinementStatus = .notRequested
+    var pastedRaw = false
+    var cleanupMode: CleanupMode = .clean
+    var deliveryCommitted = false
+    var interleavedTyping = false
+    var cancellationRequested = false
+    var warnedAtTenMinutes = false
+    var durationCapTriggered = false
+    var audioURL: URL?
+    var finalizationTask: Task<Void, Never>?
+    var streamingStartTask: Task<AsyncStream<TranscriptUpdate>?, Never>?
+    var streamingUpdatesTask: Task<Void, Never>?
+    var captureWatchdog: Task<Void, Never>?
+    var finalizationWatchdog: Task<Void, Never>?
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let appState = AppState()
@@ -17,7 +44,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let browserHostnameProvider = BrowserAutomationHostnameProvider()
     private var configuration = ConfigurationSnapshot.typedDefaults
     private var profileResolver = ProfileResolver(catalog: .nativeDefaults)
-    private var activeProfile = ProfileCatalog.nativeDefaults["default"]!
     private var historyStore: HistoryStore?
     private var statusItem: NSStatusItem!
     private var hotkeyManager: HotkeyManager!
@@ -29,8 +55,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var modelManager: ModelManager!
     private var transcriptionEngine: (any TranscriptionEngine)?
     private var streamingTranscriber: (any StreamingTranscriber)?
-    private var streamingStartTask: Task<AsyncStream<TranscriptUpdate>?, Never>?
-    private var streamingUpdatesTask: Task<Void, Never>?
 
     private var settingsWindow: NSWindow?
     private var onboardingWindow: NSWindow?
@@ -43,20 +67,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var cancellables = Set<AnyCancellable>()
     private var engineTask: Task<Void, Never>?
-    private var sessionTask: Task<Void, Never>?
-    private var currentDestination: DictationDestination?
+    private var engineReloadPending = false
     private var historyRepasteDestination: DictationDestination?
-    private var currentRawText = ""
-    private var currentDeliveredText = ""
-    private var currentHistoryID: UUID?
-    private var currentRefinementStatus: HistoryRefinementStatus = .notRequested
-    private var currentPastedRaw = false
-    private var currentCleanupMode: CleanupMode = .clean
-    private var deliveryCommitted = false
-    private var activeSessionID: UUID?
-    private var sessionStartedAt: Date?
-    private var warnedAtTenMinutes = false
-    private var durationCapTriggered = false
+    private var activeSession: ActiveDictationSession?
 
     private static let onboardingKey = "LocalDictation.hasCompletedOnboarding.v1"
     private static let configurationDirectory = FileManager.default.homeDirectoryForCurrentUser
@@ -83,12 +96,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        sessionTask?.cancel()
         engineTask?.cancel()
-        streamingStartTask?.cancel()
-        streamingUpdatesTask?.cancel()
-        if let streamingTranscriber {
-            Task { await streamingTranscriber.cancel() }
+        if let session = activeSession {
+            session.finalizationTask?.cancel()
+            session.streamingStartTask?.cancel()
+            session.streamingUpdatesTask?.cancel()
+            session.captureWatchdog?.cancel()
+            session.finalizationWatchdog?.cancel()
+            if let streamingTranscriber = session.streamingTranscriber {
+                Task { await streamingTranscriber.cancel() }
+            }
         }
         hotkeyManager?.stop()
         if audioRecorder?.isRecording == true { audioRecorder.cancelRecording() }
@@ -136,13 +153,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
         }
         previewWindow = PreviewWindowController(
-            onDeliver: { [weak self] text in self?.deliverPreview(text) },
-            onCopy: { [weak self] text in self?.copyPreview(text) },
-            onCancel: { [weak self] in self?.cancelFromUI() }
+            onDeliver: { [weak self] token, text in self?.deliverPreview(token: token, text: text) },
+            onCopy: { [weak self] token, text in self?.copyPreview(token: token, text: text) },
+            onCancel: { [weak self] token in self?.cancelPreview(token: token) }
         )
         hotkeyManager = HotkeyManager(
             coordinator: coordinator,
-            profileMode: { [weak self] in self?.currentProfileMode() ?? .clean },
+            // The global tap must not perform Accessibility work. The exact
+            // destination profile is resolved after finish, outside the tap;
+            // Option+Enter still carries an explicit Literal override.
+            profileMode: { .clean },
             effectHandler: { [weak self] effects in self?.execute(effects) }
         )
 
@@ -275,10 +295,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func systemDidWake() {
         audioRecorder.resetAudioEngine()
-        hotkeyManager.stop()
         guard appState.hasCompletedOnboarding else { return }
         requestHotkeyMonitoringIfPossible(prompt: false)
-        initializeEngine()
+        if !appState.engineReady || transcriptionEngine == nil {
+            initializeEngine()
+        }
     }
 
     private func setupMenu() {
@@ -357,59 +378,135 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func execute(_ effects: [DictationCoordinatorEffect]) {
         for effect in effects {
             switch effect {
-            case .startCapture(let sessionID):
-                startCapture(sessionID: sessionID)
+            case .startCapture(let token):
+                beginCapture(token: token)
+                Task { @MainActor [weak self] in
+                    await Task.yield()
+                    self?.startAudioCapture(token: token)
+                }
             case .finish(let request):
-                finishCapture(request)
-            case .cancel:
-                cancelActiveSession()
-            case .interleavedTypingChanged(let detected):
-                if detected { appState.setInterleavedTyping() }
+                beginFinalization(request)
+                Task { @MainActor [weak self] in
+                    await Task.yield()
+                    self?.finishCapture(request)
+                }
+            case .cancel(let token):
+                guard matchesActiveSession(token) else { continue }
+                updateSession(token) {
+                    $0.cancellationRequested = true
+                    $0.finalizationTask?.cancel()
+                    $0.streamingStartTask?.cancel()
+                    $0.streamingUpdatesTask?.cancel()
+                }
+                Task { @MainActor [weak self] in
+                    await Task.yield()
+                    self?.cancelActiveSession(token: token)
+                }
+            case .interleavedTypingChanged(let token, let detected):
+                guard isCurrent(token) else { continue }
+                updateSession(token) { $0.interleavedTyping = detected }
+                if detected {
+                    if appState.phase == .recording {
+                        appState.setInterleavedTyping()
+                    } else {
+                        appState.interleavedTyping = true
+                    }
+                }
             }
         }
     }
 
-    private func startCapture(sessionID: UUID) {
-        guard sessionTask == nil, !audioRecorder.isRecording else { return }
-        activeSessionID = sessionID
-        warnedAtTenMinutes = false
-        durationCapTriggered = false
-        currentDestination = nil
-        currentRawText = ""
-        currentDeliveredText = ""
-        currentHistoryID = nil
-        currentRefinementStatus = .notRequested
-        currentPastedRaw = false
-        currentCleanupMode = .clean
-        deliveryCommitted = false
-        sessionStartedAt = Date()
+    private func isCurrent(_ token: DictationSessionToken) -> Bool {
+        guard let session = activeSession else { return false }
+        return session.token == token && !session.cancellationRequested
+    }
+
+    private func matchesActiveSession(_ token: DictationSessionToken) -> Bool {
+        activeSession?.token == token
+    }
+
+    @discardableResult
+    private func updateSession(
+        _ token: DictationSessionToken,
+        _ update: (inout ActiveDictationSession) -> Void
+    ) -> Bool {
+        guard var session = activeSession, session.token == token else { return false }
+        update(&session)
+        activeSession = session
+        return true
+    }
+
+    private func beginCapture(token: DictationSessionToken) {
+        guard coordinator.owns(token) else { return }
+
+        if let prior = activeSession, prior.token != token {
+            retireRuntime(prior)
+        }
+
+        let placeholderProfile = ProfileCatalog.nativeDefaults["default"]!
+        activeSession = ActiveDictationSession(
+            token: token,
+            startedAt: Date(),
+            engine: transcriptionEngine,
+            streamingTranscriber: streamingTranscriber,
+            profile: placeholderProfile
+        )
 
         // These happen before permission checks or model work so the key-down
         // feedback path stays under the 100 ms product gate.
         appState.beginRecording()
-        overlayWindow.show(position: appState.overlayPosition)
+        overlayWindow.show(position: appState.overlayPosition, token: token)
 
-        guard transcriptionEngine != nil else {
-            failSession("The local speech model is still preparing. Try Hyper+D again when setup finishes.")
+        let watchdog = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled,
+                  let self,
+                  self.isCurrent(token),
+                  !self.audioRecorder.isRecording
+            else { return }
+            self.failSession(token: token, "The microphone did not start within two seconds.")
+        }
+        updateSession(token) { $0.captureWatchdog = watchdog }
+    }
+
+    private func startAudioCapture(token: DictationSessionToken) {
+        guard isCurrent(token), coordinator.owns(token) else { return }
+        guard !audioRecorder.isRecording else {
+            failSession(token: token, "The microphone is already owned by another recording.")
+            return
+        }
+
+        guard activeSession?.engine != nil else {
+            failSession(token: token, "The local speech model is still preparing. Try Hyper+D again when setup finishes.")
             return
         }
 
         do {
             let samples = try audioRecorder.startRecording()
-            if streamingTranscriber == nil {
+            updateSession(token) {
+                $0.captureWatchdog?.cancel()
+                $0.captureWatchdog = nil
+            }
+            if activeSession?.streamingTranscriber == nil {
                 appState.overlayMessage = "Listening · live text unavailable"
             } else {
-                startStreamingUpdates(samples: samples)
+                startStreamingUpdates(samples: samples, token: token)
             }
         } catch {
-            failSession("Could not start the microphone: \(error.localizedDescription)")
+            failSession(token: token, "Could not start the microphone: \(error.localizedDescription)")
         }
     }
 
-    private func startStreamingUpdates(samples: AsyncStream<AudioChunk>) {
-        guard let streamingTranscriber else { return }
-        streamingStartTask?.cancel()
-        streamingUpdatesTask?.cancel()
+    private func startStreamingUpdates(
+        samples: AsyncStream<AudioChunk>,
+        token: DictationSessionToken
+    ) {
+        guard let session = activeSession,
+              session.token == token,
+              let streamingTranscriber = session.streamingTranscriber
+        else { return }
+        session.streamingStartTask?.cancel()
+        session.streamingUpdatesTask?.cancel()
 
         let startTask = Task<AsyncStream<TranscriptUpdate>?, Never> {
             do {
@@ -418,49 +515,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 AppLogger.transcription.error(
                     "Live transcription could not start: \(error.localizedDescription)"
                 )
-                await MainActor.run {
-                    if self.appState.phase == .recording, !self.appState.interleavedTyping {
-                        self.appState.overlayMessage = "Listening · live text unavailable"
-                    }
+                if self.isCurrent(token),
+                   self.appState.phase == .recording,
+                   !self.appState.interleavedTyping {
+                    self.appState.overlayMessage = "Listening · live text unavailable"
                 }
                 return nil
             }
         }
-        streamingStartTask = startTask
-        streamingUpdatesTask = Task { [weak self] in
+        updateSession(token) { $0.streamingStartTask = startTask }
+        let updatesTask = Task { @MainActor [weak self] in
             guard let updates = await startTask.value else { return }
             for await update in updates {
-                guard !Task.isCancelled else { return }
-                self?.appState.liveTranscript = LiveTranscript(
+                guard !Task.isCancelled,
+                      let self,
+                      self.isCurrent(token)
+                else { return }
+                self.appState.liveTranscript = LiveTranscript(
                     finalized: update.finalized,
                     volatile: update.volatile
                 )
             }
             guard !Task.isCancelled,
-                  self?.appState.phase == .recording,
-                  self?.appState.interleavedTyping == false
+                  let self,
+                  self.isCurrent(token),
+                  self.appState.phase == .recording,
+                  !self.appState.interleavedTyping
             else { return }
-            self?.appState.overlayMessage = "Listening · live text unavailable"
+            self.appState.overlayMessage = "Listening · live text unavailable"
         }
+        updateSession(token) { $0.streamingUpdatesTask = updatesTask }
     }
 
-    private func finishStreamingTranscript() async -> FinalTranscript? {
-        guard let streamingTranscriber,
-              let streamingStartTask,
-              await streamingStartTask.value != nil
+    private func finishStreamingTranscript(token: DictationSessionToken) async -> FinalTranscript? {
+        guard let session = activeSession,
+              session.token == token,
+              let streamingTranscriber = session.streamingTranscriber,
+              let streamingStartTask = session.streamingStartTask,
+              await streamingStartTask.value != nil,
+              isCurrent(token)
         else {
-            self.streamingStartTask = nil
-            streamingUpdatesTask?.cancel()
-            streamingUpdatesTask = nil
+            updateSession(token) {
+                $0.streamingStartTask = nil
+                $0.streamingUpdatesTask?.cancel()
+                $0.streamingUpdatesTask = nil
+            }
             return nil
         }
 
         defer {
-            self.streamingStartTask = nil
-            streamingUpdatesTask = nil
+            updateSession(token) {
+                $0.streamingStartTask = nil
+                $0.streamingUpdatesTask = nil
+            }
         }
         do {
             let final = try await streamingTranscriber.finish()
+            guard isCurrent(token) else { return nil }
             appState.liveTranscript = LiveTranscript(finalized: final.text, volatile: "")
             return final
         } catch {
@@ -471,66 +582,102 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func cancelStreamingSession() {
-        streamingStartTask?.cancel()
-        streamingUpdatesTask?.cancel()
-        streamingStartTask = nil
-        streamingUpdatesTask = nil
-        guard let streamingTranscriber else { return }
+    private func cancelStreamingSession(token: DictationSessionToken) {
+        guard let session = activeSession, session.token == token else { return }
+        session.streamingStartTask?.cancel()
+        session.streamingUpdatesTask?.cancel()
+        updateSession(token) {
+            $0.streamingStartTask = nil
+            $0.streamingUpdatesTask = nil
+        }
+        guard let streamingTranscriber = session.streamingTranscriber else { return }
         Task { await streamingTranscriber.cancel() }
     }
 
-    private func finishCapture(_ request: DictationFinishRequest) {
-        guard request.sessionID == activeSessionID, audioRecorder.isRecording else { return }
+    private func beginFinalization(_ request: DictationFinishRequest) {
+        guard isCurrent(request.token) else { return }
+        updateSession(request.token) { $0.state = .finalizing }
         appState.endRecordingClock()
         appState.phase = .finalizing
         appState.overlayMessage = "Finalizing"
-        currentDestination = DictationDestination.captureFrontmost()
-        activeProfile = resolveProfile(for: currentDestination).profile
-        appState.activeProfileName = profileDisplayName(activeProfile)
+    }
+
+    private func finishCapture(_ request: DictationFinishRequest) {
+        guard isCurrent(request.token) else { return }
+        guard audioRecorder.isRecording else {
+            failSession(token: request.token, "The microphone stopped before finalization could begin.")
+            return
+        }
+
+        let destination = DictationDestination.captureFrontmost()
+        let initialProfile = resolveProfile(for: destination).profile
+        updateSession(request.token) {
+            $0.destination = destination
+            $0.profile = initialProfile
+        }
+        appState.activeProfileName = profileDisplayName(initialProfile)
 
         let audioURL: URL
         do {
             audioURL = try audioRecorder.stopRecording()
+            updateSession(request.token) { $0.audioURL = audioURL }
         } catch {
-            failSession("Could not finish the recording: \(error.localizedDescription)")
+            failSession(token: request.token, "Could not finish the recording: \(error.localizedDescription)")
             return
         }
 
-        sessionTask = Task { [weak self] in
+        let watchdog = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(120))
+            guard !Task.isCancelled, let self, self.isCurrent(request.token) else { return }
+            self.activeSession?.finalizationTask?.cancel()
+            self.failSession(token: request.token, "Transcription exceeded its two-minute safety deadline. The recording was not pasted.")
+        }
+        updateSession(request.token) { $0.finalizationWatchdog = watchdog }
+
+        let finalizationTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer {
                 if FileManager.default.fileExists(atPath: audioURL.path) {
                     try? FileManager.default.removeItem(at: audioURL)
                 }
-                self.sessionTask = nil
+                if self.isCurrent(request.token) {
+                    self.updateSession(request.token) {
+                        $0.audioURL = nil
+                        $0.finalizationTask = nil
+                        $0.finalizationWatchdog?.cancel()
+                        $0.finalizationWatchdog = nil
+                    }
+                }
             }
 
             let started = ContinuousClock.now
             let streamingFinalTask = Task { [weak self] in
-                await self?.finishStreamingTranscript()
+                await self?.finishStreamingTranscript(token: request.token)
             }
             do {
                 let resolvedProfile = await self.resolveProfileIncludingHostname(
-                    for: self.currentDestination
+                    for: destination
                 )
                 try Task.checkCancellation()
-                self.activeProfile = resolvedProfile.profile
+                guard self.isCurrent(request.token) else { return }
+                self.updateSession(request.token) { $0.profile = resolvedProfile.profile }
                 self.appState.activeProfileName = self.profileDisplayName(resolvedProfile.profile)
-                self.appState.customVocabulary = self.asrVocabularyBias()
+                self.appState.customVocabulary = self.asrVocabularyBias(for: resolvedProfile.profile)
 
-                guard let engine = self.transcriptionEngine else {
+                guard let engine = self.activeSession?.engine else {
                     throw LocalDictationError.engineUnavailable
                 }
                 let raw = try await engine.transcribe(audioURL: audioURL)
                 _ = await streamingFinalTask.value
                 try Task.checkCancellation()
+                guard self.isCurrent(request.token) else { return }
                 let asrLatency = started.duration(to: .now).seconds
                 self.retainDebugRecordingIfEnabled(
                     at: audioURL,
                     transcript: raw.text,
                     latency: asrLatency,
-                    error: nil
+                    error: nil,
+                    token: request.token
                 )
                 await self.handleRawTranscript(
                     raw,
@@ -541,7 +688,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 streamingFinalTask.cancel()
                 return
             } catch {
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, self.isCurrent(request.token) else { return }
                 let streamingFinal = await streamingFinalTask.value
                 if let streamingFinal,
                    !streamingFinal.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -551,7 +698,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         at: audioURL,
                         transcript: streamingFinal.text,
                         latency: latency,
-                        error: "Batch ASR failed; delivered the local streaming transcript"
+                        error: "Batch ASR failed; delivered the local streaming transcript",
+                        token: request.token
                     )
                     await self.handleRawTranscript(
                         streamingFinal,
@@ -564,11 +712,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     at: audioURL,
                     transcript: "",
                     latency: started.duration(to: .now).seconds,
-                    error: error.localizedDescription
+                    error: error.localizedDescription,
+                    token: request.token
                 )
-                self.failSession("Transcription failed: \(error.localizedDescription)")
+                self.failSession(token: request.token, "Transcription failed: \(error.localizedDescription)")
             }
         }
+        updateSession(request.token) { $0.finalizationTask = finalizationTask }
     }
 
     private func handleRawTranscript(
@@ -576,37 +726,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         request: DictationFinishRequest,
         asrLatency: Double
     ) async {
-        guard !Task.isCancelled else { return }
-        currentRawText = raw.text
-        guard !currentRawText.isEmpty else {
-            failSession("No speech was detected. Nothing was pasted.")
+        let token = request.token
+        guard !Task.isCancelled, isCurrent(token) else { return }
+        updateSession(token) { $0.rawText = raw.text }
+        guard !raw.text.isEmpty else {
+            failSession(token: token, "No speech was detected. Nothing was pasted.")
             return
         }
 
-        appState.lastTranscription = currentRawText
+        appState.lastTranscription = raw.text
         lastTextMenuItem?.isEnabled = true
 
+        guard let profile = activeSession?.profile else { return }
         let cleanupMode: CleanupMode = request.mode == .literal
-            || activeProfile.mode == .literal
-            || !activeProfile.cleanupEnabled
+            || profile.mode == .literal
+            || !profile.cleanupEnabled
             ? .literal
             : .clean
-        currentCleanupMode = cleanupMode
+        updateSession(token) { $0.cleanupMode = cleanupMode }
         let commandAnalysis = cleanupMode == .clean
-            ? CleanupCommandProcessor().analyze(currentRawText)
+            ? CleanupCommandProcessor().analyze(raw.text)
             : CleanupCommandResult(
-                text: currentRawText,
+                text: raw.text,
                 recognizedCommands: [],
                 unrecognizedCommandCandidates: []
             )
         guard saveRawHistory(
+            token: token,
             mode: cleanupMode,
             asrLatency: asrLatency,
             unrecognizedCommands: commandAnalysis.unrecognizedCommandCandidates.map(\.phrase)
         ) else {
-            currentDeliveredText = currentRawText
-            textInserter.copyOnly(currentRawText)
+            updateSession(token) { $0.deliveredText = raw.text }
+            textInserter.copyOnly(raw.text)
             failSession(
+                token: token,
                 "Raw history could not be saved. The transcript was copied to the clipboard; nothing was pasted."
             )
             return
@@ -614,191 +768,276 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let refinementStarted = Date()
         if cleanupMode == .clean {
+            guard coordinator.transition(token: token, to: .polishing) else { return }
+            updateSession(token) { $0.state = .polishing }
             appState.phase = .polishing
-            coordinator.transition(to: .polishing)
             appState.overlayMessage = "Polishing"
         }
 
         do {
-            let result = try await makeCleanupPipeline().process(
+            let result = try await makeCleanupPipeline(for: profile).process(
                 raw,
                 mode: cleanupMode
             )
             try Task.checkCancellation()
-            currentDeliveredText = result.text
-            switch result.outcome {
-            case .skippedLiteralMode:
-                currentRefinementStatus = .notRequested
-                currentPastedRaw = false
-            case .accepted:
-                currentRefinementStatus = .succeeded
-                currentPastedRaw = false
-            case .deterministicFallback:
-                currentRefinementStatus = .failed
-                currentPastedRaw = true
+            guard isCurrent(token) else { return }
+            updateSession(token) { session in
+                session.deliveredText = result.text
+                switch result.outcome {
+                case .skippedLiteralMode:
+                    session.refinementStatus = .notRequested
+                    session.pastedRaw = false
+                case .accepted:
+                    session.refinementStatus = .succeeded
+                    session.pastedRaw = false
+                case .deterministicFallback:
+                    session.refinementStatus = .failed
+                    session.pastedRaw = true
+                }
             }
             finalizeHistoryBeforeDelivery(
+                token: token,
                 refinementLatency: Date().timeIntervalSince(refinementStarted)
             )
         } catch is CancellationError {
             return
         } catch {
-            currentDeliveredText = currentRawText
-            currentRefinementStatus = cleanupMode == .literal ? .notRequested : .failed
-            currentPastedRaw = cleanupMode == .clean
+            guard isCurrent(token) else { return }
+            updateSession(token) {
+                $0.deliveredText = $0.rawText
+                $0.refinementStatus = cleanupMode == .literal ? .notRequested : .failed
+                $0.pastedRaw = cleanupMode == .clean
+            }
             if cleanupMode == .clean {
-                markHistoryPolishFailed(error.localizedDescription)
+                markHistoryPolishFailed(token: token, error.localizedDescription)
             } else {
                 finalizeHistoryBeforeDelivery(
+                    token: token,
                     refinementLatency: Date().timeIntervalSince(refinementStarted)
                 )
             }
         }
 
         AppLogger.transcription.info("Local ASR complete in \(String(format: "%.3f", asrLatency)) seconds")
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, isCurrent(token), let session = activeSession else { return }
         if request.delivery == .preview {
-            showPreview()
+            showPreview(token: token)
         } else {
             await pasteCurrentText(
-                showRawLabel: currentPastedRaw || cleanupMode == .literal,
-                failedPolish: currentPastedRaw
+                token: token,
+                showRawLabel: session.pastedRaw || cleanupMode == .literal,
+                failedPolish: session.pastedRaw
             )
         }
     }
 
-    private func showPreview() {
-        coordinator.transition(to: .previewing)
+    private func showPreview(token: DictationSessionToken) {
+        guard let session = activeSession,
+              session.token == token,
+              coordinator.transition(token: token, to: .previewing)
+        else { return }
+        updateSession(token) { $0.state = .previewing }
         appState.phase = .previewing
         appState.overlayMessage = "Preview"
-        overlayWindow.hide()
+        overlayWindow.hide(token: token)
         previewWindow.show(
-            text: currentDeliveredText,
-            rawText: currentRawText,
-            isRemoteRefiner: appState.isRemoteRefiner
+            text: session.deliveredText,
+            rawText: session.rawText,
+            isRemoteRefiner: appState.isRemoteRefiner,
+            token: token
         )
     }
 
-    private func pasteCurrentText(showRawLabel: Bool, failedPolish: Bool) async {
-        guard !Task.isCancelled else { return }
-        coordinator.transition(to: .pasting)
+    private func pasteCurrentText(
+        token: DictationSessionToken,
+        showRawLabel: Bool,
+        failedPolish: Bool
+    ) async {
+        guard !Task.isCancelled,
+              let session = activeSession,
+              session.token == token,
+              coordinator.transition(token: token, to: .pasting)
+        else { return }
+        updateSession(token) { $0.state = .pasting }
         appState.phase = .pasting
         appState.overlayMessage = "Pasting"
-        overlayWindow.show(position: appState.overlayPosition)
-        let outcome = await textInserter.insertText(currentDeliveredText, destination: currentDestination)
+        overlayWindow.show(position: appState.overlayPosition, token: token)
+        let outcome = await textInserter.insertText(
+            session.deliveredText,
+            destination: session.destination
+        )
+        guard isCurrent(token), let current = activeSession else { return }
 
         switch outcome {
         case .pasted:
             appState.overlayMessage = showRawLabel ? "Pasted raw" : "Pasted"
             updateHistoryDelivery(
+                token: token,
                 status: failedPolish ? .pastedRaw : .delivered,
-                deliveredText: currentDeliveredText
+                deliveredText: current.deliveredText
             )
-            deliveryCommitted = true
+            updateSession(token) { $0.deliveryCommitted = true }
         case .clipboardOnly(let reason):
             appState.overlayMessage = "Copied to clipboard"
             appState.lastError = reason
             updateHistoryDelivery(
+                token: token,
                 status: .failed,
-                deliveredText: currentDeliveredText,
+                deliveredText: current.deliveredText,
                 error: reason
             )
-            deliveryCommitted = true
+            updateSession(token) { $0.deliveryCommitted = true }
         case .cancelled:
             return
         }
-        appState.lastTranscription = currentDeliveredText
-        try? await Task.sleep(for: .milliseconds(650))
-        completeSession()
+        appState.lastTranscription = current.deliveredText
+        completeSession(token: token, toastDuration: .milliseconds(250))
     }
 
-    private func deliverPreview(_ text: String) {
-        currentDeliveredText = text
-        previewWindow.close()
-        sessionTask = Task { [weak self] in
+    private func deliverPreview(token: DictationSessionToken, text: String) {
+        guard isCurrent(token) else { return }
+        updateSession(token) { $0.deliveredText = text }
+        previewWindow.close(token: token)
+        let task = Task { @MainActor [weak self] in
             guard let self else { return }
-            defer { self.sessionTask = nil }
+            guard let session = self.activeSession, session.token == token else { return }
             await self.pasteCurrentText(
-                showRawLabel: self.currentPastedRaw || self.currentCleanupMode == .literal,
-                failedPolish: self.currentPastedRaw
+                token: token,
+                showRawLabel: session.pastedRaw || session.cleanupMode == .literal,
+                failedPolish: session.pastedRaw
             )
         }
+        updateSession(token) { $0.finalizationTask = task }
     }
 
-    private func copyPreview(_ text: String) {
-        currentDeliveredText = text
+    private func copyPreview(token: DictationSessionToken, text: String) {
+        guard isCurrent(token) else { return }
+        updateSession(token) {
+            $0.deliveredText = text
+            $0.deliveryCommitted = true
+        }
         textInserter.copyOnly(text)
-        updateHistoryDelivery(status: .previewed, deliveredText: text)
-        deliveryCommitted = true
-        previewWindow.close()
-        completeSession()
+        updateHistoryDelivery(token: token, status: .previewed, deliveredText: text)
+        previewWindow.close(token: token)
+        completeSession(token: token)
+    }
+
+    private func cancelPreview(token: DictationSessionToken) {
+        guard isCurrent(token) else { return }
+        execute(coordinator.escapePressed().effects)
     }
 
     private func cancelFromUI() {
         execute(coordinator.escapePressed().effects)
     }
 
-    private func cancelActiveSession() {
+    private func cancelActiveSession(token: DictationSessionToken) {
+        guard let session = activeSession, session.token == token else { return }
         let pasteMayHaveBeenCommitted = appState.phase == .pasting
-        sessionTask?.cancel()
-        sessionTask = nil
-        cancelStreamingSession()
+        session.finalizationTask?.cancel()
+        cancelStreamingSession(token: token)
         if audioRecorder.isRecording { audioRecorder.cancelRecording() }
-        if !deliveryCommitted,
+        if !session.deliveryCommitted,
            !pasteMayHaveBeenCommitted,
            let historyStore,
-           let currentHistoryID
+           let historyID = session.historyID
         {
-            _ = try? historyStore.delete(id: currentHistoryID)
+            _ = try? historyStore.delete(id: historyID)
         }
-        previewWindow.close()
-        completeSession()
+        previewWindow.close(token: token)
+        completeSession(token: token)
     }
 
-    private func failSession(_ message: String) {
-        cancelStreamingSession()
+    private func failSession(token: DictationSessionToken, _ message: String) {
+        guard let session = activeSession,
+              session.token == token,
+              !session.cancellationRequested
+        else { return }
+        updateSession(token) {
+            $0.captureWatchdog?.cancel()
+            $0.captureWatchdog = nil
+            $0.finalizationWatchdog?.cancel()
+            $0.finalizationWatchdog = nil
+        }
+        cancelStreamingSession(token: token)
         if audioRecorder?.isRecording == true { audioRecorder.cancelRecording() }
-        coordinator.transition(to: .failed)
+        _ = coordinator.transition(token: token, to: .failed)
+        updateSession(token) { $0.state = .failed }
         appState.endRecordingClock()
         appState.phase = .failed
         appState.lastError = message
         appState.overlayMessage = "Error"
-        overlayWindow.show(position: appState.overlayPosition)
+        overlayWindow.show(position: appState.overlayPosition, token: token)
+        retireRuntime(session, hideOverlay: false)
+        _ = coordinator.complete(token: token)
+        activeSession = nil
 
-        Task { [weak self] in
+        Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(3))
-            guard let self, self.appState.phase == .failed else { return }
-            self.completeSession()
+            guard let self else { return }
+            self.overlayWindow.hide(token: token)
+            if self.activeSession == nil, self.appState.phase == .failed {
+                self.appState.resetSessionUI()
+                if self.engineReloadPending { self.initializeEngine() }
+            }
         }
     }
 
-    private func completeSession() {
-        coordinator.complete()
-        activeSessionID = nil
-        currentDestination = nil
-        currentRawText = ""
-        currentDeliveredText = ""
-        currentHistoryID = nil
-        currentRefinementStatus = .notRequested
-        currentPastedRaw = false
-        currentCleanupMode = .clean
-        deliveryCommitted = false
-        sessionStartedAt = nil
-        previewWindow.close()
-        overlayWindow.hide()
+    private func completeSession(
+        token: DictationSessionToken,
+        toastDuration: Duration? = nil
+    ) {
+        guard let session = activeSession, session.token == token else { return }
+        let toastMessage = appState.overlayMessage
+        retireRuntime(session, hideOverlay: toastDuration == nil)
+        _ = coordinator.complete(token: token)
+        activeSession = nil
         appState.resetSessionUI()
+        if engineReloadPending { initializeEngine() }
+        guard let toastDuration else { return }
+        appState.overlayMessage = toastMessage
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: toastDuration)
+            guard let self else { return }
+            self.overlayWindow.hide(token: token)
+            if self.activeSession == nil {
+                self.appState.overlayMessage = "Listening"
+            }
+        }
+    }
+
+    private func retireRuntime(
+        _ session: ActiveDictationSession,
+        hideOverlay: Bool = true
+    ) {
+        session.finalizationTask?.cancel()
+        session.streamingStartTask?.cancel()
+        session.streamingUpdatesTask?.cancel()
+        session.captureWatchdog?.cancel()
+        session.finalizationWatchdog?.cancel()
+        if let streamingTranscriber = session.streamingTranscriber {
+            Task { await streamingTranscriber.cancel() }
+        }
+        if let audioURL = session.audioURL,
+           FileManager.default.fileExists(atPath: audioURL.path) {
+            try? FileManager.default.removeItem(at: audioURL)
+        }
+        previewWindow.close(token: session.token)
+        if hideOverlay { overlayWindow.hide(token: session.token) }
     }
 
     private func handleDuration(_ duration: TimeInterval) {
-        guard appState.phase == .recording else { return }
-        if duration >= 600, !warnedAtTenMinutes {
-            warnedAtTenMinutes = true
+        guard appState.phase == .recording,
+              let token = activeSession?.token
+        else { return }
+        if duration >= 600, activeSession?.warnedAtTenMinutes == false {
+            updateSession(token) { $0.warnedAtTenMinutes = true }
             appState.overlayMessage = "10 minutes · preview at 15"
         }
         if duration >= TimeInterval(configuration.app.maximumRecordingDurationSeconds),
-           !durationCapTriggered
+           activeSession?.durationCapTriggered == false
         {
-            durationCapTriggered = true
+            updateSession(token) { $0.durationCapTriggered = true }
             execute(coordinator.durationLimitReached(profileMode: currentProfileMode()).effects)
         }
     }
@@ -909,12 +1148,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         "\(profile.id.capitalized) · \(profile.mode.rawValue.capitalized)"
     }
 
-    private func selectedVocabulary() -> VocabularyPack {
-        configuration.vocabulary.selection(including: activeProfile.vocabularyPackIDs)
+    private func selectedVocabulary(for profile: DictationProfile) -> VocabularyPack {
+        configuration.vocabulary.selection(including: profile.vocabularyPackIDs)
     }
 
-    private func asrVocabularyBias() -> String {
-        let vocabulary = selectedVocabulary()
+    private func asrVocabularyBias(for profile: DictationProfile) -> String {
+        let vocabulary = selectedVocabulary(for: profile)
         return Array(
             Set(
                 vocabulary.literalPhrases
@@ -926,8 +1165,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         .joined(separator: ", ")
     }
 
-    private func makeCleanupPipeline() -> CleanupPipeline {
-        let vocabulary = selectedVocabulary()
+    private func makeCleanupPipeline(for profile: DictationProfile) -> CleanupPipeline {
+        let vocabulary = selectedVocabulary(for: profile)
         var replacements: [CleanupVocabularyReplacement] = vocabulary.replacements.map {
             CleanupVocabularyReplacement(
                 spokenForm: $0.key,
@@ -954,11 +1193,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return CleanupPipeline(
             vocabularyReplacements: replacements,
             protectedPatterns: CleanupProtectedPattern.standard + configuredPatterns,
-            refiner: configuredTextRefiner()
+            refiner: configuredTextRefiner(for: profile)
         )
     }
 
-    private func configuredTextRefiner() -> any TextRefiner {
+    private func configuredTextRefiner(for profile: DictationProfile) -> any TextRefiner {
         let app = configuration.app
         let deadline = Duration.milliseconds(
             Int64(max(1, (app.refinementDeadlineSeconds * 1_000).rounded()))
@@ -983,7 +1222,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        switch activeProfile.formattingStyle {
+        switch profile.formattingStyle {
         case .structured:
             return base
         case .chat, .prose, .plain, .terminal:
@@ -1032,9 +1271,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         at audioURL: URL,
         transcript: String,
         latency: TimeInterval,
-        error: String?
+        error: String?,
+        token: DictationSessionToken
     ) {
-        guard appState.retainDebugAudio,
+        guard let session = activeSession,
+              session.token == token,
+              appState.retainDebugAudio,
               FileManager.default.fileExists(atPath: audioURL.path)
         else { return }
 
@@ -1052,7 +1294,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             engine: engine,
             model: model,
             sourceAudioURL: audioURL,
-            recordingDuration: sessionStartedAt.map { Date().timeIntervalSince($0) } ?? 0,
+            recordingDuration: Date().timeIntervalSince(session.startedAt),
             transcribedText: transcript,
             latencySeconds: latency,
             language: "en",
@@ -1061,30 +1303,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func saveRawHistory(
+        token: DictationSessionToken,
         mode: CleanupMode,
         asrLatency: TimeInterval,
         unrecognizedCommands: [String]
     ) -> Bool {
-        guard let historyStore else {
+        guard let historyStore,
+              let session = activeSession,
+              session.token == token
+        else {
             appState.lastError = "History is unavailable"
             return false
         }
-        let id = activeSessionID ?? UUID()
+        let id = token.id
         do {
             _ = try historyStore.saveRaw(
                 HistoryRawCapture(
                     id: id,
-                    rawText: currentRawText,
+                    rawText: session.rawText,
                     destination: HistoryDestination(
-                        bundleIdentifier: currentDestination?.bundleIdentifier,
-                        displayName: currentDestination?.applicationName
+                        bundleIdentifier: session.destination?.bundleIdentifier,
+                        displayName: session.destination?.applicationName
                     ),
                     mode: mode == .literal ? .literal : .clean,
                     asrLatency: asrLatency,
                     unrecognizedCommandCandidates: unrecognizedCommands
                 )
             )
-            currentHistoryID = id
+            updateSession(token) { $0.historyID = id }
             return true
         } catch {
             appState.lastError = "Could not save raw history: \(error.localizedDescription)"
@@ -1092,17 +1338,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func finalizeHistoryBeforeDelivery(refinementLatency: TimeInterval) {
-        guard let historyStore, let id = currentHistoryID else { return }
+    private func finalizeHistoryBeforeDelivery(
+        token: DictationSessionToken,
+        refinementLatency: TimeInterval
+    ) {
+        guard let historyStore,
+              let session = activeSession,
+              session.token == token,
+              let id = session.historyID
+        else { return }
         do {
             _ = try historyStore.finalize(
                 id: id,
                 with: HistoryFinalization(
-                    polishedText: currentDeliveredText,
-                    refinementStatus: currentRefinementStatus,
+                    polishedText: session.deliveredText,
+                    refinementStatus: session.refinementStatus,
                     deliveryStatus: .pending,
                     refinementLatency: refinementLatency,
-                    totalLatency: sessionStartedAt.map { Date().timeIntervalSince($0) }
+                    totalLatency: Date().timeIntervalSince(session.startedAt)
                 )
             )
         } catch {
@@ -1110,13 +1363,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func markHistoryPolishFailed(_ error: String) {
-        guard let historyStore, let id = currentHistoryID else { return }
+    private func markHistoryPolishFailed(
+        token: DictationSessionToken,
+        _ error: String
+    ) {
+        guard let historyStore,
+              let session = activeSession,
+              session.token == token,
+              let id = session.historyID
+        else { return }
         do {
             _ = try historyStore.markPolishFailed(
                 id: id,
                 error: error,
-                totalLatency: sessionStartedAt.map { Date().timeIntervalSince($0) }
+                totalLatency: Date().timeIntervalSince(session.startedAt)
             )
         } catch {
             appState.lastError = "Could not mark failed polish: \(error.localizedDescription)"
@@ -1124,18 +1384,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateHistoryDelivery(
+        token: DictationSessionToken,
         status: HistoryDeliveryStatus,
         deliveredText: String,
         error: String? = nil
     ) {
-        guard let historyStore, let id = currentHistoryID else { return }
+        guard let historyStore,
+              let session = activeSession,
+              session.token == token,
+              let id = session.historyID
+        else { return }
         do {
             _ = try historyStore.updateDelivery(
                 id: id,
                 with: HistoryDeliveryUpdate(
                     status: status,
                     deliveredText: deliveredText,
-                    totalLatency: sessionStartedAt.map { Date().timeIntervalSince($0) },
+                    totalLatency: Date().timeIntervalSince(session.startedAt),
                     error: error
                 )
             )
@@ -1162,7 +1427,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 let retry = try historyStore.beginPolishRetry(id: entry.id)
                 let started = Date()
-                let result = try await self.makeCleanupPipeline().process(retry.rawText, mode: .clean)
+                let profile = self.resolveCurrentProfile().profile
+                let result = try await self.makeCleanupPipeline(for: profile).process(
+                    retry.rawText,
+                    mode: .clean
+                )
                 let refinementStatus: HistoryRefinementStatus
                 switch result.outcome {
                 case .accepted:
@@ -1191,8 +1460,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func initializeEngine(onCompletion: ((Bool) -> Void)? = nil) {
+        guard activeSession == nil else {
+            engineReloadPending = true
+            onCompletion?(true)
+            return
+        }
+        engineReloadPending = false
         engineTask?.cancel()
-        cancelStreamingSession()
         streamingTranscriber = nil
         transcriptionEngine = nil
         appState.engineReady = false

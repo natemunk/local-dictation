@@ -3,6 +3,7 @@ import Testing
 @testable import LocalDictation
 
 @Suite("Dictation coordinator")
+@MainActor
 struct DictationCoordinatorTests {
     @Test("capture starts on key-down and a quick tap arms toggle mode")
     func quickTapStartsImmediately() {
@@ -121,14 +122,14 @@ struct DictationCoordinatorTests {
     func escapeCancels() {
         let coordinator = DictationCoordinator()
         let start = coordinator.hotkeyDown(at: 1, profileMode: .clean)
-        guard case let .startCapture(sessionID) = start.effects.first else {
+        guard case let .startCapture(token) = start.effects.first else {
             Issue.record("Expected capture effect")
             return
         }
 
         let response = coordinator.escapePressed()
         #expect(response.consumeKeyEvent)
-        #expect(response.effects == [.cancel(sessionID: sessionID)])
+        #expect(response.effects == [.cancel(token: token)])
         #expect(coordinator.phase == .idle)
         #expect(coordinator.session == nil)
     }
@@ -145,5 +146,45 @@ struct DictationCoordinatorTests {
         }
         #expect(request.delivery == .preview)
         #expect(request.trigger == .durationLimit)
+    }
+
+    @Test("stale generations cannot transition or complete a replacement session")
+    func staleGenerationCannotMutateReplacement() {
+        let coordinator = DictationCoordinator()
+        let first = coordinator.hotkeyDown(at: 1, profileMode: .clean)
+        guard case let .startCapture(firstToken) = first.effects.first else {
+            Issue.record("Expected first capture token")
+            return
+        }
+        _ = coordinator.escapePressed()
+
+        let second = coordinator.hotkeyDown(at: 2, profileMode: .clean)
+        guard case let .startCapture(secondToken) = second.effects.first else {
+            Issue.record("Expected second capture token")
+            return
+        }
+
+        #expect(secondToken.generation > firstToken.generation)
+        #expect(!coordinator.complete(token: firstToken))
+        #expect(!coordinator.transition(token: firstToken, to: .failed))
+        #expect(coordinator.owns(secondToken))
+        #expect(coordinator.phase == .recording)
+    }
+
+    @Test("typing detected after finish keeps Enter owned by the foreground app")
+    func typingAfterFinishKeepsEnterPassThrough() {
+        let coordinator = DictationCoordinator()
+        _ = coordinator.hotkeyDown(at: 1, profileMode: .clean)
+        _ = coordinator.hotkeyUp(at: 1.1, profileMode: .clean)
+        _ = coordinator.hotkeyDown(at: 2, profileMode: .clean)
+        #expect(coordinator.phase == .finalizing)
+
+        let typing = coordinator.nonModifierKeyTyped()
+        #expect(!typing.consumeKeyEvent)
+        #expect(coordinator.session?.interleavedTyping == true)
+
+        let enter = coordinator.enterPressed(modifiers: [], profileMode: .clean)
+        #expect(!enter.consumeKeyEvent)
+        #expect(enter.effects.isEmpty)
     }
 }

@@ -150,6 +150,14 @@ final class TextInserter {
 
         keyDown.flags = .maskCommand
         keyUp.flags = .maskCommand
+        keyDown.setIntegerValueField(
+            .eventSourceUserData,
+            value: HotkeyManager.syntheticPasteEventUserData
+        )
+        keyUp.setIntegerValueField(
+            .eventSourceUserData,
+            value: HotkeyManager.syntheticPasteEventUserData
+        )
         keyDown.post(tap: .cghidEventTap)
         keyUp.post(tap: .cghidEventTap)
         return true

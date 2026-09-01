@@ -47,17 +47,24 @@ struct EnterModifiers: OptionSet, Equatable, Sendable {
 }
 
 struct DictationFinishRequest: Equatable, Sendable {
-    let sessionID: UUID
+    let token: DictationSessionToken
     let mode: DictationMode
     let delivery: DeliveryIntent
     let trigger: FinishTrigger
+
+    var sessionID: UUID { token.id }
+}
+
+struct DictationSessionToken: Equatable, Hashable, Sendable {
+    let generation: UInt64
+    let id: UUID
 }
 
 enum DictationCoordinatorEffect: Equatable, Sendable {
-    case startCapture(sessionID: UUID)
+    case startCapture(token: DictationSessionToken)
     case finish(DictationFinishRequest)
-    case cancel(sessionID: UUID)
-    case interleavedTypingChanged(Bool)
+    case cancel(token: DictationSessionToken)
+    case interleavedTypingChanged(token: DictationSessionToken, detected: Bool)
 }
 
 struct DictationEventResponse: Equatable, Sendable {
@@ -72,9 +79,10 @@ struct DictationEventResponse: Equatable, Sendable {
 ///
 /// The coordinator intentionally knows nothing about AppKit, audio, ASR, or UI.
 /// Callers execute returned effects and explicitly report phase transitions.
+@MainActor
 final class DictationCoordinator {
     struct Session: Equatable, Sendable {
-        let id: UUID
+        let token: DictationSessionToken
         let profileMode: DictationMode
         let firstHotkeyDownAt: TimeInterval
         var hotkeyIsDown: Bool
@@ -85,6 +93,7 @@ final class DictationCoordinator {
     private(set) var phase: DictationPhase = .idle
     private(set) var session: Session?
     private(set) var tapHoldThreshold: TimeInterval
+    private var nextGeneration: UInt64 = 0
 
     init(tapHoldThreshold: TimeInterval = 0.350) {
         self.tapHoldThreshold = tapHoldThreshold
@@ -99,8 +108,11 @@ final class DictationCoordinator {
     func hotkeyDown(at timestamp: TimeInterval, profileMode: DictationMode) -> DictationEventResponse {
         switch phase {
         case .idle, .failed:
+            nextGeneration &+= 1
+            if nextGeneration == 0 { nextGeneration = 1 }
+            let token = DictationSessionToken(generation: nextGeneration, id: UUID())
             let session = Session(
-                id: UUID(),
+                token: token,
                 profileMode: profileMode,
                 firstHotkeyDownAt: timestamp,
                 hotkeyIsDown: true,
@@ -111,7 +123,7 @@ final class DictationCoordinator {
             phase = .recording
             return DictationEventResponse(
                 consumeKeyEvent: true,
-                effects: [.startCapture(sessionID: session.id)]
+                effects: [.startCapture(token: token)]
             )
 
         case .recording:
@@ -151,14 +163,19 @@ final class DictationCoordinator {
 
     @discardableResult
     func nonModifierKeyTyped() -> DictationEventResponse {
-        guard phase == .recording, var session else { return .passThrough }
+        guard phase == .recording
+                || phase == .finalizing
+                || phase == .polishing
+                || phase == .pasting,
+              var session
+        else { return .passThrough }
         guard !session.interleavedTyping else { return .passThrough }
 
         session.interleavedTyping = true
         self.session = session
         return DictationEventResponse(
             consumeKeyEvent: false,
-            effects: [.interleavedTypingChanged(true)]
+            effects: [.interleavedTypingChanged(token: session.token, detected: true)]
         )
     }
 
@@ -183,10 +200,10 @@ final class DictationCoordinator {
     @discardableResult
     func escapePressed() -> DictationEventResponse {
         guard phase.hasActiveSession, let session else { return .passThrough }
-        let id = session.id
+        let token = session.token
         phase = .idle
         self.session = nil
-        return DictationEventResponse(consumeKeyEvent: true, effects: [.cancel(sessionID: id)])
+        return DictationEventResponse(consumeKeyEvent: true, effects: [.cancel(token: token)])
     }
 
     @discardableResult
@@ -209,7 +226,9 @@ final class DictationCoordinator {
         )
     }
 
-    func transition(to newPhase: DictationPhase) {
+    @discardableResult
+    func transition(token: DictationSessionToken, to newPhase: DictationPhase) -> Bool {
+        guard session?.token == token else { return false }
         switch (phase, newPhase) {
         case (.finalizing, .polishing),
              (.finalizing, .previewing),
@@ -219,14 +238,23 @@ final class DictationCoordinator {
              (.previewing, .pasting),
              (_, .failed):
             phase = newPhase
+            return true
         default:
             assertionFailure("Invalid dictation transition: \(phase.rawValue) -> \(newPhase.rawValue)")
+            return false
         }
     }
 
-    func complete() {
+    @discardableResult
+    func complete(token: DictationSessionToken) -> Bool {
+        guard session?.token == token else { return false }
         phase = .idle
         session = nil
+        return true
+    }
+
+    func owns(_ token: DictationSessionToken) -> Bool {
+        session?.token == token
     }
 
     private func requestFinish(
@@ -237,7 +265,7 @@ final class DictationCoordinator {
         guard phase == .recording, let session else { return .consume }
         phase = .finalizing
         let request = DictationFinishRequest(
-            sessionID: session.id,
+            token: session.token,
             mode: mode,
             delivery: delivery,
             trigger: trigger

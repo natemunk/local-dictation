@@ -7,9 +7,35 @@ private final class FirstMouseHostingView<Content: View>: NSHostingView<Content>
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
-class OverlayWindow: NSPanel {
+struct OverlayPresentationState: Equatable, Sendable {
+    private(set) var visibleToken: DictationSessionToken?
+    private(set) var revision: UInt64 = 0
+
+    @discardableResult
+    mutating func show(token: DictationSessionToken) -> UInt64 {
+        revision &+= 1
+        visibleToken = token
+        return revision
+    }
+
+    mutating func beginHide(token: DictationSessionToken) -> UInt64? {
+        guard visibleToken == token else { return nil }
+        revision &+= 1
+        return revision
+    }
+
+    mutating func completeHide(token: DictationSessionToken, revision: UInt64) -> Bool {
+        guard visibleToken == token, self.revision == revision else { return false }
+        visibleToken = nil
+        return true
+    }
+}
+
+@MainActor
+final class OverlayWindow: NSPanel {
     private let appState: AppState
     private var hostingView: NSHostingView<OverlayView>?
+    private var presentation = OverlayPresentationState()
 
     init(appState: AppState, onCancel: @escaping () -> Void) {
         self.appState = appState
@@ -41,7 +67,8 @@ class OverlayWindow: NSPanel {
         self.hostingView = hostingView
     }
 
-    func show(position: OverlayPosition) {
+    func show(position: OverlayPosition, token: DictationSessionToken) {
+        presentation.show(token: token)
         let pointer = NSEvent.mouseLocation
         guard let screen = NSScreen.screens.first(where: { $0.frame.contains(pointer) })
             ?? NSScreen.main
@@ -103,13 +130,19 @@ class OverlayWindow: NSPanel {
         // The view will automatically update based on appState
     }
 
-    func hide() {
+    func hide(token: DictationSessionToken) {
+        guard let revision = presentation.beginHide(token: token) else { return }
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = 0.2
             context.timingFunction = CAMediaTimingFunction(name: .easeIn)
             self.animator().alphaValue = 0
-        }, completionHandler: {
-            self.orderOut(nil)
+        }, completionHandler: { [weak self] in
+            Task { @MainActor in
+                guard let self,
+                      self.presentation.completeHide(token: token, revision: revision)
+                else { return }
+                self.orderOut(nil)
+            }
         })
     }
 }

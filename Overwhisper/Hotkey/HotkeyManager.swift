@@ -1,7 +1,8 @@
-import AppKit
 import Carbon.HIToolbox
+import CoreGraphics
+import Foundation
 
-enum GlobalKeyMonitorError: LocalizedError {
+enum GlobalKeyMonitorError: Error, LocalizedError {
     case eventTapUnavailable
 
     var errorDescription: String? {
@@ -12,30 +13,57 @@ enum GlobalKeyMonitorError: LocalizedError {
     }
 }
 
-/// A single session event tap owns the dictation chord and the session-scoped
-/// Enter/Escape safety rules. It never synthesizes Return.
+enum HotkeyTapRecoveryAction: Equatable, Sendable {
+    case keep
+    case reenable
+    case rebuild
+    case create
+}
+
+enum HotkeyTapHealthPolicy {
+    static func action(
+        tapExists: Bool,
+        tapEnabled: Bool,
+        reenableSucceeded: Bool? = nil
+    ) -> HotkeyTapRecoveryAction {
+        guard tapExists else { return .create }
+        guard !tapEnabled else { return .keep }
+        guard let reenableSucceeded else { return .reenable }
+        return reenableSucceeded ? .keep : .rebuild
+    }
+}
+
+@MainActor
 final class HotkeyManager {
-    typealias EffectHandler = ([DictationCoordinatorEffect]) -> Void
+    static let syntheticPasteEventUserData: Int64 = 0x4C44_5041_5354_4501
+
+    private struct PendingKeyUp {
+        let expiresAt: TimeInterval
+    }
 
     private let coordinator: DictationCoordinator
     private let profileMode: () -> DictationMode
-    private let effectHandler: EffectHandler
+    private let effectHandler: ([DictationCoordinatorEffect]) -> Void
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
-    private var suppressedKeyUps = Set<UInt16>()
+    private var pendingKeyUps: [UInt16: PendingKeyUp] = [:]
+    private var physicalDDown = false
+    private var logicalDReleaseHandled = false
+
+    private(set) var tapDisableCount = 0
+    private(set) var tapRebuildCount = 0
+    private(set) var lastTapDisableReason: String?
+
+    private static let keyUpSuppressionLifetime: TimeInterval = 2
 
     init(
         coordinator: DictationCoordinator,
         profileMode: @escaping () -> DictationMode,
-        effectHandler: @escaping EffectHandler
+        effectHandler: @escaping ([DictationCoordinatorEffect]) -> Void
     ) {
         self.coordinator = coordinator
         self.profileMode = profileMode
         self.effectHandler = effectHandler
-    }
-
-    deinit {
-        stop()
     }
 
     var isMonitoring: Bool {
@@ -44,23 +72,67 @@ final class HotkeyManager {
     }
 
     func start(promptForPermission: Bool = true) throws {
-        guard eventTap == nil else { return }
+        try ensureHealthy(promptForPermission: promptForPermission)
+    }
+
+    func ensureHealthy(promptForPermission: Bool = false) throws {
         if promptForPermission, !CGPreflightListenEventAccess() {
             _ = CGRequestListenEventAccess()
         }
 
+        switch HotkeyTapHealthPolicy.action(
+            tapExists: eventTap != nil,
+            tapEnabled: isMonitoring
+        ) {
+        case .keep:
+            return
+        case .create:
+            try createTap()
+        case .reenable:
+            guard let eventTap else {
+                try createTap()
+                return
+            }
+            CGEvent.tapEnable(tap: eventTap, enable: true)
+            let enabled = CGEvent.tapIsEnabled(tap: eventTap)
+            if HotkeyTapHealthPolicy.action(
+                tapExists: true,
+                tapEnabled: false,
+                reenableSucceeded: enabled
+            ) == .rebuild {
+                try rebuild(reason: "event tap remained disabled after re-enable")
+            }
+        case .rebuild:
+            try rebuild(reason: "event tap health check requested rebuild")
+        }
+    }
+
+    func rebuild(reason: String) throws {
+        tapRebuildCount += 1
+        lastTapDisableReason = reason
+        reconcileConsumedDRelease(at: ProcessInfo.processInfo.systemUptime)
+        destroyTap()
+        try createTap()
+    }
+
+    func stop() {
+        reconcileConsumedDRelease(at: ProcessInfo.processInfo.systemUptime)
+        destroyTap()
+        AppLogger.hotkey.info("Hyper+D event tap stopped")
+    }
+
+    private func createTap() throws {
         let mask = CGEventMask(1 << CGEventType.keyDown.rawValue)
             | CGEventMask(1 << CGEventType.keyUp.rawValue)
             | CGEventMask(1 << CGEventType.flagsChanged.rawValue)
 
-        let opaqueSelf = Unmanaged.passUnretained(self).toOpaque()
-        guard let eventTap = CGEvent.tapCreate(
+        guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
             options: .defaultTap,
             eventsOfInterest: mask,
             callback: Self.eventTapCallback,
-            userInfo: opaqueSelf
+            userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
             AppLogger.hotkey.error(
                 "Unable to create event tap; Input Monitoring=\(CGPreflightListenEventAccess(), privacy: .public), Accessibility=\(AXIsProcessTrusted(), privacy: .public)"
@@ -68,66 +140,136 @@ final class HotkeyManager {
             throw GlobalKeyMonitorError.eventTapUnavailable
         }
 
-        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
-        self.eventTap = eventTap
-        self.runLoopSource = source
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        eventTap = tap
+        runLoopSource = source
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
-        CGEvent.tapEnable(tap: eventTap, enable: true)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        guard CGEvent.tapIsEnabled(tap: tap) else {
+            destroyTap()
+            throw GlobalKeyMonitorError.eventTapUnavailable
+        }
         AppLogger.hotkey.info(
             "Hyper+D event tap started; Input Monitoring=\(CGPreflightListenEventAccess(), privacy: .public), Accessibility=\(AXIsProcessTrusted(), privacy: .public)"
         )
     }
 
-    func stop() {
+    private func destroyTap() {
         if let eventTap { CGEvent.tapEnable(tap: eventTap, enable: false) }
-        if let runLoopSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes) }
+        if let runLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
+        }
         eventTap = nil
         runLoopSource = nil
-        suppressedKeyUps.removeAll()
-        AppLogger.hotkey.info("Hyper+D event tap stopped")
+        pendingKeyUps.removeAll()
+        physicalDDown = false
+        logicalDReleaseHandled = false
     }
 
-    private static let eventTapCallback: CGEventTapCallBack = { _, type, event, userInfo in
-        guard let userInfo else { return Unmanaged.passUnretained(event) }
-        let manager = Unmanaged<HotkeyManager>.fromOpaque(userInfo).takeUnretainedValue()
-
-        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            AppLogger.hotkey.warning("Hyper+D event tap was disabled by the system; re-enabling it")
-            if let eventTap = manager.eventTap {
-                CGEvent.tapEnable(tap: eventTap, enable: true)
-            }
+    private nonisolated static let eventTapCallback: CGEventTapCallBack = {
+        _, type, event, userInfo in
+        guard let userInfo, Thread.isMainThread else {
             return Unmanaged.passUnretained(event)
         }
+        let manager = Unmanaged<HotkeyManager>.fromOpaque(userInfo).takeUnretainedValue()
+        return MainActor.assumeIsolated {
+            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                manager.handleTapDisabled(type)
+                return Unmanaged.passUnretained(event)
+            }
+            return manager.handle(type: type, event: event)
+        }
+    }
 
-        return manager.handle(type: type, event: event)
+    private func handleTapDisabled(_ type: CGEventType) {
+        tapDisableCount += 1
+        let reason = type == .tapDisabledByTimeout ? "system timeout" : "user input"
+        lastTapDisableReason = reason
+        guard let eventTap else { return }
+        CGEvent.tapEnable(tap: eventTap, enable: true)
+        guard !CGEvent.tapIsEnabled(tap: eventTap) else { return }
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try self.rebuild(reason: "tap disabled by \(reason) and re-enable failed")
+            } catch {
+                AppLogger.hotkey.error(
+                    "Hyper+D event tap rebuild failed: \(error.localizedDescription, privacy: .public)"
+                )
+            }
+        }
     }
 
     func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        if event.getIntegerValueField(.eventSourceUserData) == Self.syntheticPasteEventUserData {
+            return Unmanaged.passUnretained(event)
+        }
+
+        let timestamp = ProcessInfo.processInfo.systemUptime
+        expirePendingKeyUps(at: timestamp)
         let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
         let isDKey = keyCode == UInt16(kVK_ANSI_D)
         let hyperD = isDKey && hasHyperModifiers(event.flags)
-        let timestamp = ProcessInfo.processInfo.systemUptime
-        let response: DictationEventResponse
+        var response = DictationEventResponse.passThrough
+
+        if physicalDDown,
+           !isDKey,
+           !CGEventSource.keyState(
+               .combinedSessionState,
+               key: CGKeyCode(kVK_ANSI_D)
+           ) {
+            let recovery = releaseLogicalD(at: timestamp)
+            dispatch(recovery.effects)
+            physicalDDown = false
+            logicalDReleaseHandled = false
+        }
 
         switch type {
+        case .flagsChanged:
+            if physicalDDown,
+               !logicalDReleaseHandled,
+               !hasHyperModifiers(event.flags) {
+                response = releaseLogicalD(at: timestamp)
+                dispatch(response.effects)
+            }
+            return Unmanaged.passUnretained(event)
+
         case .keyDown where hyperD:
             let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
-            response = isRepeat
-                ? .consume
-                : coordinator.hotkeyDown(at: timestamp, profileMode: profileMode())
+            if isRepeat, physicalDDown {
+                response = .consume
+                break
+            }
+            if physicalDDown {
+                let recovery = releaseLogicalD(at: timestamp)
+                dispatch(recovery.effects)
+                physicalDDown = false
+                logicalDReleaseHandled = false
+            }
+            physicalDDown = true
+            logicalDReleaseHandled = false
+            response = coordinator.hotkeyDown(at: timestamp, profileMode: profileMode())
 
-        // Recognize the initiating D key-up even if the user released one or
-        // more Hyper modifiers first.
-        case .keyUp where isDKey && coordinator.session?.hotkeyIsDown == true:
-            response = coordinator.hotkeyUp(at: timestamp, profileMode: profileMode())
+        case .keyUp where isDKey && physicalDDown:
+            if !logicalDReleaseHandled {
+                response = releaseLogicalD(at: timestamp)
+            } else {
+                response = .consume
+            }
+            physicalDDown = false
+            logicalDReleaseHandled = false
 
-        case .keyUp where suppressedKeyUps.remove(keyCode) != nil:
+        case .keyUp where pendingKeyUps.removeValue(forKey: keyCode) != nil:
             response = .consume
 
         case .keyDown where coordinator.phase.hasActiveSession:
+            // A new down for the same key proves an older matching up was lost.
+            pendingKeyUps.removeValue(forKey: keyCode)
             if keyCode == UInt16(kVK_Escape) {
                 response = coordinator.escapePressed()
-            } else if keyCode == UInt16(kVK_Return) || keyCode == UInt16(kVK_ANSI_KeypadEnter) {
+            } else if keyCode == UInt16(kVK_Return)
+                        || keyCode == UInt16(kVK_ANSI_KeypadEnter) {
                 response = coordinator.enterPressed(
                     modifiers: enterModifiers(from: event.flags),
                     profileMode: profileMode()
@@ -137,21 +279,43 @@ final class HotkeyManager {
             }
 
         default:
-            response = .passThrough
+            break
         }
 
-        if !response.effects.isEmpty {
-            DispatchQueue.main.async { [effectHandler] in effectHandler(response.effects) }
-        }
+        dispatch(response.effects)
         if type == .keyDown,
            response.consumeKeyEvent,
-           keyCode == UInt16(kVK_Return)
-               || keyCode == UInt16(kVK_ANSI_KeypadEnter)
-               || keyCode == UInt16(kVK_Escape)
-        {
-            suppressedKeyUps.insert(keyCode)
+           (keyCode == UInt16(kVK_Return)
+                || keyCode == UInt16(kVK_ANSI_KeypadEnter)
+                || keyCode == UInt16(kVK_Escape)) {
+            pendingKeyUps[keyCode] = PendingKeyUp(
+                expiresAt: timestamp + Self.keyUpSuppressionLifetime
+            )
         }
         return response.consumeKeyEvent ? nil : Unmanaged.passUnretained(event)
+    }
+
+    private func dispatch(_ effects: [DictationCoordinatorEffect]) {
+        guard !effects.isEmpty else { return }
+        effectHandler(effects)
+    }
+
+    private func releaseLogicalD(at timestamp: TimeInterval) -> DictationEventResponse {
+        guard physicalDDown, !logicalDReleaseHandled else { return .consume }
+        logicalDReleaseHandled = true
+        return coordinator.hotkeyUp(at: timestamp, profileMode: profileMode())
+    }
+
+    private func reconcileConsumedDRelease(at timestamp: TimeInterval) {
+        guard physicalDDown else { return }
+        let response = releaseLogicalD(at: timestamp)
+        dispatch(response.effects)
+        physicalDDown = false
+        logicalDReleaseHandled = false
+    }
+
+    private func expirePendingKeyUps(at timestamp: TimeInterval) {
+        pendingKeyUps = pendingKeyUps.filter { $0.value.expiresAt > timestamp }
     }
 
     private func hasHyperModifiers(_ flags: CGEventFlags) -> Bool {
@@ -167,11 +331,8 @@ final class HotkeyManager {
         if flags.contains(.maskControl) { result.insert(.control) }
         if flags.contains(.maskSecondaryFn) { result.insert(.function) }
 
-        // CGEvent's low 16 bits identify left/right device keys and event
-        // metadata. Bits 16 and above are the device-independent modifier and
-        // special-key plane. Numeric-pad is key-origin metadata, so ignore it;
-        // fail closed for every other unclassified bit, including Caps Lock,
-        // Help, and future flags.
+        // Caps Lock and numeric-pad are origin/state metadata, not unsupported
+        // Return modifiers. Fail closed for other unclassified high bits.
         let classifiedFlags: CGEventFlags = [
             .maskAlternate,
             .maskShift,
@@ -179,6 +340,7 @@ final class HotkeyManager {
             .maskControl,
             .maskSecondaryFn,
             .maskNumericPad,
+            .maskAlphaShift,
         ]
         let deviceIndependentFlags = flags.rawValue & ~UInt64(0xFFFF)
         if deviceIndependentFlags & ~classifiedFlags.rawValue != 0 {
