@@ -1,0 +1,31 @@
+{
+  "title": "Local Dictation Hyper Key",
+  "rules": [
+    {
+      "description": "Right Option to Hyper (Command+Control+Option+Shift)",
+      "manipulators": [
+        {
+          "type": "basic",
+          "from": {
+            "key_code": "right_option",
+            "modifiers": {
+              "optional": [
+                "any"
+              ]
+            }
+          },
+          "to": [
+            {
+              "key_code": "left_shift",
+              "modifiers": [
+                "left_command",
+                "left_control",
+                "left_option"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

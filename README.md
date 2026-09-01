@@ -32,6 +32,45 @@ On first launch:
 
 For a first dictation, open Apple Notes, click in a blank note, tap Hyper+D, speak, then tap Hyper+D again. Local Dictation sends Command+V only if the destination is still safe. Otherwise, the transcript remains available on the clipboard and in Local Dictation History.
 
+## Set up a Hyper key
+
+Hyper is not a special key built into macOS. In Local Dictation, it means pressing Command+Control+Option+Shift together. You can always hold all four modifiers and press D, but mapping one otherwise-unused key to that combination is much more comfortable. Right Option is a good choice if you do not rely on it for alternate characters or keyboard layouts.
+
+### With Raycast
+
+This is the easiest route if Raycast is already installed:
+
+1. Open Raycast Settings → Keyboard → Hyper Key.
+2. Choose **Right Option** as the physical key.
+3. Turn on **Include Shift (⇧)**. Local Dictation requires the complete Command+Control+Option+Shift chord.
+4. Open Local Dictation Settings → General and confirm **Hyper+D listener** says Ready.
+5. Hold Right Option and tap D.
+
+Do not map Right Option in both Raycast and Karabiner-Elements; two remappers handling the same key can make the shortcut unreliable. Raycast's optional Secure Input Compatibility mode is unnecessary for normal use and changes how Right Control and non-Raycast Hyper shortcuts behave while Secure Input is active. See the [Raycast Hyper Key guide](https://manual.raycast.com/hyper-key) for its current behavior and diagnostic indicator.
+
+### Without Raycast: Karabiner-Elements
+
+[Karabiner-Elements](https://karabiner-elements.pqrs.org/) is a free, open-source keyboard customizer. This repository includes a ready-made rule that maps Right Option to Hyper:
+
+1. Install and open Karabiner-Elements, then grant the macOS permissions it requests.
+2. From the Local Dictation repository root, run:
+
+   ```sh
+   mkdir -p ~/.config/karabiner/assets/complex_modifications
+   cp docs/karabiner-right-option-hyper.json \
+     ~/.config/karabiner/assets/complex_modifications/local-dictation-hyper.json
+   ```
+
+3. Open Karabiner-Elements Settings → Complex Modifications → **Add predefined rule**.
+4. Enable **Right Option to Hyper (Command+Control+Option+Shift)**.
+5. Make sure Raycast is not also mapping Right Option, then confirm Local Dictation Settings → General shows the Hyper+D listener as Ready.
+
+Disable the rule in Karabiner-Elements to restore normal Right Option behavior. Karabiner's [Complex Modifications guide](https://karabiner-elements.pqrs.org/docs/manual/configuration/configure-complex-modifications/) explains the same import flow.
+
+### Without a key remapper
+
+Hold Command+Control+Option+Shift and tap D. This needs no extra utility. macOS can swap individual modifier keys in System Settings, but it does not provide a built-in way to make one key emit all four modifiers.
+
 ## Opening Local Dictation
 
 Local Dictation normally lives behind the `LD` item in the right side of the macOS menu bar. Its menu provides Start/Finish Dictation, History, Configuration, Settings, and Quit.
@@ -161,7 +200,7 @@ History is actor-isolated GRDB/SQLite with WAL and FTS5. Raw text is saved befor
 
 | Symptom | What to check |
 |---|---|
-| Hyper+D does nothing | Open Settings → General. Microphone, Input Monitoring, Accessibility, and Hyper+D listener should all say Ready. Use **Refresh** and then **Retry Hyper+D** after changing a macOS permission. |
+| Hyper+D does nothing | Open Settings → General. Microphone, Input Monitoring, Accessibility, and Hyper+D listener should all say Ready. Use **Refresh** and then **Retry Hyper+D** after changing a macOS permission. If a mapped Right Option does nothing, make sure Raycast has **Include Shift (⇧)** enabled and that Raycast and Karabiner-Elements are not both remapping the key. |
 | The model appears stuck | Settings → Speech now distinguishes Downloading, Validating, and Optimizing. First-time download and Core ML optimization can take several minutes. If it reaches an explicit failure, use **Verify** first and **Repair** only when needed; Repair touches only Local Dictation-owned model files. |
 | Configuration says Degraded | Current builds automatically remove the obsolete `browser_profiles_enabled`/`hostname_matching_enabled` app flags and rename `history_success_retention_days` to `history_retention_days` without changing its value. Remaining notices identify an exact file and usually mean an old profile still contains a now-ignored `hostnames` match; remove that entry and choose Settings → General → **Reload**. |
 | Dictation reaches the clipboard but not the field | This is the safe fallback when focus changed, the destination could not be revalidated, or the app is not on the reviewed insertion allowlist. Return to the field and press Command+V, or use History → Paste Again. |
