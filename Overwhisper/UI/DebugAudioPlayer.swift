@@ -40,7 +40,7 @@ final class DebugAudioPlayer: NSObject, ObservableObject {
       isPlaying = true
       startTimer()
     } catch {
-      AppLogger.app.error("DebugAudioPlayer: failed to load retained local audio: \(error.localizedDescription)")
+      AppLogger.app.error("DebugAudioPlayer could not load retained local audio")
     }
   }
 

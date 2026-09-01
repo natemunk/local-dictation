@@ -32,6 +32,8 @@ struct SettingsView: View {
                 .tabItem { Label("Speech", systemImage: "waveform") }
             privacy
                 .tabItem { Label("Privacy", systemImage: "lock.shield") }
+            DiagnosticsSettingsView(appState: appState)
+                .tabItem { Label("Diagnostics", systemImage: "stethoscope") }
         }
         .frame(width: 610, height: 540)
         .padding(18)

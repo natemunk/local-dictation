@@ -1,6 +1,6 @@
 # Benchmark corpus and result schema
 
-Status: the scorer mechanics below are implemented and verified with synthetic fixtures. The corpus size, real engine measurements, and engine choice remain unbenchmarked.
+Status: the production final-engine runner and scorer mechanics below are implemented. Scoring logic is verified with synthetic fixtures; no fixture audio exists, and the real corpus size, engine measurements, and engine choice remain unbenchmarked.
 
 ## Files and formats
 
@@ -11,7 +11,7 @@ Each file is UTF-8 JSON Lines: one complete JSON object per non-empty line.
 - Cleanup records: [cleanup-pair-record.schema.json](../Benchmark/Schemas/cleanup-pair-record.schema.json)
 - Synthetic examples: [Fixtures](../Benchmark/Fixtures)
 
-The examples contain no WAV files and no user or Raycast recordings. Their audio paths intentionally use `synthetic/not-included/...`.
+The examples contain no WAV files and no user or Raycast recordings. Their audio paths intentionally use `synthetic/not-included/...`; they verify scoring logic and cannot be executed by the production corpus runner.
 
 ## Corpus manifest record
 
@@ -47,25 +47,62 @@ Ticket-shaped reference tokens matching a case-insensitive letter/alphanumeric p
 
 ```json
 {
+  "schema_version": "2.0.0",
   "sample_id": "fresh-technical-001",
   "candidate": "parakeet-v2",
   "transcript": "Create MYE-2077 in Linear for the Voshi release.",
+  "raw_output": "Create MYE-2077 in Linear for the Voshi release.",
   "processing_seconds": 0.61,
-  "latency_ms": 145.0,
+  "latency_ms": 610.0,
+  "latency_scope": "final_asr_file_dispatch_to_authoritative_transcript",
+  "rtf": 0.0724,
+  "audio_duration_seconds": 8.42,
   "status": "ok",
   "content_loss": false,
   "latency_failure": false,
-  "error": null
+  "error": null,
+  "error_type": null,
+  "model": "parakeet-v2",
+  "model_version": "fluidaudio-0.14.3",
+  "provenance": {
+    "runner": "local-dictation-corpus-runner",
+    "runner_version": "1.0.0",
+    "run_id": "11111111-2222-3333-4444-555555555555",
+    "run_label": "warm-final-asr",
+    "manifest_provenance": "fresh-opt-in",
+    "audio_path": "audio/fresh-technical-001.wav",
+    "audio_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "audio_bytes": 269484,
+    "device": "built-in-microphone",
+    "noise": "quiet",
+    "model_selection": "parakeetV2",
+    "model_variant": "parakeet-v2",
+    "adapter_version": "fluidaudio-0.14.3",
+    "source_host": "huggingface.co",
+    "installed_at": "2026-08-31T20:00:00.000Z",
+    "payload_relative_path": "parakeet-tdt-0.6b-v2-coreml",
+    "preparation_performed": false,
+    "engine_load_seconds": 1.21,
+    "language": "en",
+    "custom_vocabulary_sha256": null,
+    "host_os": "macOS 26.6.2",
+    "host_architecture": "arm64",
+    "started_at": "2026-08-31T20:01:00.000Z",
+    "finished_at": "2026-08-31T20:01:00.610Z"
+  }
 }
 ```
 
 - There must be at most one result per `(candidate, sample_id)` and every `sample_id` must exist in the manifest.
-- `processing_seconds` is total wall-clock transcription processing time for the clip. It drives RTF.
-- `latency_ms` is measured consistently from the final input audio boundary to the authoritative final transcript. It drives median/p95 and the faster-engine comparison.
+- `transcript` and `raw_output` are the same authoritative production final-ASR text before command interpretation, cleanup, or insertion. `transcript` remains the scorer input.
+- `processing_seconds` is total wall-clock final-engine processing time for the clip. It drives scorer RTF.
+- Runner `latency_ms` is final-ASR file dispatch to authoritative final transcript and is labeled by `latency_scope`. It drives median/p95 and the faster-engine comparison, but it is not stop-to-paste or end-to-end app latency.
+- `rtf` is the runner's per-record ratio using measured audio duration. The scorer still recomputes aggregate RTF from `processing_seconds` and manifest duration.
 - `status` is `ok`, `crash`, or `error`.
 - `content_loss` is set by runner/integrity checks for dropped or truncated material, especially missing beginnings/endings in long sessions. The scorer also treats a missing result or normalized-empty transcript as content loss. It does not guess subtle truncation from word count alone.
 - `latency_failure` records an instrumentation-level timeout/stall/failure that aggregate numbers would hide.
-- Crash/error text is optional and must be sanitized.
+- Crash/error text is optional. Production runner errors are whitespace-normalized, bounded, and redact the home, model-root, manifest-directory, and resolved audio paths before JSONL persistence.
+- Production provenance includes audio bytes/hash, model/adapter manifest metadata, engine-load duration, preparation state, OS/architecture, and timestamps. It never writes the resolved absolute audio or model path; an absolute manifest audio input is reduced to `manifest-audio/<filename>`.
 
 Use these canonical candidate IDs for the final-engine report:
 
@@ -125,7 +162,7 @@ domain-weighted WER = weighted edit cost / weighted reference-word count
 
 Candidate-level WERs are computed from summed corpus errors and denominators, not an average of per-sample WERs.
 
-## RTF and latency
+## RTF and final-ASR latency
 
 Aggregate real-time factor is:
 
@@ -135,7 +172,7 @@ RTF = sum(processing_seconds) / sum(duration_seconds)
 
 Any missing/invalid processing time fails the RTF gate. A complete candidate passes only when aggregate `RTF <= 0.20`; exactly `0.20` passes.
 
-Latency is reported from all candidate sample values:
+Final-ASR latency is reported from all candidate sample values:
 
 - Median is the middle value, or the arithmetic mean of the two middle values for an even sample count.
 - P95 uses the nearest-rank method: sorted value at `ceil(0.95 × n)`, one-indexed.
@@ -143,7 +180,7 @@ Latency is reported from all candidate sample values:
 
 The CLI defaults to median `<=700 ms` and p95 `<=2500 ms`, reflecting the approved v1 end-to-end deterministic median and outer local-refiner p95 ceilings. These defaults are provisional proxies for final-ASR scoring, not measured engine claims. Every report records the active thresholds, and callers can override them with `--max-median-latency-ms` and `--max-p95-latency-ms` once a benchmark-specific gate is approved.
 
-An explicit `latency_failure`, missing/invalid latency, median above its limit, or p95 above its limit fails the latency gate.
+An explicit `latency_failure`, missing/invalid latency, median above its limit, or p95 above its limit fails the latency gate. Stop-to-paste acceptance remains a separate app instrumentation measurement.
 
 ## Hard gates and exact selection
 
@@ -164,7 +201,30 @@ Selection in [BenchmarkEvaluator.swift](../Benchmark/BenchmarkEvaluator.swift) i
 
 A passing report uses `raycast_disposition: benchmark_passed_other_cutover_gates_remain`; it does not authorize Raycast removal by itself.
 
-## CLI
+## Production corpus runner CLI
+
+Build and run one or more canonical final engines:
+
+```sh
+swift build --product local-dictation-corpus-runner
+swift run local-dictation-corpus-runner \
+  --manifest /path/to/corpus.jsonl \
+  --output /path/to/final-engine-results.jsonl \
+  --candidate parakeet-v2 \
+  --candidate whisperkit-small.en
+```
+
+Audio paths are resolved relative to the manifest. The runner measures and hashes each audio file, rejects a declared/measured duration mismatch over 100 ms or 1%, runs candidates sequentially through the shared production final-engine layer, and checkpoints after every result.
+
+Existing Local Dictation-owned model installations are loaded with model download disabled and a local-tokenizer preflight for WhisperKit. Missing or invalid models produce candidate error records; they are not downloaded or repaired unless the invocation explicitly includes:
+
+```sh
+--allow-model-preparation
+```
+
+Use `--overwrite` to intentionally replace an existing final output or partial checkpoint. A partial/interrupted run remains valid JSONL at `<output>.partial`. EOU/live-preview candidates are rejected by this CLI and require a separate report.
+
+## Scorer CLI
 
 Compile without SwiftPM or application dependencies:
 
@@ -208,7 +268,7 @@ Run:
 Benchmark/verify-fixtures.sh
 ```
 
-The benchmark executable is not a dependency of the existing SwiftPM test target, and changing `Package.swift` was outside this work's ownership boundary. Therefore no misleading Swift Testing wrapper was added. Pure scoring types remain separated under `Benchmark/`, and the fixture script is the documented verification path until the package target graph is intentionally changed.
+The synthetic fixtures remain scorer-only logic verification. They do not prove that a production engine can open audio, meet a latency gate, preserve a long recording, or beat another engine.
 
 ## Real corpus readiness checklist
 
@@ -218,7 +278,7 @@ The benchmark executable is not a dependency of the existing SwiftPM test target
 - The same audio bytes and measurement checkpoints used for every candidate.
 - Cold-start/model-download time recorded separately from warm transcription measurements.
 - At least one integrity mechanism that can set `content_loss` for subtle long-session truncation.
-- Candidate runner and exact model/version/configuration provenance attached to the report.
+- Production runner JSONL and exact model/version/configuration provenance attached to the report.
 - Paired Raycast accuracy measured separately for the cutover criterion.
 
-None of those real-corpus conditions has been completed by the synthetic fixtures.
+None of those real-corpus conditions has been completed by the synthetic fixtures or by implementing the runner.

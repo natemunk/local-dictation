@@ -12,6 +12,12 @@ actor HistoryStore {
     static let searchMigrationIdentifier = "history_fts_v1"
     static let searchBundleMigrationIdentifier = "history_fts_v2"
     static let metadataMigrationIdentifier = "history_metadata_v2"
+    static let expectedMigrationIdentifiers = [
+        schemaMigrationIdentifier,
+        searchMigrationIdentifier,
+        searchBundleMigrationIdentifier,
+        metadataMigrationIdentifier,
+    ]
 
     private static let tableName = "dictation_history"
     private static let searchTableName = "dictation_history_fts"
@@ -65,6 +71,41 @@ actor HistoryStore {
 
     static func inMemory() throws -> HistoryStore {
         try HistoryStore(database: DatabaseQueue())
+    }
+
+    static func defaultDatabaseURL(
+        fileManager: FileManager = .default,
+        bundleIdentifier: String? = Bundle.main.bundleIdentifier
+    ) throws -> URL {
+        let base = try fileManager.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: false
+        )
+        return base
+            .appendingPathComponent(
+                bundleIdentifier ?? "com.natemunk.LocalDictation",
+                isDirectory: true
+            )
+            .appendingPathComponent("history.sqlite", isDirectory: false)
+    }
+
+    /// Opens an existing history database without migrating or writing it and
+    /// reads only operational columns/PRAGMAs used by the diagnostics UI.
+    static func readOnlyHealth(
+        databaseURL: URL,
+        policy: HistoryRetentionPolicy = .default
+    ) throws -> HistoryStoreHealth {
+        var configuration = Configuration()
+        configuration.readonly = true
+        let database = try DatabaseQueue(
+            path: databaseURL.path,
+            configuration: configuration
+        )
+        return try database.read { db in
+            try makeHealth(in: db, policy: policy)
+        }
     }
 
     /// Persists the immutable ASR result before any refinement or delivery is
@@ -522,24 +563,53 @@ actor HistoryStore {
     /// error text is included, so this can be used for launch diagnostics.
     func health(policy: HistoryRetentionPolicy = .default) throws -> HistoryStoreHealth {
         try database.read { db in
-            let journalMode = (
-                try String.fetchOne(db, sql: "PRAGMA journal_mode") ?? "unknown"
-            ).lowercased()
-            let migrations = try String.fetchAll(
-                db,
-                sql: "SELECT identifier FROM grdb_migrations ORDER BY rowid"
-            )
-            let entryCount = try Int.fetchOne(
-                db,
-                sql: "SELECT COUNT(*) FROM \(Self.tableName)"
-            ) ?? 0
-            return HistoryStoreHealth(
-                journalMode: journalMode,
-                appliedMigrationIdentifiers: migrations,
-                retentionPolicy: policy,
-                entryCount: entryCount
-            )
+            try Self.makeHealth(in: db, policy: policy)
         }
+    }
+
+    private static func makeHealth(
+        in db: Database,
+        policy: HistoryRetentionPolicy
+    ) throws -> HistoryStoreHealth {
+        let journalMode = (
+            try String.fetchOne(db, sql: "PRAGMA journal_mode") ?? "unknown"
+        ).lowercased()
+        let migrations = try String.fetchAll(
+            db,
+            sql: "SELECT identifier FROM grdb_migrations ORDER BY rowid"
+        )
+        let entryCount = try Int.fetchOne(
+            db,
+            sql: "SELECT COUNT(*) FROM \(Self.tableName)"
+        ) ?? 0
+        let pendingEntryCount = try Int.fetchOne(
+            db,
+            sql: "SELECT COUNT(*) FROM \(Self.tableName) WHERE \(Column.deliveryStatus) = ?",
+            arguments: [HistoryDeliveryStatus.pending.rawValue]
+        ) ?? 0
+        let lastDeliveryRaw = try String.fetchOne(
+            db,
+            sql: """
+                SELECT \(Column.deliveryStatus)
+                FROM \(Self.tableName)
+                ORDER BY \(Column.timestamp) DESC, \(Column.rowID) DESC
+                LIMIT 1
+                """
+        )
+        let lastDeliveryStatus = lastDeliveryRaw.flatMap(HistoryDeliveryStatus.init(rawValue:))
+        let quickCheck = try String.fetchOne(db, sql: "PRAGMA quick_check(1)")
+        let integrityCheckPassed = quickCheck?.lowercased() == "ok"
+            && (lastDeliveryRaw == nil || lastDeliveryStatus != nil)
+
+        return HistoryStoreHealth(
+            journalMode: journalMode,
+            appliedMigrationIdentifiers: migrations,
+            retentionPolicy: policy,
+            entryCount: entryCount,
+            pendingEntryCount: pendingEntryCount,
+            lastDeliveryStatus: lastDeliveryStatus,
+            integrityCheckPassed: integrityCheckPassed
+        )
     }
 
     func databaseColumnNames() throws -> [String] {

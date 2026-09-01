@@ -1,6 +1,6 @@
 # Local Dictation v1 acceptance matrix
 
-Snapshot: 2026-08-31. “Implemented” refers only to source in this checkout. “Automated-verified” refers to the 149-test SwiftPM run across 23 suites on this host. “Fixture-verified” refers only to synthetic scorer fixtures. “Pending” and “blocked” rows are not product claims.
+Snapshot: 2026-08-31. “Implemented” refers only to source in this checkout. “Automated-verified” refers to the 166-test SwiftPM run across 27 suites on this host. “Fixture-verified” refers only to synthetic scorer fixtures. “Pending” and “blocked” rows are not product claims.
 
 ## Evidence states
 
@@ -16,7 +16,7 @@ Snapshot: 2026-08-31. “Implemented” refers only to source in this checkout. 
 
 | ID | Acceptance requirement | Evidence/method | Current state |
 |---|---|---|---|
-| BEN-001 | Manifest carries category, device, noise, duration, verbatim reference, protected tokens, provenance, and audio path. | JSON Schema plus CLI validation. | Fixture-verified with synthetic records. |
+| BEN-001 | Manifest carries category, device, noise, duration, verbatim reference, protected tokens, provenance, and audio path. | JSON Schema plus production-runner validation. | Automated-verified for required/unknown fields, category, provenance, identifiers, and protected-reference alignment; no real corpus exists. |
 | BEN-002 | Corpus has at least 20 fresh opt-in recordings across all approved categories. | Corpus audit; no source-control audio assumption. | Pending benchmark; repository contains no real audio. |
 | BEN-003 | Cleanup set has at least 10 separate raw-to-ideal pairs. | Cleanup schema and corpus count. | Pending benchmark; three synthetic structure examples are not the corpus. |
 | BEN-004 | No existing Raycast recording is used without explicit recording-specific opt-in. | Provenance review and corpus inventory. | Required; bundled fixtures are synthetic only. |
@@ -30,6 +30,7 @@ Snapshot: 2026-08-31. “Implemented” refers only to source in this checkout. 
 | BEN-012 | Final report covers Parakeet v2/v3 and WhisperKit `small.en`/`large-v3_turbo` with exact versions/configuration. | Candidate-run provenance and report review. | Pending benchmark. |
 | BEN-013 | Lazy live-preview Parakeet EOU 320 ms is scored separately from final engines. | Separate live report and UI lag measurements. | Pending benchmark. |
 | BEN-014 | Domain accuracy equals/exceeds paired Raycast results before cutover. | Paired opt-in recordings and locked normalization. | Pending benchmark; Raycast stays. |
+| BEN-015 | Production corpus runs use the app's authoritative final engines, load owned models offline by default, require explicit preparation authority, checkpoint atomically, and record sanitized provenance. | Shared speech target plus fake-engine/CLI/checkpoint contracts. | Automated-verified at the contract boundary; real inference through all four engines remains pending. |
 
 ## Controls, overlay, and insertion
 
@@ -40,7 +41,7 @@ Snapshot: 2026-08-31. “Implemented” refers only to source in this checkout. 
 | UX-003 | Enter, Option+Enter, Shift+Enter, and Option+Shift+Enter map to approved modes/delivery. | Coordinator and event-policy unit tests plus app manual matrix. | Automated-verified for approved variants, numeric-pad origin, and pass-through of unsupported Return modifiers; manual matrix pending. |
 | UX-004 | Any interleaved non-modifier typing permanently leaves all Enter variants to the foreground app for that session. | Unit test and Slack/terminal/manual app switching. | Automated-verified at coordinator boundary; manual evidence pending. |
 | UX-005 | Finish Enter is swallowed, including repeats/empty recordings; no synthetic Return or auto-submit exists. | Event-tap integration and terminal/Slack observation. | Repeated finalization swallowing is automated-verified; real event-tap/manual evidence pending. |
-| UX-006 | Escape always cancels active/in-flight work and discards temporary audio. | Unit plus temporary-file integration test. | Coordinator cancellation is automated-verified; app/file lifecycle is source-observed and manual integration remains. |
+| UX-006 | Escape always cancels active/in-flight work and discards temporary audio. | Unit plus temporary-file integration test. | Generation detachment and immediate restart are automated-verified, including preservation of the old cancellation snapshot; app/file lifecycle still needs manual integration. |
 | UX-007 | Non-activating overlay never steals focus across apps, Spaces, or full-screen windows. | Manual matrix with focus logging. | Pending manual. |
 | UX-008 | Destination/profile resolve at finish after arbitrary app switching. | Cross-app integration test. | Finish-time profile selection is automated-verified; real cross-app destination exercise pending. |
 | UX-009 | Preview returns to the exact captured destination or reviewed focus token, otherwise leaves verified clipboard/history recovery. | Preview destination invalidation tests. | Automated-verified for tier classification, reactivation intent, invalid/focus-lost fallback, and secure refusal; real AX preview round trip remains pending. |
@@ -79,12 +80,14 @@ Snapshot: 2026-08-31. “Implemented” refers only to source in this checkout. 
 | PRV-005 | API keys remain in Keychain and are redacted from every artifact. | Keychain test double and repository/log scan. | Keychain storage and static source audit observed; end-to-end log/artifact exercise pending. |
 | REL-001 | Sleep/wake and microphone unplug/switch recover without relaunch. | Repeated manual matrix on supported hardware. | Pending manual. |
 | REL-002 | Zero lost raw transcripts in test week. | History audit across real use. | Pending cutover trial. |
+| DIAG-001 | Diagnostics expose only allowlisted operational states/counts and never content-bearing fields or raw dynamic errors. | Closed snapshot contract, sentinel non-leak test, read-only history-health test, and static privacy audit. | Automated-verified; runtime unified-log/file review remains pending. |
+| DIAG-002 | One dictation emits the fixed nine-event timing catalog with opaque request correlation; unrelated copies do not enter the trace. | Signpost catalog/hotkey/insertion contracts. | Automated-verified structurally; Instruments measurement remains pending. |
 
 ## Quantitative performance gates
 
 | ID | Gate | Measurement | Current state |
 |---|---|---|---|
-| PERF-001 | Hotkey key-down to overlay p95 `<=100 ms`. | Signposts over repeated real hotkey events. | Unbenchmarked. |
+| PERF-001 | Hotkey key-down to overlay p95 `<=100 ms`. | Signposts over repeated real hotkey events. | Fixed correlated signposts are automated-verified; p95 remains unbenchmarked. |
 | PERF-002 | Deterministic-only median stop-to-paste `<=700 ms` for typical short dictations. | Warm-engine end-to-end corpus run. | Unbenchmarked; CLI uses 700 ms as provisional median ceiling. |
 | PERF-003 | Local-refiner median stop-to-paste `<=1.2 s`. | Warm local-refiner end-to-end corpus run. | Unbenchmarked. |
 | PERF-004 | Local-refiner p95 stop-to-paste `<=2.5 s`. | Warm local-refiner end-to-end corpus run. | Unbenchmarked; CLI uses 2500 ms as provisional p95 ceiling. |
@@ -109,7 +112,7 @@ Snapshot: 2026-08-31. “Implemented” refers only to source in this checkout. 
 | ID | Observation | Evidence | Consequence |
 |---|---|---|---|
 | TOOL-001 | Host is macOS 26.6.2 with Xcode 26.6 (17F113). Normal `xcrun --sdk macosx --find swiftc` fails while loading `libxcodebuildLoader.dylib`: `CoreDevice.framework` references `_XPCTypeBool`, expected in `Mercury.framework`. | Reproduced during this benchmark work. | Normal developer-tool resolution is unreliable. |
-| TOOL-002 | Direct SwiftPM invocation through the Xcode toolchain works when supplied the SDK plus Developer Framework search paths, even though `xcrun` remains broken. | Current run built the app and passed 149 tests in 23 suites. | Automated source contracts are usable on this host; the documented setup script contains the workaround. Repairing Xcode remains advisable for normal tooling. |
+| TOOL-002 | Direct SwiftPM invocation through the Xcode toolchain works when supplied the SDK plus Developer Framework search paths, even though `xcrun` remains broken. | Current run built the app and passed 166 tests in 27 suites. | Automated source contracts are usable on this host; the documented setup script contains the workaround. Repairing Xcode remains advisable for normal tooling. |
 | TOOL-003 | Pure benchmark sources compile with direct `swiftc`, explicit SDK, target `arm64-apple-macosx15.0`, and a writable module cache. | `Benchmark/verify-fixtures.sh` passed. | Scorer mechanics are independently verifiable; this does not clear TOOL-001/002 for the application. |
 | TOOL-004 | Source packaging puts required SwiftPM resource bundles under `Contents/Resources`, signs nested code before the app, and restores its generated dependency checkout. | Reusable app-bundle verifier plus isolated-home CI packaging with an explicit CI-only ad-hoc requirement. | Source implementation present; real per-machine identity creation and two-build TCC retention remain manual gates. Notarization and downloadable binary distribution remain deferred. |
 

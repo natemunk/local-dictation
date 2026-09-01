@@ -27,13 +27,20 @@ final class TextInserter {
     private let pasteSimulator: @MainActor () -> Bool
     private let privateClipboardMode: @MainActor () -> Bool
     private let yieldBeforeValidation: @MainActor () async -> Void
+    private let performanceSignpost: @MainActor (DictationPerformanceEvent, UInt64) -> Void
 
-    init(privateClipboardMode: @escaping @MainActor () -> Bool = { false }) {
+    init(
+        privateClipboardMode: @escaping @MainActor () -> Bool = { false },
+        performanceSignpost: @escaping @MainActor (DictationPerformanceEvent, UInt64) -> Void = {
+            DictationPerformanceSignposts.emit($0, correlationID: $1)
+        }
+    ) {
         pasteboard = .general
         accessibilityPermission = { AXIsProcessTrusted() }
         pasteSimulator = { TextInserter.postSyntheticPaste() }
         self.privateClipboardMode = privateClipboardMode
         yieldBeforeValidation = { await Task.yield() }
+        self.performanceSignpost = performanceSignpost
     }
 
     init(
@@ -41,13 +48,17 @@ final class TextInserter {
         accessibilityPermission: @escaping @MainActor () -> Bool,
         pasteSimulator: @escaping @MainActor () -> Bool,
         privateClipboardMode: @escaping @MainActor () -> Bool = { false },
-        yieldBeforeValidation: @escaping @MainActor () async -> Void = { await Task.yield() }
+        yieldBeforeValidation: @escaping @MainActor () async -> Void = { await Task.yield() },
+        performanceSignpost: @escaping @MainActor (DictationPerformanceEvent, UInt64) -> Void = {
+            DictationPerformanceSignposts.emit($0, correlationID: $1)
+        }
     ) {
         self.pasteboard = pasteboard
         self.accessibilityPermission = accessibilityPermission
         self.pasteSimulator = pasteSimulator
         self.privateClipboardMode = privateClipboardMode
         self.yieldBeforeValidation = yieldBeforeValidation
+        self.performanceSignpost = performanceSignpost
     }
 
     static func hasAccessibilityPermission() -> Bool {
@@ -66,7 +77,8 @@ final class TextInserter {
     func insertText(
         _ text: String,
         destination: DictationDestination?,
-        reactivateDestination: Bool = false
+        reactivateDestination: Bool = false,
+        performanceCorrelationID: UInt64? = nil
     ) async -> InsertionOutcome {
         guard !Task.isCancelled else { return .cancelled }
 
@@ -75,7 +87,10 @@ final class TextInserter {
             return .historyOnly(reason: "Secure fields cannot receive dictation or history paste")
         }
 
-        guard let transcriptChangeCount = writeTranscript(text) else {
+        guard let transcriptChangeCount = writeTranscript(
+            text,
+            performanceCorrelationID: performanceCorrelationID
+        ) else {
             return .historyOnly(reason: "Could not write the transcript to the clipboard")
         }
 
@@ -123,15 +138,21 @@ final class TextInserter {
             )
         }
 
+        if let performanceCorrelationID {
+            performanceSignpost(.pasteEventPost, performanceCorrelationID)
+        }
         return .pasteEventSent
     }
 
     @discardableResult
     func copyOnly(_ text: String) -> Bool {
-        writeTranscript(text) != nil
+        writeTranscript(text, performanceCorrelationID: nil) != nil
     }
 
-    private func writeTranscript(_ text: String) -> Int? {
+    private func writeTranscript(
+        _ text: String,
+        performanceCorrelationID: UInt64?
+    ) -> Int? {
         pasteboard.clearContents()
         let wrote: Bool
         if privateClipboardMode() {
@@ -144,6 +165,9 @@ final class TextInserter {
             wrote = pasteboard.setString(text, forType: .string)
         }
         guard wrote else { return nil }
+        if let performanceCorrelationID {
+            performanceSignpost(.clipboardWrite, performanceCorrelationID)
+        }
         return pasteboard.changeCount
     }
 

@@ -20,6 +20,56 @@ struct OpenAICompatibleRefinerConfiguration: Equatable, Sendable {
         self.allowRemote = allowRemote
         self.deadline = deadline
     }
+
+    func endpointDisposition() throws -> OpenAICompatibleEndpointDisposition {
+        guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw OpenAICompatibleRefinerError.emptyModel
+        }
+        guard let components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false),
+              let scheme = components.scheme?.lowercased(),
+              let host = components.host?.lowercased(),
+              ["http", "https"].contains(scheme),
+              components.user == nil,
+              components.password == nil,
+              components.query == nil,
+              components.fragment == nil
+        else {
+            throw OpenAICompatibleRefinerError.invalidEndpoint(
+                "use an absolute HTTP(S) URL without credentials, query, or fragment"
+            )
+        }
+        guard components.path == "/v1/chat/completions" else {
+            throw OpenAICompatibleRefinerError.invalidEndpointPath(components.path)
+        }
+
+        if Self.isLoopbackHost(host) {
+            return .loopback
+        }
+        guard allowRemote else {
+            throw OpenAICompatibleRefinerError.remoteEndpointNotAllowed(host)
+        }
+        guard scheme == "https" else {
+            throw OpenAICompatibleRefinerError.insecureRemoteEndpoint(host)
+        }
+        return .remoteAllowed
+    }
+
+    private static func isLoopbackHost(_ host: String) -> Bool {
+        if host == "localhost" || host.hasSuffix(".localhost") || host == "::1" {
+            return true
+        }
+        let octets = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard octets.count == 4,
+              let first = UInt8(octets[0]),
+              octets.dropFirst().allSatisfy({ UInt8($0) != nil })
+        else { return false }
+        return first == 127
+    }
+}
+
+enum OpenAICompatibleEndpointDisposition: Equatable, Sendable {
+    case loopback
+    case remoteAllowed
 }
 
 enum OpenAICompatibleRefinerError: Error, Equatable, CustomStringConvertible, Sendable {
@@ -116,45 +166,7 @@ final class OpenAICompatibleRefiner: TextRefiner, @unchecked Sendable {
     }
 
     private func validateConfiguration() throws {
-        guard !configuration.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw OpenAICompatibleRefinerError.emptyModel
-        }
-        guard let components = URLComponents(url: configuration.endpoint, resolvingAgainstBaseURL: false),
-              let scheme = components.scheme?.lowercased(),
-              let host = components.host?.lowercased(),
-              ["http", "https"].contains(scheme),
-              components.user == nil,
-              components.password == nil,
-              components.query == nil,
-              components.fragment == nil
-        else {
-            throw OpenAICompatibleRefinerError.invalidEndpoint(
-                "use an absolute HTTP(S) URL without credentials, query, or fragment"
-            )
-        }
-        guard components.path == "/v1/chat/completions" else {
-            throw OpenAICompatibleRefinerError.invalidEndpointPath(components.path)
-        }
-
-        let isLoopback = isLoopbackHost(host)
-        guard isLoopback || configuration.allowRemote else {
-            throw OpenAICompatibleRefinerError.remoteEndpointNotAllowed(host)
-        }
-        if !isLoopback, scheme != "https" {
-            throw OpenAICompatibleRefinerError.insecureRemoteEndpoint(host)
-        }
-    }
-
-    private func isLoopbackHost(_ host: String) -> Bool {
-        if host == "localhost" || host.hasSuffix(".localhost") || host == "::1" {
-            return true
-        }
-        let octets = host.split(separator: ".", omittingEmptySubsequences: false)
-        guard octets.count == 4,
-              let first = UInt8(octets[0]),
-              octets.dropFirst().allSatisfy({ UInt8($0) != nil })
-        else { return false }
-        return first == 127
+        _ = try configuration.endpointDisposition()
     }
 }
 

@@ -7,8 +7,13 @@ let package = Package(
         .macOS(.v15)
     ],
     products: [
+        .library(name: "LocalDictationSpeech", targets: ["LocalDictationSpeech"]),
         .executable(name: "LocalDictation", targets: ["LocalDictation"]),
-        .executable(name: "local-dictation-benchmark", targets: ["LocalDictationBenchmark"])
+        .executable(name: "local-dictation-benchmark", targets: ["LocalDictationBenchmark"]),
+        .executable(
+            name: "local-dictation-corpus-runner",
+            targets: ["LocalDictationCorpusRunner"]
+        )
     ],
     dependencies: [
         .package(url: "https://github.com/argmaxinc/WhisperKit.git", exact: "0.15.0"),
@@ -17,9 +22,18 @@ let package = Package(
         .package(url: "https://github.com/LebJe/TOMLKit.git", exact: "0.6.0")
     ],
     targets: [
+        .target(
+            name: "LocalDictationSpeech",
+            dependencies: [
+                "WhisperKit",
+                .product(name: "FluidAudio", package: "FluidAudio")
+            ],
+            path: "Overwhisper/SpeechLayer"
+        ),
         .executableTarget(
             name: "LocalDictation",
             dependencies: [
+                "LocalDictationSpeech",
                 "WhisperKit",
                 .product(name: "FluidAudio", package: "FluidAudio"),
                 .product(name: "GRDB", package: "GRDB.swift"),
@@ -28,7 +42,8 @@ let package = Package(
             path: "Overwhisper",
             exclude: [
                 "Info.plist",
-                "Overwhisper.entitlements"
+                "Overwhisper.entitlements",
+                "SpeechLayer"
             ],
             resources: [
                 .process("Resources")
@@ -39,10 +54,23 @@ let package = Package(
             path: "Benchmark",
             exclude: ["Fixtures", "Schemas", "README.md", "verify-fixtures.sh"]
         ),
+        .executableTarget(
+            name: "LocalDictationCorpusRunner",
+            dependencies: ["LocalDictationSpeech"],
+            path: "CorpusRunner"
+        ),
         .testTarget(
             name: "LocalDictationTests",
             dependencies: ["LocalDictation"],
             path: "Tests/OverwhisperTests"
+        ),
+        .testTarget(
+            name: "LocalDictationCorpusRunnerTests",
+            dependencies: [
+                "LocalDictationSpeech",
+                "LocalDictationCorpusRunner"
+            ],
+            path: "Tests/CorpusRunnerTests"
         )
     ],
     swiftLanguageModes: [.v5]

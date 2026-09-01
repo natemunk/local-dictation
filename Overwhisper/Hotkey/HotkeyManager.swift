@@ -44,6 +44,7 @@ final class HotkeyManager {
     private let coordinator: DictationCoordinator
     private let profileMode: () -> DictationMode
     private let effectHandler: ([DictationCoordinatorEffect]) -> Void
+    private let performanceSignpost: @MainActor (DictationPerformanceEvent, UInt64) -> Void
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var pendingKeyUps: [UInt16: PendingKeyUp] = [:]
@@ -59,11 +60,15 @@ final class HotkeyManager {
     init(
         coordinator: DictationCoordinator,
         profileMode: @escaping () -> DictationMode,
-        effectHandler: @escaping ([DictationCoordinatorEffect]) -> Void
+        effectHandler: @escaping ([DictationCoordinatorEffect]) -> Void,
+        performanceSignpost: @escaping @MainActor (DictationPerformanceEvent, UInt64) -> Void = {
+            DictationPerformanceSignposts.emit($0, correlationID: $1)
+        }
     ) {
         self.coordinator = coordinator
         self.profileMode = profileMode
         self.effectHandler = effectHandler
+        self.performanceSignpost = performanceSignpost
     }
 
     var isMonitoring: Bool {
@@ -194,9 +199,7 @@ final class HotkeyManager {
             do {
                 try self.rebuild(reason: "tap disabled by \(reason) and re-enable failed")
             } catch {
-                AppLogger.hotkey.error(
-                    "Hyper+D event tap rebuild failed: \(error.localizedDescription, privacy: .public)"
-                )
+                AppLogger.hotkey.error("Hyper+D event tap rebuild failed")
             }
         }
     }
@@ -250,6 +253,9 @@ final class HotkeyManager {
             physicalDDown = true
             logicalDReleaseHandled = false
             response = coordinator.hotkeyDown(at: timestamp, profileMode: profileMode())
+            if case .startCapture(let token) = response.effects.first {
+                performanceSignpost(.hotkey, token.generation)
+            }
 
         case .keyUp where isDKey && physicalDDown:
             if !logicalDReleaseHandled {

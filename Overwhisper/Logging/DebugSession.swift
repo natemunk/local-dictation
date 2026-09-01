@@ -88,7 +88,7 @@ final class DebugSessionStore: ObservableObject {
         fileSize = (attrs?[.size] as? NSNumber)?.int64Value
         audioDuration = Self.duration(of: dest)
       } catch {
-        AppLogger.app.error("DebugSessionStore: failed to move audio: \(error.localizedDescription)")
+        AppLogger.app.error("DebugSessionStore could not retain local audio")
       }
     }
 
@@ -147,7 +147,7 @@ final class DebugSessionStore: ObservableObject {
       let decoded = try JSONDecoder.iso8601().decode([TranscriptionDebugSession].self, from: data)
       sessions = decoded
     } catch {
-      AppLogger.app.error("DebugSessionStore: failed to load: \(error.localizedDescription)")
+      AppLogger.app.error("DebugSessionStore could not load retained metadata")
     }
   }
 
@@ -157,7 +157,7 @@ final class DebugSessionStore: ObservableObject {
       let data = try JSONEncoder.iso8601().encode(sessions)
       try data.write(to: metadataURL, options: .atomic)
     } catch {
-      AppLogger.app.error("DebugSessionStore: failed to persist: \(error.localizedDescription)")
+      AppLogger.app.error("DebugSessionStore could not persist retained metadata")
     }
   }
 

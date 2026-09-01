@@ -209,9 +209,40 @@ struct HistoryStoreHealth: Equatable, Sendable {
     let appliedMigrationIdentifiers: [String]
     let retentionPolicy: HistoryRetentionPolicy
     let entryCount: Int
+    let pendingEntryCount: Int
+    let lastDeliveryStatus: HistoryDeliveryStatus?
+    let integrityCheckPassed: Bool
+
+    init(
+        journalMode: String,
+        appliedMigrationIdentifiers: [String],
+        retentionPolicy: HistoryRetentionPolicy,
+        entryCount: Int,
+        pendingEntryCount: Int = 0,
+        lastDeliveryStatus: HistoryDeliveryStatus? = nil,
+        integrityCheckPassed: Bool = true
+    ) {
+        self.journalMode = journalMode
+        self.appliedMigrationIdentifiers = appliedMigrationIdentifiers
+        self.retentionPolicy = retentionPolicy
+        self.entryCount = entryCount
+        self.pendingEntryCount = pendingEntryCount
+        self.lastDeliveryStatus = lastDeliveryStatus
+        self.integrityCheckPassed = integrityCheckPassed
+    }
 
     var migrations: [String] { appliedMigrationIdentifiers }
     var retentionDays: Int { retentionPolicy.retentionDays }
+
+    func isOperational(expectedMigrationIdentifiers: [String]) -> Bool {
+        journalMode.caseInsensitiveCompare("wal") == .orderedSame
+            && appliedMigrationIdentifiers == expectedMigrationIdentifiers
+            && integrityCheckPassed
+            && entryCount >= 0
+            && pendingEntryCount >= 0
+            && pendingEntryCount <= entryCount
+            && (entryCount == 0 || lastDeliveryStatus != nil)
+    }
 }
 
 struct HistoryEntry: Equatable, Identifiable, Sendable {

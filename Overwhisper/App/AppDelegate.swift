@@ -7,45 +7,12 @@ enum AppEnvironment {
     static let isDevBuild = Bundle.main.bundleIdentifier == nil
 }
 
-private struct ActiveDictationSession {
-    let token: DictationSessionToken
-    let startedAt: Date
-    let engine: (any TranscriptionEngine)?
-    let streamingTranscriber: (any StreamingTranscriber)?
-    let asrSelection: ASRSelection
-    var state: DictationPhase = .recording
-    var destination: DictationDestination?
-    var profile: DictationProfile
-    var rawText = ""
-    var deliveredText = ""
-    var historyID: UUID?
-    var refinementStatus: HistoryRefinementStatus = .notRequested
-    var asrOutcome = "final"
-    var refinerBackend: String?
-    var refinementOutcome: String?
-    var validationFailureKind: String?
-    var refinementError: String?
-    var stoppedAt: Date?
-    var pastedRaw = false
-    var cleanupMode: CleanupMode = .clean
-    var deliveryCommitted = false
-    var interleavedTyping = false
-    var cancellationRequested = false
-    var warnedAtTenMinutes = false
-    var durationCapTriggered = false
-    var audioURL: URL?
-    var finalizationTask: Task<Void, Never>?
-    var streamingStartTask: Task<AsyncStream<TranscriptUpdate>?, Never>?
-    var streamingUpdatesTask: Task<Void, Never>?
-    var captureWatchdog: Task<Void, Never>?
-    var finalizationWatchdog: Task<Void, Never>?
-}
-
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let appState = AppState()
 
     private let coordinator = DictationCoordinator(tapHoldThreshold: 0.350)
+    private let sessionController = DictationSessionController()
     private let configurationStore = ConfigurationStore()
     private let pasteAgainQueue = SerializedPasteAgainQueue()
     private var configuration = ConfigurationSnapshot.typedDefaults
@@ -77,7 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var historyMaintenanceTask: Task<Void, Never>?
     private var engineReloadPending = false
     private var historyRepasteDestination: DictationDestination?
-    private var activeSession: ActiveDictationSession?
+    private var activeSession: DictationSession? { sessionController.active }
 
     private static let onboardingKey = "LocalDictation.hasCompletedOnboarding.v1"
     private static let configurationDirectory = FileManager.default.homeDirectoryForCurrentUser
@@ -315,6 +282,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] status in
                 guard let self else { return }
+                self.appState.recordModelDiagnostic(status)
                 self.appState.isDownloadingModel = status.phase == .downloading
                     || status.phase == .repairing
                 self.appState.isInitializingEngine = [
@@ -464,17 +432,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     await self?.finishCapture(request)
                 }
             case .cancel(let token):
-                guard matchesActiveSession(token) else { continue }
-                updateSession(token) {
-                    $0.cancellationRequested = true
-                    $0.finalizationTask?.cancel()
-                    $0.streamingStartTask?.cancel()
-                    $0.streamingUpdatesTask?.cancel()
-                }
-                Task { @MainActor [weak self] in
-                    await Task.yield()
-                    await self?.cancelActiveSession(token: token)
-                }
+                cancelSessionImmediately(token: token)
             case .interleavedTypingChanged(let token, let detected):
                 guard isCurrent(token) else { continue }
                 updateSession(token) { $0.interleavedTyping = detected }
@@ -490,23 +448,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func isCurrent(_ token: DictationSessionToken) -> Bool {
-        guard let session = activeSession else { return false }
-        return session.token == token && !session.cancellationRequested
+        sessionController.isCurrent(token)
     }
 
     private func matchesActiveSession(_ token: DictationSessionToken) -> Bool {
-        activeSession?.token == token
+        sessionController.matches(token)
     }
 
     @discardableResult
     private func updateSession(
         _ token: DictationSessionToken,
-        _ update: (inout ActiveDictationSession) -> Void
+        _ update: (inout DictationSession) -> Void
     ) -> Bool {
-        guard var session = activeSession, session.token == token else { return false }
-        update(&session)
-        activeSession = session
-        return true
+        sessionController.update(token, update)
     }
 
     private func beginCapture(token: DictationSessionToken) {
@@ -514,22 +468,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if let prior = activeSession, prior.token != token {
             retireRuntime(prior)
+            _ = sessionController.clear(prior.token)
+            DictationPerformanceSignposts.emit(
+                .completion,
+                correlationID: prior.token.generation
+            )
         }
 
         let placeholderProfile = ProfileCatalog.nativeDefaults["default"]!
-        activeSession = ActiveDictationSession(
+        sessionController.install(DictationSession(
             token: token,
             startedAt: Date(),
             engine: transcriptionEngine,
             streamingTranscriber: streamingTranscriber,
             asrSelection: appState.asrSelection,
             profile: placeholderProfile
-        )
+        ))
 
         // These happen before permission checks or model work so the key-down
         // feedback path stays under the 100 ms product gate.
         appState.beginRecording()
         overlayWindow.show(position: appState.overlayPosition, token: token)
+        DictationPerformanceSignposts.emit(.overlay, correlationID: token.generation)
 
         let watchdog = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(2))
@@ -557,6 +517,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         do {
             let samples = try audioRecorder.startRecording()
+            DictationPerformanceSignposts.emit(.captureReady, correlationID: token.generation)
             updateSession(token) {
                 $0.captureWatchdog?.cancel()
                 $0.captureWatchdog = nil
@@ -582,13 +543,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         session.streamingStartTask?.cancel()
         session.streamingUpdatesTask?.cancel()
 
+        appState.recordEOUDiagnostic(.preparing)
         let startTask = Task<AsyncStream<TranscriptUpdate>?, Never> {
             do {
-                return try await streamingTranscriber.start(samples: samples)
+                let updates = try await streamingTranscriber.start(samples: samples)
+                self.appState.recordEOUDiagnostic(.streaming)
+                return updates
             } catch {
-                AppLogger.transcription.error(
-                    "Live transcription could not start: \(error.localizedDescription)"
-                )
+                self.appState.recordEOUDiagnostic(.degraded)
+                AppLogger.transcription.error("Live transcription could not start")
                 if self.isCurrent(token),
                    self.appState.phase == .recording,
                    !self.appState.interleavedTyping {
@@ -646,11 +609,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             let final = try await streamingTranscriber.finish()
             guard isCurrent(token) else { return nil }
+            appState.recordEOUDiagnostic(.configured)
             appState.liveTranscript = LiveTranscript(finalized: final.text, volatile: "")
             return final
         } catch {
+            appState.recordEOUDiagnostic(.degraded)
             AppLogger.transcription.error(
-                "Live transcription did not produce a final result: \(error.localizedDescription)"
+                "Live transcription did not produce a final result"
             )
             return nil
         }
@@ -664,12 +629,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             $0.streamingStartTask = nil
             $0.streamingUpdatesTask = nil
         }
+        if appState.diagnosticRuntimeState.eou != .degraded {
+            appState.recordEOUDiagnostic(.configured)
+        }
         guard let streamingTranscriber = session.streamingTranscriber else { return }
         Task { await streamingTranscriber.cancel() }
     }
 
     private func beginFinalization(_ request: DictationFinishRequest) {
         guard isCurrent(request.token) else { return }
+        DictationPerformanceSignposts.emit(
+            .stop,
+            correlationID: request.token.generation
+        )
         updateSession(request.token) {
             $0.state = .finalizing
             $0.stoppedAt = Date()
@@ -760,6 +732,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 let raw = try await engine.transcribe(audioURL: audioURL)
                 let decision = ASRFinalizationPolicy.authoritative(raw)
+                DictationPerformanceSignposts.emit(
+                    .asr,
+                    correlationID: request.token.generation
+                )
                 // Batch ASR is authoritative. Never wait for a result that will
                 // be discarded; cancel optional EOU work immediately.
                 streamingFinalTask.cancel()
@@ -784,6 +760,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             } catch {
                 guard !Task.isCancelled, self.isCurrent(request.token) else { return }
+                DictationPerformanceSignposts.emit(
+                    .asr,
+                    correlationID: request.token.generation
+                )
                 let fallback = ASRFinalizationPolicy.recoverFromEOU(
                     self.appState.liveTranscript.displayed
                 )
@@ -990,6 +970,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 token: token,
                 refinementLatency: Date().timeIntervalSince(refinementStarted)
             )
+            DictationPerformanceSignposts.emit(
+                .cleanup,
+                correlationID: token.generation
+            )
         } catch is CancellationError {
             return
         } catch {
@@ -1016,6 +1000,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     refinementLatency: Date().timeIntervalSince(refinementStarted)
                 )
             }
+            DictationPerformanceSignposts.emit(
+                .cleanup,
+                correlationID: token.generation
+            )
         }
 
         AppLogger.transcription.info("Local ASR complete in \(String(format: "%.3f", asrLatency)) seconds")
@@ -1068,8 +1056,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let outcome = await textInserter.insertText(
             insertionText,
             destination: session.destination,
-            reactivateDestination: reactivateDestination
+            reactivateDestination: reactivateDestination,
+            performanceCorrelationID: token.generation
         )
+        appState.recordInsertionDiagnostic(outcome)
         guard isCurrent(token) else { return }
 
         switch outcome {
@@ -1161,12 +1151,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         execute(coordinator.escapePressed().effects)
     }
 
-    private func cancelActiveSession(token: DictationSessionToken) async {
-        guard let session = activeSession, session.token == token else { return }
+    private func cancelSessionImmediately(token: DictationSessionToken) {
+        guard matchesActiveSession(token) else { return }
         let pasteMayHaveBeenCommitted = appState.phase == .pasting
-        session.finalizationTask?.cancel()
+        updateSession(token) {
+            $0.cancellationRequested = true
+            $0.finalizationTask?.cancel()
+            $0.streamingStartTask?.cancel()
+            $0.streamingUpdatesTask?.cancel()
+        }
         cancelStreamingSession(token: token)
         if audioRecorder.isRecording { audioRecorder.cancelRecording() }
+        guard let session = activeSession, session.token == token else { return }
+        retireRuntime(session)
+        _ = sessionController.clear(token)
+        DictationPerformanceSignposts.emit(
+            .completion,
+            correlationID: token.generation
+        )
+        appState.resetSessionUI()
+        if engineReloadPending { initializeEngine() }
+
+        Task { [weak self] in
+            await self?.persistCancellation(
+                for: session,
+                pasteMayHaveBeenCommitted: pasteMayHaveBeenCommitted
+            )
+        }
+    }
+
+    private func persistCancellation(
+        for session: DictationSession,
+        pasteMayHaveBeenCommitted: Bool
+    ) async {
         if !session.deliveryCommitted,
            let historyID = session.historyID,
            let historyStore {
@@ -1182,8 +1199,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 )
             )
         }
-        previewWindow.close(token: token)
-        completeSession(token: token)
     }
 
     private func failSession(token: DictationSessionToken, _ message: String) {
@@ -1208,7 +1223,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         overlayWindow.show(position: appState.overlayPosition, token: token)
         retireRuntime(session, hideOverlay: false)
         _ = coordinator.complete(token: token)
-        activeSession = nil
+        _ = sessionController.clear(token)
+        DictationPerformanceSignposts.emit(
+            .completion,
+            correlationID: token.generation
+        )
 
         Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(3))
@@ -1229,7 +1248,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let toastMessage = appState.overlayMessage
         retireRuntime(session, hideOverlay: toastDuration == nil)
         _ = coordinator.complete(token: token)
-        activeSession = nil
+        _ = sessionController.clear(token)
+        DictationPerformanceSignposts.emit(
+            .completion,
+            correlationID: token.generation
+        )
         appState.resetSessionUI()
         if engineReloadPending { initializeEngine() }
         guard let toastDuration else { return }
@@ -1245,7 +1268,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func retireRuntime(
-        _ session: ActiveDictationSession,
+        _ session: DictationSession,
         hideOverlay: Bool = true
     ) {
         session.finalizationTask?.cancel()
@@ -1253,6 +1276,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         session.streamingUpdatesTask?.cancel()
         session.captureWatchdog?.cancel()
         session.finalizationWatchdog?.cancel()
+        if activeSession?.token == session.token,
+           audioRecorder?.isRecording == true {
+            audioRecorder.cancelRecording()
+        }
         if let streamingTranscriber = session.streamingTranscriber {
             Task { await streamingTranscriber.cancel() }
         }
@@ -1352,6 +1379,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateRefinerPrivacyState()
         appState.configurationDiagnostic = result.diagnostic?.message
         appState.configurationNotices = result.notices.map(\.message)
+        appState.recordConfigurationDiagnostic(
+            generation: configurationStore.generation,
+            applied: result.applied,
+            historyRetentionDays: configuration.app.historySuccessRetentionDays
+        )
         if let historyStore {
             startHistoryMaintenance(for: historyStore)
         }
@@ -1380,6 +1412,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let store = try HistoryStore(databaseURL: directory.appendingPathComponent("history.sqlite"))
             historyStore = store
             startHistoryMaintenance(for: store)
+            Task { @MainActor [weak self, store] in
+                guard let self else { return }
+                do {
+                    self.appState.updateHistoryDiagnosticHealth(
+                        try await store.health(
+                            policy: HistoryRetentionPolicy(
+                                retentionDays: self.configuration.app.historySuccessRetentionDays
+                            )
+                        )
+                    )
+                } catch {
+                    // Diagnostics remain unavailable; runtime history errors
+                    // continue to use the existing user-facing error channel.
+                }
+            }
         } catch {
             appState.lastError = "History is unavailable: \(error.localizedDescription)"
         }
@@ -1394,6 +1441,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             while !Task.isCancelled {
                 do {
                     _ = try await store.pruneEntries(policy: policy)
+                    self?.appState.updateHistoryDiagnosticHealth(
+                        try await store.health(policy: policy)
+                    )
                 } catch is CancellationError {
                     return
                 } catch {
@@ -1517,13 +1567,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .deterministic:
             return "deterministic"
         case .openAICompatible:
-            return configuration.app.refinerEndpoint != nil
-                && configuration.app.refinerModel != nil
+            return configuredRefinerEndpointDisposition != nil
                 ? "openai_compatible"
                 : "deterministic"
         case .auto:
-            if configuration.app.refinerEndpoint != nil,
-               configuration.app.refinerModel != nil {
+            if configuredRefinerEndpointDisposition != nil {
                 return "openai_compatible"
             }
             return SystemAppleFoundationModelAdapter().availability() == .available
@@ -1565,6 +1613,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let endpoint = configuration.app.refinerEndpoint,
               let model = configuration.app.refinerModel
         else { return nil }
+        let endpointConfiguration = OpenAICompatibleRefinerConfiguration(
+            endpoint: endpoint,
+            model: model,
+            apiKey: nil,
+            allowRemote: configuration.app.allowRemote,
+            deadline: deadline
+        )
+        guard (try? endpointConfiguration.endpointDisposition()) != nil else {
+            return nil
+        }
         let key = appState.refinerAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
         return OpenAICompatibleRefiner(
             configuration: OpenAICompatibleRefinerConfiguration(
@@ -1577,22 +1635,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
+    private var configuredRefinerEndpointDisposition: OpenAICompatibleEndpointDisposition? {
+        guard let endpoint = configuration.app.refinerEndpoint,
+              let model = configuration.app.refinerModel
+        else { return nil }
+        return try? OpenAICompatibleRefinerConfiguration(
+            endpoint: endpoint,
+            model: model,
+            allowRemote: configuration.app.allowRemote
+        ).endpointDisposition()
+    }
+
     private var configuredRefinerIsRemote: Bool {
         guard appState.experimentalModelCleanupEnabled,
-              configuration.app.refinerMode != .deterministic,
-              let host = configuration.app.refinerEndpoint?.host?.lowercased()
+              configuration.app.refinerMode != .deterministic
         else { return false }
-        if host == "localhost" || host.hasSuffix(".localhost") || host == "::1" {
-            return false
-        }
-        let octets = host.split(separator: ".", omittingEmptySubsequences: false)
-        if octets.count == 4,
-           octets.allSatisfy({ UInt8($0) != nil }),
-           octets.first == "127"
-        {
-            return false
-        }
-        return true
+        return configuredRefinerEndpointDisposition == .remoteAllowed
     }
 
     private func retainDebugRecordingIfEnabled(
@@ -1798,6 +1856,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 destination: destination,
                 reactivateDestination: reactivateDestination
             )
+            self.appState.recordInsertionDiagnostic(outcome)
             switch outcome {
             case .pasteEventSent:
                 self.appState.lastError = nil
@@ -1875,6 +1934,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         engineTask?.cancel()
         engineCoordinator.cancelPreparation(selection: appState.asrSelection)
         streamingTranscriber = nil
+        appState.recordEOUDiagnostic(.unavailable)
         transcriptionEngine = nil
         appState.engineReady = false
         appState.isInitializingEngine = true
@@ -1889,6 +1949,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // One delayed FluidAudio EOU path serves every authoritative
                 // engine and never participates in onboarding readiness.
                 self.streamingTranscriber = FluidAudioParakeetStreamingTranscriber()
+                self.appState.recordEOUDiagnostic(.configured)
                 self.appState.engineReady = true
                 self.appState.lastError = nil
             } catch is CancellationError {
@@ -1899,6 +1960,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard self.appState.asrSelection == selection else { return }
                 self.transcriptionEngine = nil
                 self.streamingTranscriber = nil
+                self.appState.recordEOUDiagnostic(.unavailable)
                 self.appState.engineReady = false
                 self.appState.lastError = error.localizedDescription
             }
@@ -1923,7 +1985,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } catch {
             appState.lastError = error.localizedDescription
             appState.hotkeyMonitoringError = error.localizedDescription
-            AppLogger.hotkey.error("Hyper+D monitoring failed: \(error.localizedDescription, privacy: .public)")
+            AppLogger.hotkey.error("Hyper+D monitoring failed")
         }
         refreshPermissionDiagnostics()
     }
@@ -1968,6 +2030,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appState.inputMonitoringGranted = CGPreflightListenEventAccess()
         appState.accessibilityGranted = AXIsProcessTrusted()
         appState.hotkeyMonitoringActive = hotkeyManager?.isMonitoring ?? false
+        appState.recordTapDiagnostic(
+            disableCount: hotkeyManager?.tapDisableCount ?? 0,
+            rebuildCount: hotkeyManager?.tapRebuildCount ?? 0,
+            lastReason: hotkeyManager?.lastTapDisableReason
+        )
     }
 
     private func openPrivacyPane(_ anchor: String) {
@@ -2161,12 +2228,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard self.appState.asrSelection == selection else { return }
                 self.transcriptionEngine = prepared.engine
                 self.streamingTranscriber = FluidAudioParakeetStreamingTranscriber()
+                self.appState.recordEOUDiagnostic(.configured)
                 self.appState.engineReady = true
                 self.appState.lastError = nil
             } catch {
                 guard self.appState.asrSelection == selection else { return }
                 self.transcriptionEngine = nil
                 self.streamingTranscriber = nil
+                self.appState.recordEOUDiagnostic(.unavailable)
                 self.appState.engineReady = false
                 self.appState.lastError = "Model verification failed: \(error.localizedDescription)"
             }
@@ -2190,6 +2259,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         engineTask?.cancel()
         transcriptionEngine = nil
         streamingTranscriber = nil
+        appState.recordEOUDiagnostic(.unavailable)
         appState.engineReady = false
         engineTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -2198,6 +2268,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard self.appState.asrSelection == selection else { return }
                 self.transcriptionEngine = prepared.engine
                 self.streamingTranscriber = FluidAudioParakeetStreamingTranscriber()
+                self.appState.recordEOUDiagnostic(.configured)
                 self.appState.engineReady = true
                 self.appState.lastError = nil
             } catch {

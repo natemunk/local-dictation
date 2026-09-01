@@ -12,6 +12,10 @@
     "latency_failure"
   ],
   "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+[.][0-9]+[.][0-9]+$"
+    },
     "sample_id": {
       "type": "string",
       "minLength": 1
@@ -22,17 +26,35 @@
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
     },
     "transcript": {
-      "type": ["string", "null"]
+      "type": ["string", "null"],
+      "description": "Authoritative final ASR output before cleanup; retained for scorer compatibility."
+    },
+    "raw_output": {
+      "type": ["string", "null"],
+      "description": "Authoritative final ASR output before commands, cleanup, or insertion."
     },
     "processing_seconds": {
       "type": ["number", "null"],
       "minimum": 0,
-      "description": "Wall-clock processing time used for RTF."
+      "description": "Wall-clock final-engine processing time used for RTF."
     },
     "latency_ms": {
       "type": ["number", "null"],
       "minimum": 0,
-      "description": "Audio-end to final-transcript latency for percentile reporting."
+      "description": "Final-ASR file-dispatch to authoritative-transcript time; not stop-to-paste latency."
+    },
+    "latency_scope": {
+      "type": "string",
+      "enum": ["final_asr_file_dispatch_to_authoritative_transcript"]
+    },
+    "rtf": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "description": "Per-record processing_seconds divided by measured audio_duration_seconds."
+    },
+    "audio_duration_seconds": {
+      "type": ["number", "null"],
+      "exclusiveMinimum": 0
     },
     "status": {
       "type": "string",
@@ -44,10 +66,141 @@
     },
     "latency_failure": {
       "type": "boolean",
-      "description": "True when run instrumentation observed a latency failure not expressible by aggregate thresholds."
+      "description": "True when run instrumentation observed a timeout/stall not expressible by aggregate thresholds."
     },
     "error": {
+      "type": ["string", "null"],
+      "maxLength": 2049,
+      "description": "Sanitized error text with user, corpus, and model-root paths redacted."
+    },
+    "error_type": {
       "type": ["string", "null"]
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "model_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runner",
+        "runner_version",
+        "run_id",
+        "manifest_provenance",
+        "audio_path",
+        "device",
+        "noise",
+        "model_selection",
+        "model_variant",
+        "adapter_version",
+        "source_host",
+        "preparation_performed",
+        "language",
+        "host_os",
+        "host_architecture",
+        "started_at",
+        "finished_at"
+      ],
+      "properties": {
+        "runner": {
+          "const": "local-dictation-corpus-runner"
+        },
+        "runner_version": {
+          "type": "string",
+          "pattern": "^[0-9]+[.][0-9]+[.][0-9]+$"
+        },
+        "run_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "run_label": {
+          "type": ["string", "null"]
+        },
+        "manifest_provenance": {
+          "type": "string",
+          "enum": ["synthetic", "fresh-opt-in"]
+        },
+        "audio_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Manifest-declared relative path, or a safe manifest-audio filename label for absolute inputs."
+        },
+        "audio_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "audio_bytes": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "device": {
+          "type": "string",
+          "minLength": 1
+        },
+        "noise": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model_selection": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model_variant": {
+          "type": "string",
+          "minLength": 1
+        },
+        "adapter_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_host": {
+          "type": "string",
+          "minLength": 1
+        },
+        "installed_at": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "payload_relative_path": {
+          "type": ["string", "null"]
+        },
+        "preparation_performed": {
+          "type": "boolean"
+        },
+        "engine_load_seconds": {
+          "type": ["number", "null"],
+          "minimum": 0
+        },
+        "language": {
+          "type": "string",
+          "minLength": 1
+        },
+        "custom_vocabulary_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "host_os": {
+          "type": "string",
+          "minLength": 1
+        },
+        "host_architecture": {
+          "type": "string",
+          "minLength": 1
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "finished_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
     }
   }
 }

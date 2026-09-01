@@ -9,7 +9,9 @@ The normative source is Nate's approved Local Dictation v1 implementation plan f
 - The seed is the MIT-licensed Overwhisper repository at commit [`b8ef86e`](https://github.com/OverseedAI/overwhisper/tree/b8ef86eb2fda65d7dcc68ab500fb371469c4d283), with attribution preserved in [LICENSE](../LICENSE).
 - [Package.swift](../Package.swift) currently identifies `LocalDictation`, targets macOS 15+, and pins WhisperKit `0.15.0`, FluidAudio `0.14.3`, GRDB `7.10.0`, and TOMLKit `0.6.0`. This is source state, not runtime proof.
 - [DictationCoordinator.swift](../Overwhisper/Core/DictationCoordinator.swift) contains the intended phase vocabulary and control state machine. Its presence is not proof that every app integration path works.
+- [DictationSessionController.swift](../Overwhisper/Core/DictationSessionController.swift) is the sole owner of active generation-scoped tasks and artifacts. Its tests cover stale mutation/cleanup and immediate Escape-to-restart ownership.
 - [TranscriptionEngine.swift](../Overwhisper/Transcription/TranscriptionEngine.swift) contains the streaming protocol and separate finalized/volatile transcript buffer. No live-engine benchmark has validated it.
+- [SpeechLayer](../Overwhisper/SpeechLayer) contains the reusable authoritative final-ASR/model-loading layer used by both the app and [CorpusRunner](../CorpusRunner). Corpus-runner contract tests use a fake production engine; no real model inference is claimed.
 - [Benchmark](../Benchmark) is independently compilable and its synthetic fixtures verify scorer mechanics only. The fixtures are not engine measurements.
 
 “Required” below means approved behavior. “Observed” means present in the current checkout. “Verified” is reserved for a named test or measurement that actually ran.
@@ -179,6 +181,13 @@ Browser hostname profiles and Apple Events execution are removed from v1. Generi
 - All successful, failed, pending, and cancelled history defaults to 90-day retention, pruned at launch and daily. History supports FTS plus escaped literal fallback, copy, serialized Paste Again, raw-versus-polished inspection, explicit vocabulary correction, delete entry, and delete all.
 - Temporary audio is deleted after ASR or cancellation, and crash orphans are cleaned on launch. Debug audio retention is explicit and capped at the latest 10 recordings.
 
+## Diagnostics and performance instrumentation
+
+- Settings exposes a privacy-safe Diagnostics panel for Microphone, Input Monitoring, Accessibility, event-tap health/rebuild counts, selected owned model lifecycle, EOU preview state, last-known-good configuration, history WAL/migrations/retention/integrity, and the last insertion policy outcome.
+- The copied diagnostic report is a closed allowlist of enums, booleans, and counts. Transcript text, clipboard contents, audio, browser/URL/hostname data, API keys, destination identity, focused-field content, raw paths, and dynamic error descriptions are structurally absent.
+- Fixed signposts cover hotkey, overlay, capture readiness, stop, final ASR, cleanup, clipboard write, paste-event post, and completion. One request is correlated through an opaque signpost ID; ordinary clipboard/history actions do not enter a dictation timing trace.
+- Instrumentation presence is not performance evidence. The quantitative gates still require real repeated measurements.
+
 ## Distribution and non-goals
 
 The source workflow must eventually take a developer coworker with Xcode and Command Line Tools from fresh clone to first dictation through documented `./setup` steps in under 15 minutes. Notarized binaries remain deferred.
@@ -189,6 +198,7 @@ English is the only enabled v1 language. V1 excludes cursor-local or selected-te
 
 - No real audio corpus is included in this repository yet.
 - No listed ASR engine is currently selected by real measurements.
+- The production corpus runner exists and shares the app's authoritative final-engine layer, but no real corpus/model run was performed during this implementation pass.
 - Accuracy, RTF, stop-to-final latency, model warm-up behavior, idle CPU, recovery, and cross-app reliability remain unverified.
 - The synthetic benchmark fixtures prove arithmetic, gates, and selection behavior only.
 - On this host (macOS 26.6.2, Xcode 26.6 build 17F113), normal `xcrun` resolution currently fails because `CoreDevice.framework` references `_XPCTypeBool`, which is absent from the loaded `Mercury.framework`. The documented setup fallback invokes the selected Xcode toolchain and SDK directly; it builds/packages the app and the full SwiftPM test suite passes. Repairing Xcode remains advisable for normal developer-tool behavior. See [acceptance-matrix.md](acceptance-matrix.md#current-toolchain-state).

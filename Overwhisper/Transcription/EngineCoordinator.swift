@@ -1,7 +1,7 @@
 import Combine
 import Foundation
 
-enum EngineLifecyclePhase: String, Equatable, Sendable {
+enum EngineLifecyclePhase: String, Codable, Equatable, Sendable {
     case idle
     case checking
     case downloading

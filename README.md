@@ -106,23 +106,32 @@ Runtime behavior is intentionally small: terminals use Literal mode, ordinary ap
 
 History is actor-isolated GRDB/SQLite with WAL and FTS5. Raw text is saved before cleanup/delivery for every nonsecure session; successful, failed, pending, and cancelled rows share the configurable 90-day default retention. Search falls back to escaped literal matching when an FTS query cannot represent punctuation.
 
+## Diagnostics
+
+Settings → Diagnostics shows permission and Hyper+D event-tap health, tap disable/rebuild counts, the selected owned model and lifecycle state, EOU-preview availability, last-known-good configuration state, SQLite/WAL/retention health, and the last insertion policy outcome. **Copy Diagnostics** emits a closed, privacy-safe report made only from allowlisted states and counts. It never includes transcript or clipboard text, audio, browser data, API keys, destination identity, focused-field content, raw paths, or dynamic error descriptions.
+
+Privacy-safe signposts cover `hotkey`, `overlay`, `capture-ready`, `stop`, `ASR`, `cleanup`, `clipboard-write`, `paste-event-post`, and `completion`. They correlate one session with an opaque signpost ID and contain no request content. Their presence enables measurement; it does not establish that any latency gate has passed.
+
 ## Benchmark
 
-The repository includes a standalone scorer for:
+The repository includes two separate tools for:
 
 - FluidAudio Parakeet v2 English.
 - FluidAudio Parakeet v3 multilingual.
 - WhisperKit `small.en`.
 - WhisperKit `large-v3_turbo`.
 
-Build and inspect it with:
+`local-dictation-corpus-runner` executes the same shared production final-ASR implementations as the app and writes atomic, provenance-rich JSONL checkpoints. It loads existing Local Dictation-owned models offline by default; only the explicit `--allow-model-preparation` flag permits model download or repair. `local-dictation-benchmark` is a Foundation-only scorer for those results.
+
+Build and inspect both tools with:
 
 ```sh
+swift build --product local-dictation-corpus-runner
 swift build --product local-dictation-benchmark
 Benchmark/verify-fixtures.sh
 ```
 
-The synthetic fixtures verify scoring and selection mechanics only. They do not select an engine. Collect at least 20 fresh opt-in recordings and 10 raw-to-ideal cleanup pairs before invoking the real gate. See [Benchmark/README.md](Benchmark/README.md) and [docs/corpus-schema.md](docs/corpus-schema.md).
+The production runner and synthetic scorer fixtures are automated-verified, but no real audio was run during this hardening pass. The fixtures verify scoring and selection mechanics only and do not select an engine. Collect at least 20 fresh opt-in recordings and 10 raw-to-ideal cleanup pairs before invoking the real gate. See [Benchmark/README.md](Benchmark/README.md) and [docs/corpus-schema.md](docs/corpus-schema.md).
 
 ## Architecture
 
@@ -133,20 +142,26 @@ Overwhisper/
 ├── Cleanup/         # commands, vocabulary, refiners, alignment validator
 ├── Configuration/   # TOML defaults, overrides, importer
 ├── Core/            # testable dictation state machine
+├── Diagnostics/     # privacy-safe operational health panel/report
 ├── History/         # GRDB, SQLite, and FTS5
 ├── Hotkey/          # global event tap and typing interlock
+├── Logging/         # static logging and privacy-safe signposts
 ├── Output/          # destination capture and safe clipboard insertion
 ├── Profiles/        # bundle ID and AX role/subrole matching
+├── SpeechLayer/     # reusable production final-ASR/model ownership
 ├── Streaming/       # live finalized/volatile ASR adapters
-├── Transcription/   # local final-ASR candidates
+├── Transcription/   # app adapters and engine coordination
 └── UI/              # non-activating overlay, preview, settings, history
+
+CorpusRunner/        # production-engine corpus execution and checkpoints
+Benchmark/           # dependency-free WER/RTF/latency scorer and fixtures
 ```
 
 Core dependencies are pinned in `Package.resolved`: FluidAudio, WhisperKit, GRDB, and TOMLKit.
 
 ## Status and acceptance
 
-The full product requirements, corpus contracts, and acceptance matrix are checked in under [docs](docs). In particular, source compilation is not evidence that latency, accuracy, permissions, sleep/wake recovery, or the one-week Raycast cutover gates have passed.
+The current automated snapshot is 166 tests across 27 suites. The full product requirements, corpus contracts, and acceptance matrix are checked in under [docs](docs). Source compilation and contract tests are not evidence that latency, accuracy, permission retention, sleep/wake recovery, cross-app insertion, or the one-week Raycast cutover gates have passed.
 
 ## Origin and license
 

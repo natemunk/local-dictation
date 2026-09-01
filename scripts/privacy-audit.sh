@@ -16,8 +16,16 @@ for forbidden in \
   fi
 done
 
-if rg -n 'URLSession|http://' Overwhisper/Audio Overwhisper/Transcription; then
+if rg -n 'URLSession|http://' \
+  Overwhisper/Audio \
+  Overwhisper/Transcription \
+  Overwhisper/SpeechLayer; then
   print -u2 "Privacy audit failed: speech/audio code contains a network API."
+  exit 1
+fi
+
+if rg -n -U 'AppLogger\.[^(]+\([^)]*localizedDescription' Overwhisper --glob '*.swift'; then
+  print -u2 "Privacy audit failed: a dynamic error description can reach unified logging."
   exit 1
 fi
 

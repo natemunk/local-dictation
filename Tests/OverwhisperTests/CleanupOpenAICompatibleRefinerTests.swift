@@ -171,6 +171,30 @@ struct CleanupOpenAICompatibleRefinerTests {
         #expect(recorder.request?.url?.host == "api.example.com")
     }
 
+    @Test("effective endpoint disposition matches the Remote badge policy")
+    func endpointDisposition() throws {
+        let loopback = OpenAICompatibleRefinerConfiguration(
+            endpoint: URL(string: "http://127.0.0.1:8080/v1/chat/completions")!,
+            model: "cleaner"
+        )
+        #expect(try loopback.endpointDisposition() == .loopback)
+
+        let remote = OpenAICompatibleRefinerConfiguration(
+            endpoint: URL(string: "https://api.example.com/v1/chat/completions")!,
+            model: "cleaner",
+            allowRemote: true
+        )
+        #expect(try remote.endpointDisposition() == .remoteAllowed)
+
+        let blocked = OpenAICompatibleRefinerConfiguration(
+            endpoint: URL(string: "https://api.example.com/v1/chat/completions")!,
+            model: "cleaner"
+        )
+        #expect(throws: OpenAICompatibleRefinerError.self) {
+            _ = try blocked.endpointDisposition()
+        }
+    }
+
     @Test("deadline helper cancels a slow operation")
     func deadline() async {
         let clock = ContinuousClock()
