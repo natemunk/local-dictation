@@ -104,7 +104,10 @@ struct PrivacySafeDiagnosticsTests {
         #expect(snapshot.tap.rebuildCount == 1)
         #expect(snapshot.tap.lastReason == .other)
         #expect(snapshot.model.preparationGeneration == 7)
-        #expect(snapshot.model.ownedPath?.hasPrefix("~/Library/") == true)
+        #expect(
+            snapshot.model.ownedPath
+                == "~/Library/Application Support/LocalDictation/Models/v1/parakeet-v2/fluidaudio-0.14.3/current"
+        )
         #expect(snapshot.model.lastFailure == .initialization)
         #expect(snapshot.configuration.usingLastKnownGood)
         #expect(snapshot.history.retentionDays == 45)

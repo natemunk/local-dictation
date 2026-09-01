@@ -1,6 +1,6 @@
 # Local Dictation v1 acceptance matrix
 
-Snapshot: 2026-08-31. “Implemented” refers only to source in this checkout. “Automated-verified” refers to the 166-test SwiftPM run across 27 suites on this host. “Fixture-verified” refers only to synthetic scorer fixtures. “Pending” and “blocked” rows are not product claims.
+Snapshot: 2026-09-01. “Implemented” refers only to source in this checkout. “Automated-verified” refers to the 169-test SwiftPM run across 27 suites on this host. “Fixture-verified” refers only to synthetic scorer fixtures. “Pending” and “blocked” rows are not product claims.
 
 ## Evidence states
 
@@ -65,7 +65,7 @@ Snapshot: 2026-08-31. “Implemented” refers only to source in this checkout. 
 | CFG-001 | Defaults and local TOML overrides merge with local precedence; invalid reload preserves the last-known-good snapshot and compiled vocabulary. | Configuration unit tests. | Automated-verified, including same-generation cache reuse and a 300-entry personal pack. |
 | CFG-002 | Raycast import and history corrections require explicit user input, update the personal pack transactionally, and never read/learn silently. | Importer/editor unit tests and source audit. | Automated-verified. |
 | CFG-003 | Native profile precedence uses bundle ID and AX role/subrole; generic browser fallback is safe. | Profile resolution unit matrix. | Automated-verified. |
-| CFG-004 | Browser matching uses bundle IDs only; browser Apple Events/hostname execution and permission UI are absent. Legacy hostname settings are ignored with a diagnostic. | Source-surface and configuration/profile contracts. | Automated-verified; no Browser Automation permission matrix is required. |
+| CFG-004 | Browser matching uses bundle IDs only; browser Apple Events/hostname execution and permission UI are absent. Unambiguous legacy app keys migrate atomically; legacy profile hostname matches remain ignored with a diagnostic. | Source-surface and configuration/profile contracts. | Automated-verified; no Browser Automation permission matrix is required. |
 | HIS-001 | Raw transcript is saved before cleanup/insertion in GRDB/SQLite FTS5. | Transaction-order integration and crash injection. | Source-observed with automated raw-recovery/history contracts; process-crash injection pending. |
 | HIS-002 | Actor-isolated WAL history applies 90-day retention to every state at launch/daily and supports FTS/escaped search, copy/Paste Again, delete-entry, and delete-all. | Migration, actor-concurrency, WAL-health, search, and clock tests. | Automated-verified; daily scheduler is source-observed. |
 
@@ -112,9 +112,9 @@ Snapshot: 2026-08-31. “Implemented” refers only to source in this checkout. 
 | ID | Observation | Evidence | Consequence |
 |---|---|---|---|
 | TOOL-001 | Host is macOS 26.6.2 with Xcode 26.6 (17F113). Normal `xcrun --sdk macosx --find swiftc` fails while loading `libxcodebuildLoader.dylib`: `CoreDevice.framework` references `_XPCTypeBool`, expected in `Mercury.framework`. | Reproduced during this benchmark work. | Normal developer-tool resolution is unreliable. |
-| TOOL-002 | Direct SwiftPM invocation through the Xcode toolchain works when supplied the SDK plus Developer Framework search paths, even though `xcrun` remains broken. | Current run built the app and passed 166 tests in 27 suites. | Automated source contracts are usable on this host; the documented setup script contains the workaround. Repairing Xcode remains advisable for normal tooling. |
+| TOOL-002 | Direct SwiftPM invocation through the Xcode toolchain works when supplied the SDK plus Developer Framework search paths, even though `xcrun` remains broken. | Current run built the app and passed 169 tests in 27 suites. | Automated source contracts are usable on this host; the documented setup script contains the workaround. Repairing Xcode remains advisable for normal tooling. |
 | TOOL-003 | Pure benchmark sources compile with direct `swiftc`, explicit SDK, target `arm64-apple-macosx15.0`, and a writable module cache. | `Benchmark/verify-fixtures.sh` passed. | Scorer mechanics are independently verifiable; this does not clear TOOL-001/002 for the application. |
-| TOOL-004 | Source packaging puts required SwiftPM resource bundles under `Contents/Resources`, signs nested code before the app, and restores its generated dependency checkout. | Reusable app-bundle verifier plus isolated-home CI packaging with an explicit CI-only ad-hoc requirement. | Source implementation present; real per-machine identity creation and two-build TCC retention remain manual gates. Notarization and downloadable binary distribution remain deferred. |
+| TOOL-004 | Source packaging puts required SwiftPM resource bundles under `Contents/Resources`, signs nested code before the app, and restores its generated dependency checkout. | Reusable app-bundle verifier, isolated-home CI packaging, and two consecutive real installs on the current Mac using the same certificate-backed designated requirement. | Current-Mac Microphone, Input Monitoring, Accessibility, and Hyper+D readiness persisted across both installs; the agent also remained alive after Settings closed. Fresh-coworker reproduction remains pending. Notarization and downloadable binary distribution remain deferred. |
 
 ## Manual application matrix still required
 

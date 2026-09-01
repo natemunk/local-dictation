@@ -4,6 +4,48 @@ Local Dictation is a local-first macOS menu-bar dictation app for Apple Silicon.
 
 This repository is an active v1 implementation. The app builds and its automated unit/contract suite passes on the current development host, but the final speech-engine selection and Raycast cutover are deliberately **not claimed** until the checked-in benchmark and real-use gates pass.
 
+## Quick start
+
+Local Dictation currently ships as a source build. It does not require an Apple Developer Program membership, a subscription, or an API key. You need an Apple Silicon Mac running macOS 15 or newer, Xcode with Command Line Tools, Git, and an internet connection for the first build and model download.
+
+From the repository root, run:
+
+```sh
+./setup --configure-signing
+```
+
+The first run asks you to type `CREATE`, then requests your login-keychain password with hidden input. It creates one stable, code-signing-only identity for this Mac, runs the complete test suite, builds and verifies the app, and installs it at:
+
+```text
+~/Applications/Local Dictation.app
+```
+
+Do not run `--configure-signing` again after it succeeds. Future rebuilds and updates use plain `./setup`, which preserves the same macOS permission identity.
+
+On first launch:
+
+1. Allow Microphone, Input Monitoring, and Accessibility.
+2. Confirm the **Hyper+D listener** row says Ready.
+3. Choose **Prepare & Finish Setup**.
+4. Wait for the local model to move through Downloading, Validating, and Optimizing. The first download is roughly 600 MB and macOS optimization can take several minutes.
+5. Confirm Settings → Speech says **Ready**.
+
+For a first dictation, open Apple Notes, click in a blank note, tap Hyper+D, speak, then tap Hyper+D again. Local Dictation sends Command+V only if the destination is still safe. Otherwise, the transcript remains available on the clipboard and in Local Dictation History.
+
+## Opening Local Dictation
+
+Local Dictation normally lives behind the `LD` item in the right side of the macOS menu bar. Its menu provides Start/Finish Dictation, History, Configuration, Settings, and Quit.
+
+If macOS hides the item because the menu bar is crowded, launch `~/Applications/Local Dictation.app` again from Finder or Spotlight. The already-running app opens Settings instead of starting a duplicate. Settings → General shows live permission and Hyper+D health; Settings → Diagnostics provides a privacy-safe operational report.
+
+After pulling a source update, run:
+
+```sh
+./setup
+```
+
+Normal updates must not require another permission reset. Only an intentional signing-identity rotation should do that.
+
 ## Privacy boundary
 
 - Microphone audio always stays on the Mac.
@@ -34,7 +76,7 @@ Insertion is deliberately conservative. Local Dictation posts Command+V only to 
 
 The overlay warns at 10 minutes. Recording stops at the hard 15-minute cap and opens preview instead of inserting automatically; configuration may shorten this cap but cannot extend it.
 
-## Source build
+## Source-build details
 
 Requirements:
 
@@ -91,7 +133,7 @@ On first launch, macOS asks for:
 
 After the first stable-signed install, setup guides one final removal and re-add of the old Microphone, Input Monitoring, and Accessibility rows. Later builds use the exact same certificate-backed designated requirement, and setup aborts if that identity drifts. Intentional replacement requires `./setup --rotate-signing-identity` and another one-time permission reset. Settings → General refreshes permission and Hyper+D listener health while it is visible.
 
-No speech model is downloaded before you choose **Prepare & Finish Setup** in onboarding. Onboarding completes only after Microphone, Input Monitoring, Accessibility, the Hyper+D event tap, and the selected local model are all ready. That explicit action downloads the selected model from `huggingface.co` into `~/Library/Application Support/Local Dictation/Models/v1/`; the default model is roughly 600 MB, and later transcription remains local. Verify and Repair operate only on that owned model tree.
+No speech model is downloaded before you choose **Prepare & Finish Setup** in onboarding. Onboarding completes only after Microphone, Input Monitoring, Accessibility, the Hyper+D event tap, and the selected local model are all ready. That explicit action downloads the selected model from `huggingface.co` into `~/Library/Application Support/LocalDictation/Models/v1/`; the default model is roughly 600 MB, and later transcription remains local. Verify and Repair operate only on that owned model tree.
 
 Browser Automation is not used or requested. Browser behavior is selected only by bundle ID, with no page URL or hostname access.
 
@@ -114,6 +156,20 @@ Local values override typed defaults. A malformed edit is rejected transactional
 Runtime behavior is intentionally small: terminals use Literal mode, ordinary apps use Clean prose with explicit formatting only, and Linear uses Clean structured paragraphs with protected ticket IDs. Friendly app matches cover Slack, Notes, Notion, and generic browsers without duplicating policy. Legacy hostname settings are parsed as ignored values and surfaced as a configuration notice.
 
 History is actor-isolated GRDB/SQLite with WAL and FTS5. Raw text is saved before cleanup/delivery for every nonsecure session; successful, failed, pending, and cancelled rows share the configurable 90-day default retention. Search falls back to escaped literal matching when an FTS query cannot represent punctuation.
+
+## Troubleshooting
+
+| Symptom | What to check |
+|---|---|
+| Hyper+D does nothing | Open Settings → General. Microphone, Input Monitoring, Accessibility, and Hyper+D listener should all say Ready. Use **Refresh** and then **Retry Hyper+D** after changing a macOS permission. |
+| The model appears stuck | Settings → Speech now distinguishes Downloading, Validating, and Optimizing. First-time download and Core ML optimization can take several minutes. If it reaches an explicit failure, use **Verify** first and **Repair** only when needed; Repair touches only Local Dictation-owned model files. |
+| Configuration says Degraded | Current builds automatically remove the obsolete `browser_profiles_enabled`/`hostname_matching_enabled` app flags and rename `history_success_retention_days` to `history_retention_days` without changing its value. Remaining notices identify an exact file and usually mean an old profile still contains a now-ignored `hostnames` match; remove that entry and choose Settings → General → **Reload**. |
+| Dictation reaches the clipboard but not the field | This is the safe fallback when focus changed, the destination could not be revalidated, or the app is not on the reviewed insertion allowlist. Return to the field and press Command+V, or use History → Paste Again. |
+| The `LD` menu item is missing | Open `~/Applications/Local Dictation.app` from Finder or Spotlight. If Settings opens and Diagnostics says Hyper+D is Ready, the agent is running and macOS is only hiding the crowded menu-bar item. |
+| A rebuild asks for permissions again | Use plain `./setup`; do not recreate or rotate the signing identity. Settings → General shows the current permission state. Rotation is intentionally the only workflow that requires another one-time reset. |
+| You need support evidence | Use Settings → Diagnostics → **Copy Diagnostics**. The report contains only allowlisted states and counts—never transcript text, clipboard contents, audio, API keys, browser data, or focused-field content. |
+
+User-editable configuration lives at `~/.config/local-dictation/`. Local model data lives at `~/Library/Application Support/LocalDictation/Models/v1/`. History and temporary-audio lifecycle are managed by the app; normal audio is deleted after transcription or cancellation.
 
 ## Diagnostics
 
@@ -170,7 +226,7 @@ Core dependencies are pinned in `Package.resolved`: FluidAudio, WhisperKit, GRDB
 
 ## Status and acceptance
 
-The current automated snapshot is 166 tests across 27 suites. The full product requirements, corpus contracts, and acceptance matrix are checked in under [docs](docs). Source compilation and contract tests are not evidence that latency, accuracy, permission retention, sleep/wake recovery, cross-app insertion, or the one-week Raycast cutover gates have passed.
+The current automated snapshot is 169 tests across 27 suites. On the current development Mac, two consecutive same-identity source installs retained Microphone, Input Monitoring, Accessibility, and Hyper+D readiness, and the menu-bar agent remained alive after Settings closed. The full product requirements, corpus contracts, and acceptance matrix are checked in under [docs](docs). Source compilation and contract tests are not evidence that latency, accuracy, sleep/wake recovery, the full cross-app insertion matrix, or the one-week Raycast cutover gates have passed.
 
 ## Origin and license
 

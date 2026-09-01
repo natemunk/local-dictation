@@ -553,8 +553,10 @@ struct PrivacySafeDiagnosticSnapshot: Equatable, Encodable, Sendable {
     }
 
     private static func expectedOwnedModelPath(for selection: ASRSelection) -> String {
-        "~/Library/Application Support/Local Dictation/Models/v1/"
+        "~/Library/Application Support/LocalDictation/Models/v1/"
             + selection.storageName
+            + "/"
+            + selection.adapterVersion
             + "/current"
     }
 

@@ -56,6 +56,7 @@ final class ConfigurationStore {
     func bootstrapAndReload() -> ConfigurationReloadResult {
         do {
             try createInitialFilesIfNeeded()
+            try migrateLegacyAppConfigurationIfNeeded()
         } catch {
             return reject(
                 ConfigurationDiagnostic(
@@ -66,6 +67,80 @@ final class ConfigurationStore {
             )
         }
         return reload()
+    }
+
+    /// Migrates only legacy top-level app keys whose modern meaning is
+    /// unambiguous. The file is decoded first and replaced atomically, so a
+    /// malformed or user-specific document is never partially rewritten.
+    /// Legacy profile hostname arrays remain notice-only because removing a
+    /// potentially multiline value safely requires explicit user review.
+    private func migrateLegacyAppConfigurationIfNeeded() throws {
+        let decoded = try TOMLDocumentCodec.decode(
+            AppConfigurationFile.self,
+            from: paths.appFile
+        )
+        let hasLegacyBrowserFlag = decoded.browserProfilesEnabled != nil
+            || decoded.hostnameMatchingEnabled != nil
+        let hasLegacyRetention = decoded.historySuccessRetentionDays != nil
+        guard hasLegacyBrowserFlag || hasLegacyRetention else { return }
+
+        let source = try String(contentsOf: paths.appFile, encoding: .utf8)
+        let hasCurrentRetention = decoded.historyRetentionDays != nil
+        var changed = false
+        var migratedLegacyRetention = false
+        let output = source
+            .components(separatedBy: "\n")
+            .compactMap { line -> String? in
+                guard let assignment = Self.topLevelAssignment(in: line) else {
+                    return line
+                }
+                switch assignment.key {
+                case "browser_profiles_enabled", "hostname_matching_enabled":
+                    changed = true
+                    return nil
+                case "history_success_retention_days":
+                    changed = true
+                    guard !hasCurrentRetention, !migratedLegacyRetention else {
+                        return nil
+                    }
+                    migratedLegacyRetention = true
+                    return assignment.indentation
+                        + "history_retention_days"
+                        + assignment.suffix
+                default:
+                    return line
+                }
+            }
+            .joined(separator: "\n")
+
+        guard changed else { return }
+        try Data(output.utf8).write(to: paths.appFile, options: [.atomic])
+    }
+
+    private static func topLevelAssignment(
+        in line: String
+    ) -> (key: String, indentation: String, suffix: String)? {
+        let indentation = String(line.prefix { $0 == " " || $0 == "\t" })
+        let content = line.dropFirst(indentation.count)
+        guard !content.isEmpty,
+              content.first != "#",
+              content.first != "[",
+              let equals = content.firstIndex(of: "=")
+        else { return nil }
+
+        let keyPortion = content[..<equals]
+        let key = keyPortion.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty,
+              key.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" })
+        else { return nil }
+        let separatorStart = keyPortion.lastIndex(where: { !$0.isWhitespace })
+            .map { keyPortion.index(after: $0) }
+            ?? keyPortion.startIndex
+        return (
+            key: key,
+            indentation: indentation,
+            suffix: String(content[separatorStart...])
+        )
     }
 
     @discardableResult

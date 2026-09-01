@@ -144,6 +144,44 @@ struct ConfigurationStoreTests {
         #expect(!generated.lowercased().contains("api_key"))
     }
 
+    @Test("bootstrap atomically migrates unambiguous legacy app keys")
+    func bootstrapMigratesLegacyAppKeys() throws {
+        let temporary = try TemporaryConfigurationDirectory()
+        defer { temporary.remove() }
+        let paths = ConfigurationPaths(rootDirectory: temporary.url)
+        let initial = ConfigurationStore(paths: paths)
+        #expect(initial.bootstrapAndReload().applied)
+
+        try Self.write(
+            """
+            # Keep this user comment.
+            version = 1
+            browser_profiles_enabled = true
+            hostname_matching_enabled = false
+            history_success_retention_days = 37
+            refiner_mode = "auto"
+            """,
+            to: paths.appFile
+        )
+
+        let migratedStore = ConfigurationStore(paths: paths)
+        let result = migratedStore.bootstrapAndReload()
+        let migrated = try String(contentsOf: paths.appFile, encoding: .utf8)
+
+        #expect(result.applied)
+        #expect(result.notices.isEmpty)
+        #expect(result.snapshot.app.historySuccessRetentionDays == 37)
+        #expect(migrated.contains("# Keep this user comment."))
+        #expect(migrated.contains("history_retention_days = 37"))
+        #expect(!migrated.contains("history_success_retention_days"))
+        #expect(!migrated.contains("browser_profiles_enabled"))
+        #expect(!migrated.contains("hostname_matching_enabled"))
+
+        let firstMigration = migrated
+        #expect(migratedStore.bootstrapAndReload().applied)
+        #expect(try String(contentsOf: paths.appFile, encoding: .utf8) == firstMigration)
+    }
+
     @Test("legacy hostname settings are ignored with a nonfatal notice")
     func legacyHostnameSettingsAreIgnored() throws {
         let temporary = try TemporaryConfigurationDirectory()
