@@ -109,6 +109,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         hotkeyManager?.stop()
         if audioRecorder?.isRecording == true { audioRecorder.cancelRecording() }
+        audioDeviceManager?.shutdown()
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -138,6 +139,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupComponents() {
         audioRecorder = AudioRecorder()
+        audioRecorder.onCallbackLoss = { [weak self] action in
+            self?.handleAudioCallbackLoss(action)
+        }
+        audioRecorder.onCaptureFailure = { [weak self] message in
+            self?.handleAudioCaptureFailure(message)
+        }
         audioDeviceManager = AudioDeviceManager()
         overlayWindow = OverlayWindow(appState: appState) { [weak self] in
             self?.cancelFromUI()
@@ -388,7 +395,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 beginFinalization(request)
                 Task { @MainActor [weak self] in
                     await Task.yield()
-                    self?.finishCapture(request)
+                    await self?.finishCapture(request)
                 }
             case .cancel(let token):
                 guard matchesActiveSession(token) else { continue }
@@ -602,7 +609,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appState.overlayMessage = "Finalizing"
     }
 
-    private func finishCapture(_ request: DictationFinishRequest) {
+    private func finishCapture(_ request: DictationFinishRequest) async {
         guard isCurrent(request.token) else { return }
         guard audioRecorder.isRecording else {
             failSession(token: request.token, "The microphone stopped before finalization could begin.")
@@ -619,7 +626,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let audioURL: URL
         do {
-            audioURL = try audioRecorder.stopRecording()
+            audioURL = try await audioRecorder.stopRecording()
             updateSession(request.token) { $0.audioURL = audioURL }
         } catch {
             failSession(token: request.token, "Could not finish the recording: \(error.localizedDescription)")
@@ -1052,6 +1059,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
+    private func handleAudioCallbackLoss(_ action: AudioCallbackLossAction) {
+        guard let token = activeSession?.token,
+              appState.phase == .recording
+        else { return }
+
+        switch action {
+        case .none:
+            return
+        case .finishInPreview:
+            appState.overlayMessage = "Microphone disconnected · opening preview"
+            execute(
+                coordinator.finishFromMenu(
+                    mode: currentProfileMode(),
+                    preview: true
+                ).effects
+            )
+        case .fail:
+            failSession(
+                token: token,
+                "The microphone stopped before any usable audio was captured."
+            )
+        }
+    }
+
+    private func handleAudioCaptureFailure(_ message: String) {
+        guard let token = activeSession?.token,
+              appState.phase == .recording
+        else { return }
+        failSession(token: token, "Audio capture failed: \(message)")
+    }
+
     private func currentProfileMode() -> DictationMode {
         let resolved = resolveCurrentProfile()
         appState.activeProfileName = profileDisplayName(resolved.profile)
@@ -1071,8 +1109,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         coordinator.updateTapHoldThreshold(
             Double(configuration.app.tapHoldThresholdMilliseconds) / 1_000
         )
-        appState.retainDebugAudio = configuration.app.debugAudioRetentionEnabled
-            || UserDefaults.standard.bool(forKey: LocalDictationPreferenceKey.retainDebugAudio)
+        let preferences = UserDefaults.standard
+        if preferences.object(forKey: LocalDictationPreferenceKey.retainDebugAudio) == nil,
+           configuration.app.debugAudioRetentionEnabled {
+            // One-time migration from the legacy TOML flag. UserDefaults is
+            // the sole owner after this value has been materialized.
+            preferences.set(true, forKey: LocalDictationPreferenceKey.retainDebugAudio)
+        }
+        appState.retainDebugAudio = preferences.bool(
+            forKey: LocalDictationPreferenceKey.retainDebugAudio
+        )
         appState.isRemoteRefiner = configuredRefinerIsRemote
         remoteMenuItem?.isHidden = !appState.isRemoteRefiner
         statusItem?.button?.toolTip = appState.isRemoteRefiner

@@ -32,6 +32,10 @@ class AudioDeviceManager: ObservableObject {
         return inputDevices.first { $0.id == defaultID }?.name
     }
 
+    func shutdown() {
+        stopMonitoring()
+    }
+
     func refreshDevices() {
         let devices = AudioDeviceManager.fetchInputDevices()
         let defaultID = AudioDeviceManager.defaultInputDeviceID()
@@ -213,57 +217,56 @@ class AudioDeviceManager: ObservableObject {
     }
 }
 
-class AudioRecorder: ObservableObject {
-    // Input-only HAL audio unit. We deliberately avoid AVAudioEngine here: its
-    // render loop is clocked by the system default *output* device, so a flaky
-    // output (e.g. Bluetooth headphones) can break input capture even when the
-    // mic itself is fine. A HAL output unit in input-only mode binds to exactly
-    // one input device and never opens an output/speaker device.
+@MainActor
+final class AudioRecorder: ObservableObject {
     private var inputUnit: AudioUnit?
-    private var clientFormat: AVAudioFormat?
-    private var recordingFormat: AVAudioFormat?
-    private var audioFile: AVAudioFile?
+    private var captureRuntime: AudioCaptureRuntime?
+    private var audioChunkSource: BoundedAudioChunkStream?
     private var recordingURL: URL?
     private var selectedInputDeviceID: AudioDeviceID?
-    private var converter: AVAudioConverter?
-    private var converterInputFormat: AVAudioFormat?
-    private var audioChunkSource: BoundedAudioChunkStream?
     private let audioChunkBufferingLimit: Int
+    private let realtimeRingCapacity: Int
+    private var healthTimer: Timer?
+    private var callbackLossHandled = false
+    private var captureFailureHandled = false
 
-    @Published var currentLevel: Float = 0.0
-    @Published var isRecording: Bool = false
+    @Published var currentLevel: Float = 0
+    @Published var isRecording = false
+    @Published private(set) var microphoneDisconnected = false
 
-    /// Highest per-buffer RMS amplitude (linear, 0..1) observed during the most
-    /// recent recording. Reset on each `startRecording()` call.
     private(set) var peakRMS: Float = 0
-
-    /// Mean RMS amplitude (linear, 0..1) across the entire most recent recording,
-    /// computed as `sqrt(sumOfSquares / totalFrames)` over the raw mic channel.
-    /// Reset on each `startRecording()` call. Use this — not `peakRMS` — to gate
-    /// silent recordings, because a single mic transient can push peak above any
-    /// threshold even when the bulk of the recording is silence.
     private(set) var meanRMS: Float = 0
-
-    /// Number of live chunks dropped because transcription did not keep up with
-    /// the bounded stream. Sequence numbers expose the same gap to consumers.
     private(set) var droppedAudioChunkCount = 0
+    private(set) var realtimeOverflowCount: UInt64 = 0
+    private(set) var oversizedCallbackCount: UInt64 = 0
 
-    private var sumOfSquares: Double = 0
-    private var totalSamples: Int = 0
+    var onCallbackLoss: ((AudioCallbackLossAction) -> Void)?
+    var onCaptureFailure: ((String) -> Void)?
 
-    private let sampleRate: Double = 16000  // Whisper optimal
-    private let channels: AVAudioChannelCount = 1  // Mono
+    private let sampleRate: Double = 16_000
+    private let channels: AVAudioChannelCount = 1
 
-    private var levelUpdateTimer: Timer?
-
-    init(audioChunkBufferingLimit: Int = 128) {
+    init(
+        audioChunkBufferingLimit: Int = 128,
+        realtimeRingCapacity: Int = 64
+    ) {
         precondition(audioChunkBufferingLimit > 0)
+        precondition(realtimeRingCapacity > 1)
         self.audioChunkBufferingLimit = audioChunkBufferingLimit
+        self.realtimeRingCapacity = realtimeRingCapacity
+    }
+
+    deinit {
+        healthTimer?.invalidate()
+        if let unit = inputUnit {
+            _ = AudioOutputUnitStop(unit)
+            _ = AudioUnitUninitialize(unit)
+            AudioComponentInstanceDispose(unit)
+        }
+        captureRuntime?.requestCancel()
     }
 
     func setInputDevice(_ device: AudioInputDevice?) {
-        // The device is bound when recording actually starts (makeInputUnit),
-        // so here we only remember the selection.
         selectedInputDeviceID = device?.id
     }
 
@@ -275,14 +278,7 @@ class AudioRecorder: ObservableObject {
             }
             return audioChunkSource.stream
         }
-        loggedOnce.removeAll()
-        peakRMS = 0
-        meanRMS = 0
-        sumOfSquares = 0
-        totalSamples = 0
-        droppedAudioChunkCount = 0
 
-        // Check microphone permission before opening the device
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
             break
@@ -292,517 +288,442 @@ class AudioRecorder: ObservableObject {
             throw AudioRecorderError.noPermission
         }
 
-        // Create temporary file for recording
-        let tempDir = FileManager.default.temporaryDirectory
-        let fileName = "local_dictation_recording_\(UUID().uuidString).wav"
-        let url = tempDir.appendingPathComponent(fileName)
+        resetPublishedMetrics()
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "local_dictation_recording_\(UUID().uuidString).wav"
+        )
         recordingURL = url
 
-        // Resolve the input device: explicit selection, else the system default
-        // input. A HAL unit defaults to the default *output* device, so the input
-        // device must always be bound explicitly.
-        guard let deviceID = selectedInputDeviceID ?? AudioDeviceManager.defaultInputDeviceID() else {
-            throw AudioRecorderError.deviceConfigurationFailed
-        }
-
-        // Build the input unit, falling back to the default input device if the
-        // explicitly-selected one can't be opened.
-        let unit: AudioUnit
-        let client: AVAudioFormat
         do {
-            (unit, client) = try makeInputUnit(deviceID: deviceID)
-        } catch {
-            guard let fallback = AudioDeviceManager.defaultInputDeviceID(), fallback != deviceID else {
-                throw error
+            guard let requestedDeviceID = selectedInputDeviceID
+                    ?? AudioDeviceManager.defaultInputDeviceID()
+            else {
+                throw AudioRecorderError.deviceConfigurationFailed
             }
-            AppLogger.audio.error("Input device \(deviceID) failed to open — falling back to system default")
-            selectedInputDeviceID = nil
-            (unit, client) = try makeInputUnit(deviceID: fallback)
-        }
-        inputUnit = unit
-        clientFormat = client
 
-        AppLogger.audio.info(
-            "Recording start — device id \(deviceID, privacy: .public) (\(self.selectedInputDeviceID == nil ? "system default" : "selected", privacy: .public)), input format: \(client.sampleRate, privacy: .public) Hz, \(client.channelCount, privacy: .public) ch"
-        )
+            let unit: AudioUnit
+            let clientFormat: AVAudioFormat
+            let maximumFrames: Int
+            let activeDeviceID: AudioDeviceID
+            do {
+                (unit, clientFormat, maximumFrames) = try makeInputUnit(
+                    deviceID: requestedDeviceID
+                )
+                activeDeviceID = requestedDeviceID
+            } catch {
+                guard let fallback = AudioDeviceManager.defaultInputDeviceID(),
+                      fallback != requestedDeviceID
+                else { throw error }
+                AppLogger.audio.error(
+                    "Input device \(requestedDeviceID) failed to open; using the system default"
+                )
+                selectedInputDeviceID = nil
+                (unit, clientFormat, maximumFrames) = try makeInputUnit(
+                    deviceID: fallback
+                )
+                activeDeviceID = fallback
+            }
+            inputUnit = unit
 
-        // Target format for transcription: 16kHz mono float32
-        guard let recording = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: sampleRate,
-            channels: channels,
-            interleaved: false
-        ) else {
-            cleanupAfterFailure()
-            throw AudioRecorderError.invalidFormat
-        }
-        recordingFormat = recording
-
-        converter = nil
-        converterInputFormat = nil
-
-        // On-disk format: 16kHz mono 16-bit PCM WAV
-        let outputFormat = AVAudioFormat(
-            commonFormat: .pcmFormatInt16,
-            sampleRate: sampleRate,
-            channels: channels,
-            interleaved: true
-        )!
-
-        do {
-            audioFile = try AVAudioFile(
+            guard let canonicalFormat = AudioFormatFactory.noninterleavedFloat32(
+                sampleRate: sampleRate,
+                channels: channels
+            ) else {
+                throw AudioRecorderError.invalidFormat
+            }
+            let wavFormat = AVAudioFormat(
+                commonFormat: .pcmFormatInt16,
+                sampleRate: sampleRate,
+                channels: channels,
+                interleaved: true
+            )!
+            let audioFile = try AVAudioFile(
                 forWriting: url,
-                settings: outputFormat.settings,
+                settings: wavFormat.settings,
                 commonFormat: .pcmFormatFloat32,
                 interleaved: false
             )
+            let chunkSource = BoundedAudioChunkStream(
+                bufferingLimit: audioChunkBufferingLimit
+            )
+            let processor = try AudioCaptureProcessor(
+                inputFormat: clientFormat,
+                outputFormat: canonicalFormat,
+                maximumInputFrames: maximumFrames,
+                audioFile: audioFile,
+                chunkSource: chunkSource
+            )
+            let ring = AudioSPSCRing(
+                capacity: realtimeRingCapacity,
+                maxFrames: maximumFrames,
+                channels: Int(clientFormat.channelCount)
+            )
+            let renderContext = RealtimeAudioRenderContext(
+                unit: unit,
+                ring: ring,
+                channels: Int(clientFormat.channelCount),
+                maximumFrames: maximumFrames
+            )
+            let runtime = AudioCaptureRuntime(
+                renderContext: renderContext,
+                processor: processor
+            )
+            captureRuntime = runtime
+            audioChunkSource = chunkSource
+
+            var callback = AURenderCallbackStruct(
+                inputProc: { reference, flags, timestamp, bus, frames, _ in
+                    let context = Unmanaged<RealtimeAudioRenderContext>
+                        .fromOpaque(reference)
+                        .takeUnretainedValue()
+                    return context.render(
+                        flags: flags,
+                        timeStamp: timestamp,
+                        busNumber: bus,
+                        frameCount: frames
+                    )
+                },
+                inputProcRefCon: Unmanaged.passUnretained(renderContext).toOpaque()
+            )
+            var status = AudioUnitSetProperty(
+                unit,
+                kAudioOutputUnitProperty_SetInputCallback,
+                kAudioUnitScope_Global,
+                0,
+                &callback,
+                UInt32(MemoryLayout<AURenderCallbackStruct>.size)
+            )
+            guard status == noErr else {
+                throw AudioRecorderError.deviceConfigurationFailed
+            }
+
+            status = AudioUnitInitialize(unit)
+            guard status == noErr else {
+                throw AudioRecorderError.deviceConfigurationFailed
+            }
+
+            runtime.startConsumer()
+            status = AudioOutputUnitStart(unit)
+            guard status == noErr else {
+                throw AudioRecorderError.deviceConfigurationFailed
+            }
+
+            isRecording = true
+            startHealthMonitoring()
+            let nativeRate = clientFormat.sampleRate
+            let nativeChannels = clientFormat.channelCount
+            AppLogger.audio.info(
+                "Recording start — device id \(activeDeviceID, privacy: .public), \(nativeRate, privacy: .public) Hz, \(nativeChannels, privacy: .public) ch, max slice \(maximumFrames, privacy: .public)"
+            )
+            return chunkSource.stream
         } catch {
-            cleanupAfterFailure()
+            cleanupFailedStart()
             throw error
         }
-
-        let audioChunkSource = BoundedAudioChunkStream(
-            bufferingLimit: audioChunkBufferingLimit
-        )
-        self.audioChunkSource = audioChunkSource
-
-        // Wire the input render callback (passing self via the opaque refcon)
-        var callbackStruct = AURenderCallbackStruct(
-            inputProc: { inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, _ in
-                let recorder = Unmanaged<AudioRecorder>.fromOpaque(inRefCon).takeUnretainedValue()
-                return recorder.renderInput(
-                    flags: ioActionFlags,
-                    timeStamp: inTimeStamp,
-                    busNumber: inBusNumber,
-                    frameCount: inNumberFrames
-                )
-            },
-            inputProcRefCon: Unmanaged.passUnretained(self).toOpaque()
-        )
-        var status = AudioUnitSetProperty(
-            unit,
-            kAudioOutputUnitProperty_SetInputCallback,
-            kAudioUnitScope_Global,
-            0,
-            &callbackStruct,
-            UInt32(MemoryLayout<AURenderCallbackStruct>.size)
-        )
-        guard status == noErr else {
-            AppLogger.audio.error("SetInputCallback failed: \(status, privacy: .public)")
-            cleanupAfterFailure()
-            throw AudioRecorderError.deviceConfigurationFailed
-        }
-
-        status = AudioUnitInitialize(unit)
-        guard status == noErr else {
-            AppLogger.audio.error("AudioUnitInitialize failed: \(status, privacy: .public)")
-            cleanupAfterFailure()
-            throw AudioRecorderError.deviceConfigurationFailed
-        }
-
-        status = AudioOutputUnitStart(unit)
-        guard status == noErr else {
-            AppLogger.audio.error("AudioOutputUnitStart failed: \(status, privacy: .public)")
-            cleanupAfterFailure()
-            throw AudioRecorderError.deviceConfigurationFailed
-        }
-
-        isRecording = true
-
-        // Start level monitoring
-        startLevelMonitoring()
-
-        return audioChunkSource.stream
     }
 
-    /// Pulls captured audio from the input unit and feeds it through the existing
-    /// conversion/metering path. Runs on a realtime audio thread.
-    private func renderInput(
-        flags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
-        timeStamp: UnsafePointer<AudioTimeStamp>,
-        busNumber: UInt32,
-        frameCount: UInt32
-    ) -> OSStatus {
-        guard let unit = inputUnit, let clientFormat, let recordingFormat else {
-            return noErr
+    func stopRecording() async throws -> URL {
+        guard isRecording,
+              let url = recordingURL,
+              let runtime = captureRuntime
+        else {
+            throw AudioRecorderError.notRecording
         }
 
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: clientFormat, frameCapacity: frameCount) else {
-            logOnce("render-alloc") {
-                AppLogger.audio.error("Failed to allocate render buffer (\(frameCount) frames)")
+        stopHealthMonitoring()
+        stopAndDisposeInputUnit()
+        runtime.requestDrain()
+
+        do {
+            let metrics = try await runtime.waitForCompletion()
+            if captureRuntime === runtime {
+                apply(metrics: metrics, runtime: runtime)
+                finishRuntimeState(ownedBy: runtime)
             }
-            return noErr
-        }
-        buffer.frameLength = frameCount
-
-        let status = AudioUnitRender(unit, flags, timeStamp, busNumber, frameCount, buffer.mutableAudioBufferList)
-        guard status == noErr else {
-            logOnce("render-error") {
-                AppLogger.audio.error("AudioUnitRender failed: \(status)")
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                throw AudioRecorderError.failedToCreateFile
             }
-            return status
+            if recordingURL == url { recordingURL = nil }
+            return url
+        } catch {
+            finishRuntimeState(ownedBy: runtime)
+            try? FileManager.default.removeItem(at: url)
+            if recordingURL == url { recordingURL = nil }
+            throw error
         }
-
-        processAudioBuffer(buffer, recordingFormat: recordingFormat)
-        return noErr
     }
 
-    /// Creates an input-only HAL audio unit bound to `deviceID`, configured to
-    /// deliver float32 non-interleaved audio at the device's native rate/channels.
-    private func makeInputUnit(deviceID: AudioDeviceID) throws -> (AudioUnit, AVAudioFormat) {
-        var desc = AudioComponentDescription(
+    func cancelRecording() {
+        guard captureRuntime != nil || inputUnit != nil || recordingURL != nil else {
+            return
+        }
+
+        stopHealthMonitoring()
+        stopAndDisposeInputUnit()
+        let runtime = captureRuntime
+        let url = recordingURL
+        runtime?.requestCancel()
+        finishRuntimeState(ownedBy: runtime)
+        if recordingURL == url { recordingURL = nil }
+
+        if let runtime {
+            Task {
+                _ = try? await runtime.waitForCompletion()
+                if let url { try? FileManager.default.removeItem(at: url) }
+            }
+        } else if let url {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    func resetAudioEngine() {
+        cancelRecording()
+    }
+
+    private func resetPublishedMetrics() {
+        peakRMS = 0
+        meanRMS = 0
+        droppedAudioChunkCount = 0
+        realtimeOverflowCount = 0
+        oversizedCallbackCount = 0
+        currentLevel = 0
+        microphoneDisconnected = false
+        callbackLossHandled = false
+        captureFailureHandled = false
+    }
+
+    private func startHealthMonitoring() {
+        healthTimer?.invalidate()
+        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.pollCaptureHealth() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        healthTimer = timer
+    }
+
+    private func stopHealthMonitoring() {
+        healthTimer?.invalidate()
+        healthTimer = nil
+        currentLevel = 0
+        microphoneDisconnected = false
+    }
+
+    private func pollCaptureHealth() {
+        guard isRecording, let runtime = captureRuntime else { return }
+
+        if !captureFailureHandled,
+           let failure = runtime.processingFailureDescription {
+            captureFailureHandled = true
+            onCaptureFailure?(failure)
+            return
+        }
+        if !captureFailureHandled,
+           let renderError = runtime.renderContext.lastRenderError {
+            captureFailureHandled = true
+            onCaptureFailure?(
+                "The microphone render callback failed (OSStatus \(renderError))."
+            )
+            return
+        }
+        if !captureFailureHandled,
+           runtime.renderContext.oversizedCallbackCount > 0 {
+            captureFailureHandled = true
+            onCaptureFailure?(
+                "The microphone produced a block larger than its declared maximum."
+            )
+            return
+        }
+
+        let health = AudioCallbackHealthPolicy.evaluate(
+            secondsSinceLastCallback: runtime.renderContext.secondsSinceLastCallback(),
+            capturedOutputFrames: runtime.processor.telemetry.emittedOutputFrames
+        )
+        currentLevel = health.shouldZeroMeter
+            ? 0
+            : runtime.processor.telemetry.currentLevel
+        microphoneDisconnected = health.isDisconnected
+
+        guard !callbackLossHandled, health.lossAction != .none else { return }
+        callbackLossHandled = true
+        onCallbackLoss?(health.lossAction)
+    }
+
+    private func apply(
+        metrics: AudioCaptureMetrics,
+        runtime: AudioCaptureRuntime
+    ) {
+        peakRMS = metrics.peakRMS
+        meanRMS = metrics.meanRMS
+        realtimeOverflowCount = runtime.renderContext.ring.overflowCount
+        oversizedCallbackCount = runtime.renderContext.oversizedCallbackCount
+        let totalDrops = UInt64(metrics.droppedStreamingChunks)
+            &+ realtimeOverflowCount
+        droppedAudioChunkCount = totalDrops > UInt64(Int.max)
+            ? Int.max
+            : Int(totalDrops)
+    }
+
+    private func finishRuntimeState(ownedBy runtime: AudioCaptureRuntime?) {
+        if let runtime {
+            guard captureRuntime === runtime else { return }
+        } else {
+            guard captureRuntime == nil else { return }
+        }
+        captureRuntime = nil
+        audioChunkSource = nil
+        isRecording = false
+        currentLevel = 0
+        microphoneDisconnected = false
+    }
+
+    private func cleanupFailedStart() {
+        stopHealthMonitoring()
+        stopAndDisposeInputUnit()
+        let runtime = captureRuntime
+        let url = recordingURL
+        runtime?.requestCancel()
+        finishRuntimeState(ownedBy: runtime)
+        if recordingURL == url { recordingURL = nil }
+
+        if let runtime {
+            Task {
+                _ = try? await runtime.waitForCompletion()
+                if let url { try? FileManager.default.removeItem(at: url) }
+            }
+        } else if let url {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    private func stopAndDisposeInputUnit() {
+        guard let unit = inputUnit else { return }
+        _ = AudioOutputUnitStop(unit)
+        _ = AudioUnitUninitialize(unit)
+        AudioComponentInstanceDispose(unit)
+        inputUnit = nil
+    }
+
+    private func makeInputUnit(
+        deviceID: AudioDeviceID
+    ) throws -> (AudioUnit, AVAudioFormat, Int) {
+        var description = AudioComponentDescription(
             componentType: kAudioUnitType_Output,
             componentSubType: kAudioUnitSubType_HALOutput,
             componentManufacturer: kAudioUnitManufacturer_Apple,
             componentFlags: 0,
             componentFlagsMask: 0
         )
-        guard let component = AudioComponentFindNext(nil, &desc) else {
+        guard let component = AudioComponentFindNext(nil, &description) else {
             throw AudioRecorderError.deviceConfigurationFailed
         }
 
-        var unitOptional: AudioUnit?
-        var status = AudioComponentInstanceNew(component, &unitOptional)
-        guard status == noErr, let unit = unitOptional else {
+        var optionalUnit: AudioUnit?
+        var status = AudioComponentInstanceNew(component, &optionalUnit)
+        guard status == noErr, let unit = optionalUnit else {
             throw AudioRecorderError.deviceConfigurationFailed
         }
 
         func fail(_ message: String) -> AudioRecorderError {
             AppLogger.audio.error("makeInputUnit: \(message, privacy: .public)")
             AudioComponentInstanceDispose(unit)
-            return AudioRecorderError.deviceConfigurationFailed
+            return .deviceConfigurationFailed
         }
 
         let flagSize = UInt32(MemoryLayout<UInt32>.size)
-
-        // Enable input (bus 1), disable output (bus 0): input-only.
         var enableInput: UInt32 = 1
-        status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &enableInput, flagSize)
-        guard status == noErr else { throw fail("EnableIO(input) failed: \(status)") }
+        status = AudioUnitSetProperty(
+            unit,
+            kAudioOutputUnitProperty_EnableIO,
+            kAudioUnitScope_Input,
+            1,
+            &enableInput,
+            flagSize
+        )
+        guard status == noErr else {
+            throw fail("EnableIO(input) failed: \(status)")
+        }
 
         var disableOutput: UInt32 = 0
-        status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &disableOutput, flagSize)
-        guard status == noErr else { throw fail("DisableIO(output) failed: \(status)") }
-
-        // Bind to the chosen input device — never an output device.
-        var device = deviceID
-        status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &device, UInt32(MemoryLayout<AudioDeviceID>.size))
-        guard status == noErr else { throw fail("Set CurrentDevice failed: \(status)") }
-
-        // Read the device's native input format (input scope, bus 1).
-        var hwFormat = AudioStreamBasicDescription()
-        var fmtSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-        status = AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &hwFormat, &fmtSize)
-        guard status == noErr, hwFormat.mSampleRate > 0, hwFormat.mChannelsPerFrame > 0 else {
-            throw fail("Get hardware StreamFormat failed: \(status), rate=\(hwFormat.mSampleRate), ch=\(hwFormat.mChannelsPerFrame)")
-        }
-
-        // Ask the unit to hand us float32 non-interleaved at that rate/channels
-        // (output scope, bus 1 — i.e. the format delivered to our callback).
-        //
-        // Build the format from a raw ASBD rather than
-        // AVAudioFormat(commonFormat:sampleRate:channels:interleaved:): that
-        // convenience initializer returns nil for >2 channels (no inferable
-        // layout), and multi-channel interfaces like the Scarlett Solo report 4
-        // input channels. We downmix to mono later via the converter's channelMap.
-        let channelCount = hwFormat.mChannelsPerFrame
-        var clientASBD = AudioStreamBasicDescription(
-            mSampleRate: hwFormat.mSampleRate,
-            mFormatID: kAudioFormatLinearPCM,
-            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved,
-            mBytesPerPacket: 4,
-            mFramesPerPacket: 1,
-            mBytesPerFrame: 4,
-            mChannelsPerFrame: channelCount,
-            mBitsPerChannel: 32,
-            mReserved: 0
+        status = AudioUnitSetProperty(
+            unit,
+            kAudioOutputUnitProperty_EnableIO,
+            kAudioUnitScope_Output,
+            0,
+            &disableOutput,
+            flagSize
         )
-        // AVAudioFormat requires an explicit channel layout above stereo, so give
-        // multi-channel devices (e.g. the 4-channel Scarlett Solo) a discrete one.
-        let client: AVAudioFormat?
-        if channelCount > 2 {
-            client = AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | channelCount)
-                .flatMap { AVAudioFormat(streamDescription: &clientASBD, channelLayout: $0) }
-        } else {
-            client = AVAudioFormat(streamDescription: &clientASBD)
-        }
-        guard let client else {
-            throw fail("Unsupported client format: \(hwFormat.mSampleRate) Hz, \(channelCount) ch")
-        }
-        status = AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &clientASBD, UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
-        guard status == noErr else { throw fail("Set client StreamFormat failed: \(status)") }
-
-        return (unit, client)
-    }
-
-    /// Stops, uninitializes and disposes the input unit. Safe to call even if the
-    /// unit was never started/initialized (those calls just no-op with an error).
-    private func teardownInputUnit() {
-        guard let unit = inputUnit else { return }
-        AudioOutputUnitStop(unit)
-        AudioUnitUninitialize(unit)
-        AudioComponentInstanceDispose(unit)
-        inputUnit = nil
-    }
-
-    /// Tears down a half-built recording session after a setup failure.
-    private func cleanupAfterFailure() {
-        teardownInputUnit()
-        audioFile = nil
-        converter = nil
-        converterInputFormat = nil
-        audioChunkSource?.cancel()
-        audioChunkSource = nil
-        if let url = recordingURL {
-            try? FileManager.default.removeItem(at: url)
-        }
-        recordingURL = nil
-    }
-
-    private func processAudioBuffer(_ buffer: AVAudioPCMBuffer, recordingFormat: AVAudioFormat) {
-        // Calculate audio level for visualization
-        updateAudioLevel(buffer: buffer)
-
-        guard let converter = ensureConverter(for: buffer.format, recordingFormat: recordingFormat) else {
-            logOnce("converter-nil") {
-                AppLogger.audio.error(
-                    "Failed to obtain audio converter — buffer format: \(buffer.format), target: \(recordingFormat)"
-                )
-            }
-            return
+        guard status == noErr else {
+            throw fail("DisableIO(output) failed: \(status)")
         }
 
-        // Convert and write to file
-        let frameCount = AVAudioFrameCount(Double(buffer.frameLength) * sampleRate / buffer.format.sampleRate)
-
-        guard let convertedBuffer = AVAudioPCMBuffer(pcmFormat: recordingFormat, frameCapacity: frameCount) else {
-            logOnce("buffer-alloc-failed") {
-                AppLogger.audio.error(
-                    "Failed to allocate converted buffer (frameCount=\(frameCount), format=\(recordingFormat))"
-                )
-            }
-            return
+        var device = deviceID
+        status = AudioUnitSetProperty(
+            unit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &device,
+            UInt32(MemoryLayout<AudioDeviceID>.size)
+        )
+        guard status == noErr else {
+            throw fail("Set CurrentDevice failed: \(status)")
         }
 
-        var error: NSError?
-        let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
-            outStatus.pointee = .haveData
-            return buffer
+        var hardwareFormat = AudioStreamBasicDescription()
+        var formatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        status = AudioUnitGetProperty(
+            unit,
+            kAudioUnitProperty_StreamFormat,
+            kAudioUnitScope_Input,
+            1,
+            &hardwareFormat,
+            &formatSize
+        )
+        guard status == noErr,
+              hardwareFormat.mSampleRate > 0,
+              hardwareFormat.mChannelsPerFrame > 0
+        else {
+            throw fail("Get hardware format failed: \(status)")
         }
 
-        let status = converter.convert(to: convertedBuffer, error: &error, withInputFrom: inputBlock)
-
-        if let error {
-            logOnce("convert-error") {
-                AppLogger.audio.error(
-                    "Audio convert error (status=\(status.rawValue)): \(error.localizedDescription)"
-                )
-            }
-            return
-        }
-
-        if convertedBuffer.frameLength == 0 {
-            logOnce("convert-empty") {
-                AppLogger.audio.error(
-                    "Converter produced 0 frames (status=\(status.rawValue), input frames=\(buffer.frameLength), input rms=\(self.bufferRMS(buffer)))"
-                )
-            }
-            return
-        }
-
-        do {
-            try audioFile?.write(from: convertedBuffer)
-        } catch {
-            AppLogger.audio.error("Error writing audio buffer: \(error.localizedDescription)")
-        }
-
-        // The live path is copied from the exact converted buffer written above;
-        // it never opens another capture device or performs a second conversion.
-        if let channel = convertedBuffer.floatChannelData?[0] {
-            let sampleCount = Int(convertedBuffer.frameLength)
-            let disposition = audioChunkSource?.yield(
-                copying: UnsafeBufferPointer(start: channel, count: sampleCount),
-                sampleRate: Int(sampleRate)
-            )
-
-            if disposition == .dropped {
-                droppedAudioChunkCount = audioChunkSource?.droppedChunkCount ?? droppedAudioChunkCount
-                logOnce("audio-stream-overflow") {
-                    AppLogger.audio.error(
-                        "Live transcription buffer is full; dropping new audio chunks"
-                    )
-                }
-            }
-        }
-    }
-
-    private var loggedOnce: Set<String> = []
-    private func logOnce(_ key: String, _ action: () -> Void) {
-        guard !loggedOnce.contains(key) else { return }
-        loggedOnce.insert(key)
-        action()
-    }
-
-    private func bufferRMS(_ buffer: AVAudioPCMBuffer) -> Float {
-        guard let channelData = buffer.floatChannelData?[0] else { return -1 }
-        let count = Int(buffer.frameLength)
-        guard count > 0 else { return 0 }
-        var sum: Float = 0
-        for i in 0..<count {
-            sum += channelData[i] * channelData[i]
-        }
-        return sqrt(sum / Float(count))
-    }
-
-    private func updateAudioLevel(buffer: AVAudioPCMBuffer) {
-        guard let channelData = buffer.floatChannelData?[0] else { return }
-        let frameLength = Int(buffer.frameLength)
-
-        var sum: Float = 0
-        for i in 0..<frameLength {
-            let sample = channelData[i]
-            sum += sample * sample
-        }
-
-        sumOfSquares += Double(sum)
-        totalSamples += frameLength
-
-        let rms = sqrt(sum / Float(frameLength))
-        if rms > peakRMS { peakRMS = rms }
-        let level = 20 * log10(max(rms, 0.000001))
-
-        // Normalize to 0-1 range (using -40dB to 0dB range for less sensitivity)
-        let normalizedLevel = max(0, min(1, (level + 40) / 40))
-
-        DispatchQueue.main.async { [weak self] in
-            self?.currentLevel = normalizedLevel
-        }
-    }
-
-    private func startLevelMonitoring() {
-        // Level updates happen in the audio tap callback
-        // Timer kept for potential future use (e.g., decay animation)
-        levelUpdateTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
-            // Reserved for level decay animation if needed
-        }
-    }
-
-    func stopRecording() throws -> URL {
-        guard isRecording, let url = recordingURL else {
-            throw AudioRecorderError.notRecording
-        }
-
-        // Stop level monitoring
-        levelUpdateTimer?.invalidate()
-        levelUpdateTimer = nil
-
-        // Stop and dispose the input unit
-        teardownInputUnit()
-
-        // AudioOutputUnitStop synchronously quiesces the render callback, so no
-        // producer can race this terminal event or write after stream finish.
-        audioChunkSource?.finish()
-        droppedAudioChunkCount = audioChunkSource?.droppedChunkCount ?? droppedAudioChunkCount
-        audioChunkSource = nil
-
-        // Close the audio file
-        audioFile = nil
-        converter = nil
-        converterInputFormat = nil
-
-        isRecording = false
-        currentLevel = 0
-
-        if totalSamples > 0 {
-            meanRMS = Float(sqrt(sumOfSquares / Double(totalSamples)))
-        } else {
-            meanRMS = 0
-        }
-
-        // Verify the file was created
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            throw AudioRecorderError.failedToCreateFile
-        }
-
-        return url
-    }
-
-    func cancelRecording() {
-        guard isRecording else { return }
-
-        levelUpdateTimer?.invalidate()
-        levelUpdateTimer = nil
-
-        teardownInputUnit()
-        audioChunkSource?.cancel()
-        droppedAudioChunkCount = audioChunkSource?.droppedChunkCount ?? droppedAudioChunkCount
-        audioChunkSource = nil
-        audioFile = nil
-        converter = nil
-        converterInputFormat = nil
-
-        // Delete the temporary file
-        if let url = recordingURL {
-            try? FileManager.default.removeItem(at: url)
-        }
-
-        isRecording = false
-        currentLevel = 0
-        recordingURL = nil
-    }
-
-    /// Tears down any active input unit after a system wake or audio route change
-    /// so the next recording starts clean. Kept under the old name because callers
-    /// (AppDelegate) invoke it on device changes and wake. The device is re-bound
-    /// fresh on the next `startRecording()`, so nothing needs reapplying here.
-    func resetAudioEngine() {
-        levelUpdateTimer?.invalidate()
-        levelUpdateTimer = nil
-
-        teardownInputUnit()
-        audioChunkSource?.cancel()
-        audioChunkSource = nil
-
-        isRecording = false
-        currentLevel = 0
-        audioFile = nil
-        recordingURL = nil
-        converter = nil
-        converterInputFormat = nil
-    }
-
-    private func ensureConverter(for inputFormat: AVAudioFormat, recordingFormat: AVAudioFormat) -> AVAudioConverter? {
-        if let converter = converter, let cachedFormat = converterInputFormat, formatsMatch(cachedFormat, inputFormat) {
-            return converter
-        }
-
-        guard let newConverter = AVAudioConverter(from: inputFormat, to: recordingFormat) else {
-            return nil
-        }
-
-        // For multi-channel input devices (e.g., Scarlett Solo Gen 4 reports as 4 channels:
-        // mic, instrument, loopback L, loopback R), AVAudioConverter's default downmix matrix
-        // can produce silence when downmixing more than 2 channels to mono. Pin the converter
-        // to take only channel 0 (the primary mic input) and drop the rest.
-        if inputFormat.channelCount > 1 && recordingFormat.channelCount == 1 {
-            newConverter.channelMap = [0]
-            AppLogger.audio.info(
-                "Configured converter channel map to [0] for \(inputFormat.channelCount)-ch input"
+        guard let clientFormat = AudioFormatFactory.noninterleavedFloat32(
+            sampleRate: hardwareFormat.mSampleRate,
+            channels: hardwareFormat.mChannelsPerFrame
+        ) else {
+            throw fail(
+                "Unsupported client format: \(hardwareFormat.mSampleRate) Hz, "
+                    + "\(hardwareFormat.mChannelsPerFrame) ch"
             )
         }
+        var clientDescription = clientFormat.streamDescription.pointee
+        status = AudioUnitSetProperty(
+            unit,
+            kAudioUnitProperty_StreamFormat,
+            kAudioUnitScope_Output,
+            1,
+            &clientDescription,
+            UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        )
+        guard status == noErr else {
+            throw fail("Set client format failed: \(status)")
+        }
 
-        converter = newConverter
-        converterInputFormat = inputFormat
-        return newConverter
+        var maximumFrames: UInt32 = 0
+        var maximumFramesSize = UInt32(MemoryLayout<UInt32>.size)
+        status = AudioUnitGetProperty(
+            unit,
+            kAudioUnitProperty_MaximumFramesPerSlice,
+            kAudioUnitScope_Global,
+            0,
+            &maximumFrames,
+            &maximumFramesSize
+        )
+        guard status == noErr, maximumFrames > 0 else {
+            throw fail("Get maximum frames per slice failed: \(status)")
+        }
+
+        return (unit, clientFormat, Int(maximumFrames))
     }
-
-    private func formatsMatch(_ lhs: AVAudioFormat, _ rhs: AVAudioFormat) -> Bool {
-        lhs.sampleRate == rhs.sampleRate
-            && lhs.channelCount == rhs.channelCount
-            && lhs.commonFormat == rhs.commonFormat
-            && lhs.isInterleaved == rhs.isInterleaved
-    }
-
 }
 
 enum AudioRecorderError: LocalizedError {
