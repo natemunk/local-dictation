@@ -59,6 +59,15 @@ label, certificate fingerprints, and designated requirement under
 private key. Use plain `./setup` for later rebuilds. A normal setup fails closed
 instead of silently falling back to ad-hoc signing.
 
+During first-time configuration, the `security` tool asks for your login
+keychain password once (input remains hidden) so only Apple code-signing tools
+can use the new private key without prompting on later rebuilds. Setup then signs
+and verifies a disposable probe before saving any metadata; if authorization is
+cancelled, it removes the just-created identity and leaves the prior installation
+untouched. The self-signed certificate is not added as a general trusted root;
+the stable certificate-backed designated requirement is what preserves app
+identity between local builds.
+
 The setup script:
 
 1. Validates macOS, architecture, Xcode, SDK, Swift, and Git.

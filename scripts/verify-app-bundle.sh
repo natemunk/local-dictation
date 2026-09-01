@@ -13,7 +13,7 @@ ALLOW_ADHOC=0
 while (( $# )); do
   case "$1" in
     --expected-requirement)
-      (( $# >= 2 )) || { print -u2 "--expected-requirement needs a value"; exit 64; }
+      (( $# >= 2 )) || { print -u2 -- "--expected-requirement needs a value"; exit 64; }
       EXPECTED_REQUIREMENT=$2
       shift 2
       ;;

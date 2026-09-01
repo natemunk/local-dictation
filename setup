@@ -39,7 +39,7 @@ STABLE_INSTALL_COMPLETED=false
 
 if (( CI_ADHOC_SIGNING )); then
   if [[ "${CI:-}" != "true" && "${LOCAL_DICTATION_ALLOW_ADHOC_CI:-}" != "1" ]]; then
-    print -u2 "--ci-adhoc-signing is restricted to CI or an explicit LOCAL_DICTATION_ALLOW_ADHOC_CI=1 test environment."
+    print -u2 -- "--ci-adhoc-signing is restricted to CI or an explicit LOCAL_DICTATION_ALLOW_ADHOC_CI=1 test environment."
     exit 1
   fi
 elif (( CONFIGURE_SIGNING )); then
@@ -64,9 +64,9 @@ if (( ! CI_ADHOC_SIGNING )); then
     print -u2 "Run ./setup --rotate-signing-identity to replace it intentionally."
     exit 1
   fi
-  if ! /usr/bin/security find-identity -v -p codesigning \
+  if ! /usr/bin/security find-identity -p codesigning \
       | /usr/bin/grep -Fq "$SIGNING_IDENTITY"; then
-    print -u2 "The recorded Local Dictation code-signing identity is missing or untrusted."
+    print -u2 "The recorded Local Dictation code-signing identity is missing or unusable."
     print -u2 "Run ./setup --rotate-signing-identity to replace it intentionally."
     exit 1
   fi

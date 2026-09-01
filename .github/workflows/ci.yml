@@ -13,6 +13,9 @@ jobs:
       - name: Report toolchain
         run: uname -m && xcodebuild -version && swift --version
 
+      - name: Verify local signing import
+        run: zsh scripts/verify-local-signing-import.sh
+
       - name: Resolve pinned packages
         run: swift package resolve
 
