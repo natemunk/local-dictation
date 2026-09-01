@@ -14,16 +14,12 @@ struct AppStatePreferencesTests {
         let first = AppState(preferences: defaults)
         first.overlayPosition = .topRight
         first.selectedInputDeviceUID = "test-microphone"
-        first.transcriptionEngine = .whisperKit
-        first.parakeetModel = .v3Multilingual
-        first.whisperModel = .largeV3Turbo
+        first.asrSelection = .whisperLargeV3Turbo
 
         let restored = AppState(preferences: defaults)
         #expect(restored.overlayPosition == .topRight)
         #expect(restored.selectedInputDeviceUID == "test-microphone")
-        #expect(restored.transcriptionEngine == .whisperKit)
-        #expect(restored.parakeetModel == .v3Multilingual)
-        #expect(restored.whisperModel == .largeV3Turbo)
+        #expect(restored.asrSelection == .whisperLargeV3Turbo)
     }
 
     @Test("unknown persisted values fall back to safe defaults")
@@ -34,15 +30,35 @@ struct AppStatePreferencesTests {
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         defaults.set("sideways", forKey: LocalDictationPreferenceKey.overlayPosition)
-        defaults.set("cloud", forKey: LocalDictationPreferenceKey.transcriptionEngine)
-        defaults.set("unknown", forKey: LocalDictationPreferenceKey.parakeetModel)
-        defaults.set("huge", forKey: LocalDictationPreferenceKey.whisperModel)
+        defaults.set("cloud", forKey: LocalDictationPreferenceKey.asrSelection)
 
         let state = AppState(preferences: defaults)
         #expect(state.overlayPosition == .bottomCenter)
-        #expect(state.transcriptionEngine == .parakeet)
-        #expect(state.parakeetModel == .v2English)
-        #expect(state.whisperModel == .smallEn)
+        #expect(state.asrSelection == .parakeetV2)
+    }
+
+    @Test("legacy engine and model preferences migrate once")
+    @MainActor
+    func legacySelectionMigrates() throws {
+        let suiteName = "AppStatePreferencesTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        defaults.set(
+            TranscriptionEngineType.whisperKit.rawValue,
+            forKey: LocalDictationPreferenceKey.transcriptionEngine
+        )
+        defaults.set(
+            WhisperModel.largeV3Turbo.rawValue,
+            forKey: LocalDictationPreferenceKey.whisperModel
+        )
+
+        let migrated = AppState(preferences: defaults)
+        #expect(migrated.asrSelection == .whisperLargeV3Turbo)
+        #expect(
+            defaults.string(forKey: LocalDictationPreferenceKey.asrSelection)
+                == ASRSelection.whisperLargeV3Turbo.rawValue
+        )
     }
 
     @Test("onboarding readiness requires permissions tap health and a prepared engine")

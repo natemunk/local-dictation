@@ -74,7 +74,7 @@ Use these canonical candidate IDs for the final-engine report:
 - `whisperkit-small.en`
 - `whisperkit-large-v3_turbo`
 
-Score Parakeet EOU and WhisperKit streaming in a separate live-preview report so they do not enter the authoritative final-engine selection pool. Paired Raycast accuracy is also acceptance evidence, not a candidate in the final-engine selection input.
+Score Parakeet EOU in a separate live-preview report so it does not enter the authoritative final-engine selection pool. Paired Raycast accuracy is also acceptance evidence, not a candidate in the final-engine selection input.
 
 ## Cleanup pair record
 

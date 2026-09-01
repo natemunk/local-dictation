@@ -15,6 +15,8 @@ struct SettingsView: View {
     let onOpenInputMonitoring: () -> Void
     let onOpenAccessibility: () -> Void
     let onImportRaycastVocabulary: (String) -> Void
+    let onVerifyModel: () -> Void
+    let onRepairModel: () -> Void
 
     private let permissionRefreshTimer = Timer.publish(
         every: 1,
@@ -140,21 +142,42 @@ struct SettingsView: View {
     private var speech: some View {
         Form {
             Section("Local transcription") {
-                Picker("Engine family", selection: $appState.transcriptionEngine) {
-                    ForEach(TranscriptionEngineType.allCases) { Text($0.rawValue).tag($0) }
-                }
-
-                if appState.transcriptionEngine == .parakeet {
-                    Picker("Candidate", selection: $appState.parakeetModel) {
-                        ForEach(ParakeetModelType.allCases) { Text($0.displayName).tag($0) }
-                    }
-                } else {
-                    Picker("Candidate", selection: $appState.whisperModel) {
-                        ForEach(WhisperModel.allCases) { Text($0.displayName).tag($0) }
+                Picker("Engine", selection: $appState.asrSelection) {
+                    ForEach(ASRSelection.allCases) { selection in
+                        Text(selection.displayName).tag(selection)
                     }
                 }
 
-                Text("No engine is labeled the winner until the checked-in corpus passes the benchmark gate. English is the only enabled v1 language.")
+                LabeledContent("Status") {
+                    if appState.engineReady {
+                        Text("Ready").foregroundStyle(.green)
+                    } else if appState.isInitializingEngine || appState.isDownloadingModel {
+                        Text("Preparing…").foregroundStyle(.orange)
+                    } else {
+                        Text("Unavailable").foregroundStyle(.red)
+                    }
+                }
+
+                if appState.isDownloadingModel {
+                    ProgressView(value: appState.modelDownloadProgress)
+                }
+
+                HStack {
+                    Button("Verify", action: onVerifyModel)
+                        .disabled(appState.isInitializingEngine || appState.isDownloadingModel)
+                    Button("Repair…", role: .destructive, action: onRepairModel)
+                        .disabled(appState.isInitializingEngine || appState.isDownloadingModel)
+                    Spacer()
+                    Text(appState.asrSelection.estimatedSize)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Text("Parakeet v2 is the daily-driver default until the checked-in corpus mechanically selects a winner. English is the only enabled v1 language.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Text("First-time ASR and optional FluidAudio EOU live-preview downloads contact \(appState.asrSelection.sourceHost). Audio and transcripts remain on this Mac.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -177,6 +200,9 @@ struct SettingsView: View {
                 Label("Microphone audio never leaves this Mac", systemImage: "checkmark.shield.fill")
                     .foregroundStyle(.green)
                 Text("There is no telemetry SDK, cloud speech engine, automatic updater, or Overseed service in this build.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Network access is limited to first-time model downloads from the documented model host and any text-only refiner you explicitly configure.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

@@ -4,7 +4,7 @@ Status: normative v1 constraints. Unless a row cites completed evidence, it is a
 
 ## Trust boundary
 
-Local Dictation may handle microphone audio, transcript text, focused-application metadata, clipboard contents, local configuration, and local history. The default trust boundary is the user's Mac. Crossing that boundary is allowed only for an explicitly configured text refiner under the policy below.
+Local Dictation may handle microphone audio, transcript text, focused-application metadata, clipboard contents, local configuration, and local history. The default trust boundary is the user's Mac. Network access is limited to explicit model-artifact downloads from documented hosts and an explicitly configured text refiner under the policy below. Model-download requests contain no audio, transcript, destination, clipboard, or history data.
 
 | ID | Invariant | Required failure behavior | Current evidence |
 |---|---|---|---|
@@ -26,6 +26,7 @@ Local Dictation may handle microphone audio, transcript text, focused-applicatio
 | PRV-016 | Idle means no microphone capture, ASR inference, refiner polling, telemetry, or sustained outbound traffic. Models may remain loaded. | Stop the offending work and surface a diagnostic. | Idle CPU/network measurements remain unbenchmarked. |
 | PRV-017 | Logs and crash diagnostics exclude audio, transcript bodies, clipboard contents, URLs/hostnames, API keys, and focused-field content. | Redact or omit the event. | Custom transcript-bearing crash capture was removed and the static privacy scan passes; runtime unified-log review remains pending. |
 | PRV-018 | Corpus metadata uses non-identifying device classes/labels and provenance `synthetic` or `fresh-opt-in`; hardware serials and account identity are excluded. | Reject invalid manifest records. | The benchmark CLI enforces provenance and non-empty device metadata; schemas prohibit undeclared fields. |
+| PRV-019 | ASR and optional EOU-preview models are downloaded only after an explicit user action from their documented model host into versioned Local Dictation-owned directories. Validation, quarantine, and repair never scan, mutate, or delete another application's model cache. | Keep an invalid owned installation quarantined, retry one clean owned download, and surface a durable error if repair fails. | Owned-manifest, path-containment, replacement, quarantine, repair, and stale-generation tests pass; live host/file-system observation remains pending. |
 
 ## Permitted local data flow
 
@@ -41,7 +42,7 @@ microphone
   → clipboard/paste or preview
 ```
 
-The optional refiner is the only approved network-capable runtime stage. It receives no ambient app context. On a fresh install the app does not initialize or download a speech model until the user chooses **Finish Setup & Download Local Model**; later model changes are also explicit settings actions. Model downloads must not be confused with transcription or cleanup traffic.
+The optional refiner is the only approved transcript-bearing network-capable runtime stage. It receives no ambient app context. On a fresh install the app does not initialize or download a speech model until the user chooses **Finish Setup & Download Local Model**; later model changes, verification, and repair are also explicit settings actions. First-time ASR and optional EOU-preview downloads contact the documented model host without sending user content. Model downloads must not be confused with transcription or cleanup traffic.
 
 ## Benchmark and corpus rules
 

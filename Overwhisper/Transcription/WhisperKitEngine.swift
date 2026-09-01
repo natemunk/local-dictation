@@ -1,113 +1,20 @@
+@preconcurrency import AVFoundation
 import Foundation
-import WhisperKit
+@preconcurrency import WhisperKit
 
 actor WhisperKitEngine: TranscriptionEngine {
-    private var whisperKit: WhisperKit?
+    private let whisperKit: WhisperKit
     private let appState: AppState
-    private let modelManager: ModelManager
-    private var isInitialized = false
-    private var isInitializing = false
-    private var currentModel: String?
 
-    init(appState: AppState, modelManager: ModelManager) {
+    /// Receives a model that the lifecycle coordinator already validated and
+    /// loaded from a Local Dictation-owned installation.
+    init(whisperKit: WhisperKit, appState: AppState) {
+        self.whisperKit = whisperKit
         self.appState = appState
-        self.modelManager = modelManager
     }
-
-    private static let maxRetries = 3
-    private static let retryDelaySeconds: UInt64 = 5
-
-    func initialize() async {
-        // Prevent concurrent initialization - check and set atomically before any await
-        guard !isInitializing else {
-            AppLogger.transcription.debug("WhisperKit initialization already in progress, skipping")
-            return
-        }
-        isInitializing = true
-
-        defer { isInitializing = false }
-
-        let modelName = await appState.whisperModel.rawValue
-
-        // Skip if already initialized with the same model
-        if isInitialized && currentModel == modelName {
-            return
-        }
-
-        AppLogger.transcription.info("Initializing WhisperKit with model: \(modelName)")
-
-        // Check if model is already downloaded locally to avoid network dependency
-        let cachedModelFolder = await modelManager.findModelFolder(for: modelName)
-        let modelAlreadyDownloaded = cachedModelFolder != nil
-
-        if cachedModelFolder != nil {
-            AppLogger.transcription.info("Using a cached WhisperKit model")
-        }
-
-        for attempt in 1...Self.maxRetries {
-            do {
-                await MainActor.run {
-                    appState.isDownloadingModel = true
-                }
-
-                whisperKit = try await WhisperKit(
-                    model: modelName,
-                    downloadBase: modelManager.devDownloadBase,
-                    modelFolder: cachedModelFolder,
-                    computeOptions: ModelComputeOptions(
-                        audioEncoderCompute: .cpuAndNeuralEngine,
-                        textDecoderCompute: .cpuAndNeuralEngine
-                    ),
-                    verbose: false,
-                    logLevel: .none,
-                    prewarm: true,
-                    load: true,
-                    download: !modelAlreadyDownloaded
-                )
-
-                isInitialized = true
-                currentModel = modelName
-
-                await MainActor.run {
-                    appState.isDownloadingModel = false
-                    appState.isModelDownloaded = true
-                    appState.downloadedModels.insert(modelName)
-                }
-
-                // Refresh the model list
-                await modelManager.scanForModels()
-
-                AppLogger.transcription.info("WhisperKit initialized successfully")
-                return
-
-            } catch {
-                AppLogger.transcription.error("Failed to initialize WhisperKit (attempt \(attempt)/\(Self.maxRetries)): \(error.localizedDescription)")
-
-                if attempt < Self.maxRetries {
-                    AppLogger.transcription.info("Retrying in \(Self.retryDelaySeconds) seconds...")
-                    try? await Task.sleep(nanoseconds: Self.retryDelaySeconds * 1_000_000_000)
-                } else {
-                    await MainActor.run {
-                        appState.isDownloadingModel = false
-                        appState.lastError = "Failed to initialize WhisperKit: \(error.localizedDescription)"
-                    }
-                }
-            }
-        }
-    }
-
-    private static let transcriptionTimeoutSeconds: UInt64 = 30
 
     func transcribe(audioURL: URL) async throws -> FinalTranscript {
-        // Ensure initialized
-        if !isInitialized {
-            await initialize()
-        }
-
-        guard let whisperKit = whisperKit else {
-            throw WhisperKitError.notInitialized
-        }
-
+        try Task.checkCancellation()
         AppLogger.transcription.debug("Transcribing a local temporary recording")
 
         // V1 is English-only. Translation and language detection remain off.
@@ -137,19 +44,22 @@ actor WhisperKitEngine: TranscriptionEngine {
             promptTokens: promptTokens
         )
 
-        // Run transcription with timeout
+        let deadlineSeconds = ASRDeadlinePolicy.whisperTimeoutSeconds(
+            audioDuration: Self.audioDuration(at: audioURL)
+        )
         let transcript = try await withThrowingTaskGroup(of: FinalTranscript.self) { group in
             group.addTask {
-                let results = try await whisperKit.transcribe(
+                let results = try await self.whisperKit.transcribe(
                     audioPath: audioURL.path,
                     decodeOptions: decodingOptions
                 )
+                try Task.checkCancellation()
                 return Self.finalTranscript(from: results)
             }
 
             group.addTask {
-                try await Task.sleep(nanoseconds: Self.transcriptionTimeoutSeconds * 1_000_000_000)
-                throw WhisperKitError.timeout
+                try await Task.sleep(for: .seconds(deadlineSeconds))
+                throw WhisperKitError.timeout(seconds: deadlineSeconds)
             }
 
             // Return the first result (either transcription completes or timeout fires)
@@ -163,9 +73,17 @@ actor WhisperKitEngine: TranscriptionEngine {
             return result
         }
 
+        try Task.checkCancellation()
         AppLogger.transcription.debug("Local WhisperKit transcription completed")
 
         return transcript
+    }
+
+    private static func audioDuration(at url: URL) -> TimeInterval {
+        guard let file = try? AVAudioFile(forReading: url),
+              file.processingFormat.sampleRate > 0
+        else { return 0 }
+        return Double(file.length) / file.processingFormat.sampleRate
     }
 
     private static func finalTranscript(from results: [TranscriptionResult]) -> FinalTranscript {
@@ -212,11 +130,21 @@ actor WhisperKitEngine: TranscriptionEngine {
     }
 }
 
+enum ASRDeadlinePolicy {
+    /// The old fixed 30-second limit was too generous for a stuck short clip
+    /// and too short for long-form dictation. Allow startup headroom plus 25%
+    /// of audio duration, with a hard bound for the 15-minute recording cap.
+    static func whisperTimeoutSeconds(audioDuration: TimeInterval) -> TimeInterval {
+        let safeDuration = audioDuration.isFinite ? max(0, audioDuration) : 0
+        return min(210, max(20, 15 + safeDuration * 0.25))
+    }
+}
+
 enum WhisperKitError: LocalizedError {
     case notInitialized
     case modelNotFound
     case transcriptionFailed(String)
-    case timeout
+    case timeout(seconds: TimeInterval)
 
     var errorDescription: String? {
         switch self {
@@ -226,8 +154,8 @@ enum WhisperKitError: LocalizedError {
             return "Whisper model not found"
         case .transcriptionFailed(let message):
             return "Transcription failed: \(message)"
-        case .timeout:
-            return "Transcription timed out after 30 seconds"
+        case .timeout(let seconds):
+            return "Transcription timed out after \(Int(seconds.rounded())) seconds"
         }
     }
 }

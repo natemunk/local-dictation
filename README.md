@@ -2,12 +2,13 @@
 
 Local Dictation is a local-first macOS menu-bar dictation app for Apple Silicon. Press Hyper+D, speak, and insert the transcript into the text field you were using. It is MIT licensed and does not require a subscription.
 
-This repository is an active v1 implementation. The app builds and its 85 unit/contract tests across 16 suites pass on the current development host, but the final speech engine and Raycast cutover are deliberately **not claimed** until the checked-in benchmark and real-use gates pass.
+This repository is an active v1 implementation. The app builds and its automated unit/contract suite passes on the current development host, but the final speech-engine selection and Raycast cutover are deliberately **not claimed** until the checked-in benchmark and real-use gates pass.
 
 ## Privacy boundary
 
 - Microphone audio always stays on the Mac.
 - Speech recognition uses local FluidAudio or WhisperKit models only.
+- First-time ASR and optional EOU-preview model downloads contact the documented model host, then models run from versioned Local Dictation-owned storage. Download requests contain no audio or transcript data.
 - The app contains no telemetry SDK, cloud speech engine, Overseed service, or automatic updater.
 - Optional text cleanup may use Apple Foundation Models or an explicitly configured OpenAI-compatible `/v1/chat/completions` endpoint. A refiner receives transcript text and static rules only—never audio, destination app, browser hostname, field contents, or surrounding text.
 - Non-loopback refinement endpoints require explicit `allow_remote = true` and show a persistent **Remote** badge.
@@ -79,7 +80,7 @@ On first launch, macOS asks for:
 
 After the first stable-signed install, setup guides one final removal and re-add of the old Microphone, Input Monitoring, and Accessibility rows. Later builds use the exact same certificate-backed designated requirement, and setup aborts if that identity drifts. Intentional replacement requires `./setup --rotate-signing-identity` and another one-time permission reset. Settings → General refreshes permission and Hyper+D listener health while it is visible.
 
-No speech model is downloaded before you choose **Prepare & Finish Setup** in onboarding. Onboarding completes only after Microphone, Input Monitoring, Accessibility, the Hyper+D event tap, and the selected local model are all ready. That explicit action downloads the selected model to the Mac; the default model is roughly 600 MB, and later transcription remains local.
+No speech model is downloaded before you choose **Prepare & Finish Setup** in onboarding. Onboarding completes only after Microphone, Input Monitoring, Accessibility, the Hyper+D event tap, and the selected local model are all ready. That explicit action downloads the selected model from `huggingface.co` into `~/Library/Application Support/Local Dictation/Models/v1/`; the default model is roughly 600 MB, and later transcription remains local. Verify and Repair operate only on that owned model tree.
 
 Browser Automation is not required. It is requested per browser only if the optional hostname-profile setting is enabled.
 

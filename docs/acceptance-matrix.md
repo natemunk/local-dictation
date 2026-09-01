@@ -28,7 +28,7 @@ Snapshot: 2026-08-31. “Implemented” refers only to source in this checkout. 
 | BEN-010 | Lowest weighted WER wins; within one point faster median wins; exact tie chooses Parakeet v2. | Passing-window and exact-tie fixture runs. | Fixture-verified. |
 | BEN-011 | No passing candidate emits temporary Parakeet v2 and says to keep Raycast. | No-pass fixture; process exit 2 and JSON assertions. | Fixture-verified. |
 | BEN-012 | Final report covers Parakeet v2/v3 and WhisperKit `small.en`/`large-v3_turbo` with exact versions/configuration. | Candidate-run provenance and report review. | Pending benchmark. |
-| BEN-013 | Live-preview Parakeet EOU 320 ms and WhisperKit streaming are scored separately. | Separate live report and UI lag measurements. | Pending benchmark. |
+| BEN-013 | Lazy live-preview Parakeet EOU 320 ms is scored separately from final engines. | Separate live report and UI lag measurements. | Pending benchmark. |
 | BEN-014 | Domain accuracy equals/exceeds paired Raycast results before cutover. | Paired opt-in recordings and locked normalization. | Pending benchmark; Raycast stays. |
 
 ## Controls, overlay, and insertion

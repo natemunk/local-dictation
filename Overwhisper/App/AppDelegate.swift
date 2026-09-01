@@ -2,7 +2,6 @@ import AppKit
 import AVFoundation
 import Combine
 import SwiftUI
-import WhisperKit
 
 enum AppEnvironment {
     static let isDevBuild = Bundle.main.bundleIdentifier == nil
@@ -13,6 +12,7 @@ private struct ActiveDictationSession {
     let startedAt: Date
     let engine: (any TranscriptionEngine)?
     let streamingTranscriber: (any StreamingTranscriber)?
+    let asrSelection: ASRSelection
     var state: DictationPhase = .recording
     var destination: DictationDestination?
     var profile: DictationProfile
@@ -52,7 +52,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var overlayWindow: OverlayWindow!
     private var previewWindow: PreviewWindowController!
     private var textInserter: TextInserter!
-    private var modelManager: ModelManager!
+    private var engineCoordinator: EngineCoordinator!
     private var transcriptionEngine: (any TranscriptionEngine)?
     private var streamingTranscriber: (any StreamingTranscriber)?
 
@@ -150,7 +150,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.cancelFromUI()
         }
         textInserter = TextInserter()
-        modelManager = ModelManager(appState: appState)
+        let modelStore = OwnedModelStore()
+        engineCoordinator = EngineCoordinator(
+            initialSelection: appState.asrSelection,
+            store: modelStore,
+            backend: ProductionEngineLifecycleBackend(appState: appState)
+        )
         if let historyStore {
             historyWindow = HistoryWindowController(
                 store: historyStore,
@@ -267,17 +272,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
 
-        Publishers.CombineLatest3(
-            appState.$transcriptionEngine,
-            appState.$parakeetModel,
-            appState.$whisperModel
-        )
+        appState.$asrSelection
         .dropFirst()
-        .sink { [weak self] _, _, _ in
+        .removeDuplicates()
+        .sink { [weak self] _ in
             self?.initializeEngine()
             self?.updateEngineMenuItem()
         }
         .store(in: &cancellables)
+
+        engineCoordinator.$status
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] status in
+                guard let self else { return }
+                self.appState.isDownloadingModel = status.phase == .downloading
+                    || status.phase == .repairing
+                self.appState.isInitializingEngine = [
+                    .checking, .downloading, .validating, .preparing, .repairing,
+                ].contains(status.phase)
+                self.appState.modelDownloadProgress = status.progress ?? 0
+                self.appState.currentlyDownloadingModel = self.appState.isDownloadingModel
+                    ? status.selection.displayName
+                    : nil
+                if status.phase == .failed {
+                    self.appState.lastError = status.lastError
+                }
+            }
+            .store(in: &cancellables)
     }
 
     private func setupSleepWakeHandling() {
@@ -304,8 +325,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         audioRecorder.resetAudioEngine()
         guard appState.hasCompletedOnboarding else { return }
         requestHotkeyMonitoringIfPossible(prompt: false)
-        if !appState.engineReady || transcriptionEngine == nil {
-            initializeEngine()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let healthy = await self.engineCoordinator.healthCheck(
+                selection: self.appState.asrSelection
+            )
+            if !healthy || !self.appState.engineReady || self.transcriptionEngine == nil {
+                self.initializeEngine()
+            }
         }
     }
 
@@ -456,6 +483,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             startedAt: Date(),
             engine: transcriptionEngine,
             streamingTranscriber: streamingTranscriber,
+            asrSelection: appState.asrSelection,
             profile: placeholderProfile
         )
 
@@ -675,7 +703,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     throw LocalDictationError.engineUnavailable
                 }
                 let raw = try await engine.transcribe(audioURL: audioURL)
-                _ = await streamingFinalTask.value
+                let decision = ASRFinalizationPolicy.authoritative(raw)
+                // Batch ASR is authoritative. Never wait for a result that will
+                // be discarded; cancel optional EOU work immediately.
+                streamingFinalTask.cancel()
+                self.cancelStreamingSession(token: request.token)
                 try Task.checkCancellation()
                 guard self.isCurrent(request.token) else { return }
                 let asrLatency = started.duration(to: .now).seconds
@@ -687,7 +719,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     token: request.token
                 )
                 await self.handleRawTranscript(
-                    raw,
+                    decision.transcript,
                     request: request,
                     asrLatency: asrLatency
                 )
@@ -696,21 +728,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             } catch {
                 guard !Task.isCancelled, self.isCurrent(request.token) else { return }
-                let streamingFinal = await streamingFinalTask.value
-                if let streamingFinal,
-                   !streamingFinal.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                {
+                let fallback = ASRFinalizationPolicy.recoverFromEOU(
+                    self.appState.liveTranscript.displayed
+                )
+                streamingFinalTask.cancel()
+                self.cancelStreamingSession(token: request.token)
+                if let fallback {
+                    assert(fallback.delivery == .previewOnly)
+                    assert(!fallback.commandsAllowed)
                     let latency = started.duration(to: .now).seconds
                     self.retainDebugRecordingIfEnabled(
                         at: audioURL,
-                        transcript: streamingFinal.text,
+                        transcript: fallback.transcript.text,
                         latency: latency,
-                        error: "Batch ASR failed; delivered the local streaming transcript",
+                        error: "Batch ASR failed; opened the local EOU transcript in preview",
                         token: request.token
                     )
-                    await self.handleRawTranscript(
-                        streamingFinal,
-                        request: request,
+                    self.handleEOUFallback(
+                        fallback.transcript,
+                        batchError: error,
+                        token: request.token,
                         asrLatency: latency
                     )
                     return
@@ -726,6 +763,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         updateSession(request.token) { $0.finalizationTask = finalizationTask }
+    }
+
+    /// A 120M EOU preview is useful recovery text, not authoritative ASR. It
+    /// bypasses commands and cleanup and can only enter an editable preview.
+    private func handleEOUFallback(
+        _ raw: FinalTranscript,
+        batchError: Error,
+        token: DictationSessionToken,
+        asrLatency: Double
+    ) {
+        guard isCurrent(token), !raw.text.isEmpty else { return }
+        updateSession(token) { session in
+            session.rawText = raw.text
+            session.deliveredText = raw.text
+            session.cleanupMode = .literal
+            session.refinementStatus = .notRequested
+            session.pastedRaw = true
+        }
+        appState.lastTranscription = raw.text
+        lastTextMenuItem?.isEnabled = true
+
+        guard saveRawHistory(
+            token: token,
+            mode: .literal,
+            asrLatency: asrLatency,
+            unrecognizedCommands: []
+        ) else {
+            failSession(
+                token: token,
+                "Batch transcription failed and the EOU recovery transcript could not be saved. Nothing was pasted."
+            )
+            return
+        }
+
+        guard let historyStore,
+              let id = activeSession?.historyID
+        else {
+            failSession(token: token, "EOU recovery history is unavailable. Nothing was pasted.")
+            return
+        }
+        do {
+            _ = try historyStore.finalize(
+                id: id,
+                with: HistoryFinalization(
+                    polishedText: raw.text,
+                    refinementStatus: .notRequested,
+                    deliveryStatus: .pending,
+                    refinementLatency: nil,
+                    totalLatency: activeSession.map {
+                        Date().timeIntervalSince($0.startedAt)
+                    },
+                    error: "Batch ASR failed; EOU preview fallback: \(batchError.localizedDescription)"
+                )
+            )
+        } catch {
+            failSession(
+                token: token,
+                "EOU recovery history could not be finalized. Nothing was pasted."
+            )
+            return
+        }
+        showPreview(token: token)
     }
 
     private func handleRawTranscript(
@@ -1326,19 +1425,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               FileManager.default.fileExists(atPath: audioURL.path)
         else { return }
 
-        let engine: String
-        let model: String
-        switch appState.transcriptionEngine {
-        case .parakeet:
-            engine = "FluidAudio Parakeet"
-            model = appState.parakeetModel.rawValue
-        case .whisperKit:
-            engine = "WhisperKit"
-            model = appState.whisperModel.rawValue
-        }
+        let selection = session.asrSelection
+        let engine = selection.isParakeet ? "FluidAudio Parakeet" : "WhisperKit"
         _ = appState.debugSessionStore.record(
             engine: engine,
-            model: model,
+            model: selection.modelVariant,
             sourceAudioURL: audioURL,
             recordingDuration: Date().timeIntervalSince(session.startedAt),
             transcribedText: transcript,
@@ -1513,64 +1604,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         engineReloadPending = false
         engineTask?.cancel()
+        engineCoordinator.cancelPreparation(selection: appState.asrSelection)
         streamingTranscriber = nil
         transcriptionEngine = nil
         appState.engineReady = false
         appState.isInitializingEngine = true
-        engineTask = Task { [weak self] in
+        let selection = appState.asrSelection
+        engineTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            switch self.appState.transcriptionEngine {
-            case .parakeet:
-                let engine = ParakeetEngine(appState: self.appState)
-                do {
-                    try await engine.initialize()
-                    self.transcriptionEngine = engine
-                    self.appState.lastError = nil
-                    let streaming = FluidAudioParakeetStreamingTranscriber()
-                    do {
-                        try await streaming.prepare()
-                        self.streamingTranscriber = streaming
-                    } catch {
-                        AppLogger.transcription.error(
-                            "Parakeet live preview is unavailable: \(error.localizedDescription)"
-                        )
-                    }
-                } catch {
-                    self.appState.lastError = error.localizedDescription
-                }
-            case .whisperKit:
-                let engine = WhisperKitEngine(appState: self.appState, modelManager: self.modelManager)
-                await engine.initialize()
-                self.transcriptionEngine = engine
-                let modelName = self.appState.whisperModel.rawValue
-                let cachedModelFolder = self.modelManager.findModelFolder(for: modelName)
-                let streaming = WhisperKitStreamingTranscriber(
-                    model: modelName,
-                    downloadBase: self.modelManager.devDownloadBase,
-                    modelFolder: cachedModelFolder,
-                    download: cachedModelFolder == nil,
-                    decodingOptions: DecodingOptions(
-                        verbose: false,
-                        task: .transcribe,
-                        language: "en",
-                        temperature: 0,
-                        usePrefillPrompt: true,
-                        usePrefillCache: true,
-                        skipSpecialTokens: true,
-                        withoutTimestamps: false
-                    )
-                )
-                do {
-                    try await streaming.prepare()
-                    self.streamingTranscriber = streaming
-                } catch {
-                    AppLogger.transcription.error(
-                        "WhisperKit live preview is unavailable: \(error.localizedDescription)"
-                    )
-                }
+            do {
+                let prepared = try await self.engineCoordinator.prepare(selection: selection)
+                try Task.checkCancellation()
+                guard self.appState.asrSelection == selection else { return }
+                self.transcriptionEngine = prepared.engine
+                // One delayed FluidAudio EOU path serves every authoritative
+                // engine and never participates in onboarding readiness.
+                self.streamingTranscriber = FluidAudioParakeetStreamingTranscriber()
+                self.appState.engineReady = true
+                self.appState.lastError = nil
+            } catch is CancellationError {
+                return
+            } catch EngineCoordinatorError.stalePreparation {
+                return
+            } catch {
+                guard self.appState.asrSelection == selection else { return }
+                self.transcriptionEngine = nil
+                self.streamingTranscriber = nil
+                self.appState.engineReady = false
+                self.appState.lastError = error.localizedDescription
             }
             self.appState.isInitializingEngine = false
-            self.appState.engineReady = self.transcriptionEngine != nil
             self.updateEngineMenuItem()
             onCompletion?(self.appState.engineReady)
         }
@@ -1765,7 +1828,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onOpenAccessibility: { [weak self] in self?.openPrivacyPane("Privacy_Accessibility") },
             onImportRaycastVocabulary: { [weak self] text in
                 self?.importRaycastVocabulary(text)
-            }
+            },
+            onVerifyModel: { [weak self] in self?.verifySelectedModel() },
+            onRepairModel: { [weak self] in self?.confirmRepairSelectedModel() }
         )
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 646, height: 580),
@@ -1801,6 +1866,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.runModal()
     }
 
+    private func verifySelectedModel() {
+        guard activeSession == nil else {
+            appState.lastError = "Finish the current dictation before verifying its speech model."
+            return
+        }
+        let selection = appState.asrSelection
+        engineTask?.cancel()
+        appState.engineReady = false
+        engineTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let prepared = try await self.engineCoordinator.verify(selection: selection)
+                guard self.appState.asrSelection == selection else { return }
+                self.transcriptionEngine = prepared.engine
+                self.streamingTranscriber = FluidAudioParakeetStreamingTranscriber()
+                self.appState.engineReady = true
+                self.appState.lastError = nil
+            } catch {
+                guard self.appState.asrSelection == selection else { return }
+                self.transcriptionEngine = nil
+                self.streamingTranscriber = nil
+                self.appState.engineReady = false
+                self.appState.lastError = "Model verification failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func confirmRepairSelectedModel() {
+        guard activeSession == nil else {
+            appState.lastError = "Finish the current dictation before repairing its speech model."
+            return
+        }
+        let selection = appState.asrSelection
+        let alert = NSAlert()
+        alert.messageText = "Repair \(selection.displayName)?"
+        alert.informativeText = "Local Dictation will quarantine only its owned copy of this model, then download and validate a fresh copy from \(selection.sourceHost). Other apps' models are never touched."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Repair")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        engineTask?.cancel()
+        transcriptionEngine = nil
+        streamingTranscriber = nil
+        appState.engineReady = false
+        engineTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let prepared = try await self.engineCoordinator.repair(selection: selection)
+                guard self.appState.asrSelection == selection else { return }
+                self.transcriptionEngine = prepared.engine
+                self.streamingTranscriber = FluidAudioParakeetStreamingTranscriber()
+                self.appState.engineReady = true
+                self.appState.lastError = nil
+            } catch {
+                guard self.appState.asrSelection == selection else { return }
+                self.appState.lastError = "Model repair failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
     @objc private func quit() {
         NSApp.terminate(nil)
     }
@@ -1832,12 +1958,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateEngineMenuItem() {
-        switch appState.transcriptionEngine {
-        case .parakeet:
-            engineMenuItem?.title = "Engine: \(appState.parakeetModel.displayName)"
-        case .whisperKit:
-            engineMenuItem?.title = "Engine: WhisperKit \(appState.whisperModel.displayName)"
-        }
+        engineMenuItem?.title = "Engine: \(appState.asrSelection.displayName)"
     }
 
     private func cleanupOrphanedTemporaryAudio() {

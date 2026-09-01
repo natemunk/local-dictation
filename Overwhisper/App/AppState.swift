@@ -39,26 +39,6 @@ enum ParakeetModelType: String, Codable, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    var size: String {
-        switch self {
-        case .v2English: "~600 MB"
-        case .v3Multilingual: "~700 MB"
-        }
-    }
-
-    var cacheDirectoryName: String {
-        switch self {
-        case .v2English: "parakeet-tdt-0.6b-v2"
-        case .v3Multilingual: "parakeet-tdt-0.6b-v3"
-        }
-    }
-
-    var cacheURL: URL? {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("FluidAudio", isDirectory: true)
-            .appendingPathComponent("Models", isDirectory: true)
-            .appendingPathComponent(cacheDirectoryName, isDirectory: true)
-    }
 }
 
 enum WhisperModel: String, Codable, CaseIterable, Identifiable, Sendable {
@@ -74,12 +54,6 @@ enum WhisperModel: String, Codable, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    var size: String {
-        switch self {
-        case .smallEn: "~500 MB"
-        case .largeV3Turbo: "~1.6 GB"
-        }
-    }
 }
 
 struct LiveTranscript: Equatable, Sendable {
@@ -111,26 +85,22 @@ final class AppState: ObservableObject {
     @Published var selectedInputDeviceUID: String {
         didSet { preferences.set(selectedInputDeviceUID, forKey: LocalDictationPreferenceKey.selectedInputDeviceUID) }
     }
-    @Published var transcriptionEngine: TranscriptionEngineType {
-        didSet { preferences.set(transcriptionEngine.rawValue, forKey: LocalDictationPreferenceKey.transcriptionEngine) }
-    }
-    @Published var parakeetModel: ParakeetModelType {
-        didSet { preferences.set(parakeetModel.rawValue, forKey: LocalDictationPreferenceKey.parakeetModel) }
-    }
-    @Published var whisperModel: WhisperModel {
-        didSet { preferences.set(whisperModel.rawValue, forKey: LocalDictationPreferenceKey.whisperModel) }
+    @Published var asrSelection: ASRSelection {
+        didSet {
+            preferences.set(
+                asrSelection.rawValue,
+                forKey: LocalDictationPreferenceKey.asrSelection
+            )
+        }
     }
     @Published var language = "en"
     @Published var customVocabulary = ""
     @Published var raycastVocabularyImportText = ""
 
-    @Published var isModelDownloaded = false
     @Published var modelDownloadProgress: Double = 0
     @Published var isDownloadingModel = false
     @Published var isInitializingEngine = false
     @Published var engineReady = false
-    @Published var downloadedModels: Set<String> = []
-    @Published var parakeetDownloadedModels: Set<String> = []
     @Published var currentlyDownloadingModel: String?
 
     @Published var lastTranscription = ""
@@ -169,13 +139,33 @@ final class AppState: ObservableObject {
         selectedInputDeviceUID = preferences.string(
             forKey: LocalDictationPreferenceKey.selectedInputDeviceUID
         ) ?? ""
-        transcriptionEngine = preferences.string(forKey: LocalDictationPreferenceKey.transcriptionEngine)
-            .flatMap(TranscriptionEngineType.init(rawValue:)) ?? .parakeet
-        parakeetModel = preferences.string(forKey: LocalDictationPreferenceKey.parakeetModel)
-            .flatMap(ParakeetModelType.init(rawValue:)) ?? .v2English
-        whisperModel = preferences.string(forKey: LocalDictationPreferenceKey.whisperModel)
-            .flatMap(WhisperModel.init(rawValue:)) ?? .smallEn
+        if let persisted = preferences.string(forKey: LocalDictationPreferenceKey.asrSelection)
+            .flatMap(ASRSelection.init(rawValue:)) {
+            asrSelection = persisted
+        } else {
+            let migrated = Self.migratedASRSelection(from: preferences)
+            asrSelection = migrated
+            preferences.set(
+                migrated.rawValue,
+                forKey: LocalDictationPreferenceKey.asrSelection
+            )
+        }
         retainDebugAudio = preferences.bool(forKey: LocalDictationPreferenceKey.retainDebugAudio)
+    }
+
+    private static func migratedASRSelection(from preferences: UserDefaults) -> ASRSelection {
+        let family = preferences.string(forKey: LocalDictationPreferenceKey.transcriptionEngine)
+            .flatMap(TranscriptionEngineType.init(rawValue:)) ?? .parakeet
+        switch family {
+        case .parakeet:
+            let model = preferences.string(forKey: LocalDictationPreferenceKey.parakeetModel)
+                .flatMap(ParakeetModelType.init(rawValue:)) ?? .v2English
+            return model == .v3Multilingual ? .parakeetV3 : .parakeetV2
+        case .whisperKit:
+            let model = preferences.string(forKey: LocalDictationPreferenceKey.whisperModel)
+                .flatMap(WhisperModel.init(rawValue:)) ?? .smallEn
+            return model == .largeV3Turbo ? .whisperLargeV3Turbo : .whisperSmallEn
+        }
     }
 
     func beginRecording() {
@@ -244,6 +234,8 @@ final class AppState: ObservableObject {
 enum LocalDictationPreferenceKey {
     static let overlayPosition = "LocalDictation.overlayPosition.v1"
     static let selectedInputDeviceUID = "LocalDictation.selectedInputDeviceUID.v1"
+    static let asrSelection = "LocalDictation.asrSelection.v1"
+    // Legacy keys are retained only for one-time migration.
     static let transcriptionEngine = "LocalDictation.transcriptionEngine.v1"
     static let parakeetModel = "LocalDictation.parakeetModel.v1"
     static let whisperModel = "LocalDictation.whisperModel.v1"

@@ -9,7 +9,10 @@ actor FluidAudioParakeetStreamingTranscriber: StreamingTranscriber {
     private static let requiredSampleRate = 16_000
 
     private let manager: StreamingEouAsrManager
+    private let modelRootURL: URL
+    private let preparationDelay: Duration
     private var isPrepared = false
+    private var preparationTask: Task<Void, Error>?
 
     private var sessionID: UUID?
     private var worker: Task<Void, Never>?
@@ -19,22 +22,60 @@ actor FluidAudioParakeetStreamingTranscriber: StreamingTranscriber {
     private var latestUpdate = TranscriptUpdate(finalized: "", volatile: "")
 
     init(
-        manager: StreamingEouAsrManager = StreamingEouAsrManager(chunkSize: .ms320)
+        manager: StreamingEouAsrManager = StreamingEouAsrManager(chunkSize: .ms320),
+        modelRootURL: URL = FluidAudioParakeetStreamingTranscriber.defaultModelRootURL(),
+        preparationDelay: Duration = .milliseconds(1_500)
     ) {
         self.manager = manager
+        self.modelRootURL = modelRootURL
+        self.preparationDelay = preparationDelay
     }
 
     func prepare() async throws {
         guard !isPrepared else { return }
-        try await manager.loadModels()
-        isPrepared = true
+        if let preparationTask {
+            try await preparationTask.value
+            try Task.checkCancellation()
+            isPrepared = true
+            return
+        }
+
+        let root = modelRootURL
+        let manager = manager
+        let task = Task<Void, Error> {
+            try Task.checkCancellation()
+            try FileManager.default.createDirectory(
+                at: root,
+                withIntermediateDirectories: true
+            )
+            try await manager.loadModels(to: root)
+            try Task.checkCancellation()
+        }
+        preparationTask = task
+        do {
+            try await task.value
+            try Task.checkCancellation()
+            preparationTask = nil
+            isPrepared = true
+        } catch {
+            preparationTask = nil
+            throw error
+        }
     }
 
     func start(
         samples: AsyncStream<AudioChunk>
     ) async throws -> AsyncStream<TranscriptUpdate> {
-        guard isPrepared else { throw StreamingTranscriberError.notPrepared }
         guard worker == nil else { throw StreamingTranscriberError.alreadyRunning }
+
+        // EOU is an optional preview aid. Delay its first preparation so short
+        // dictations never compete with the authoritative batch engine, and so
+        // onboarding/model readiness never depends on the auxiliary download.
+        if !isPrepared {
+            try await Task.sleep(for: preparationDelay)
+            try await prepare()
+        }
+        try Task.checkCancellation()
 
         await manager.reset()
 
@@ -98,6 +139,8 @@ actor FluidAudioParakeetStreamingTranscriber: StreamingTranscriber {
     }
 
     func cancel() async {
+        preparationTask?.cancel()
+        preparationTask = nil
         guard let id = sessionID else { return }
         await cancel(sessionID: id)
     }
@@ -227,6 +270,20 @@ actor FluidAudioParakeetStreamingTranscriber: StreamingTranscriber {
         activeWorker?.cancel()
         continuation?.finish()
         await manager.reset()
+    }
+
+    nonisolated private static func defaultModelRootURL() -> URL {
+        let appSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first!
+        return appSupport
+            .appendingPathComponent("LocalDictation", isDirectory: true)
+            .appendingPathComponent("Models", isDirectory: true)
+            .appendingPathComponent("v1", isDirectory: true)
+            .appendingPathComponent("eou-preview", isDirectory: true)
+            .appendingPathComponent("fluidaudio-0.14.3", isDirectory: true)
+            .appendingPathComponent("current", isDirectory: true)
     }
 }
 

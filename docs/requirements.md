@@ -71,7 +71,7 @@ Final-transcription candidates are:
 - WhisperKit `small.en`.
 - WhisperKit `large-v3_turbo`.
 
-Live-preview candidates are FluidAudio Parakeet EOU 320 ms and WhisperKit streaming. A live-preview winner may differ from the authoritative final engine.
+Live preview uses one lazy FluidAudio Parakeet EOU 320 ms path for every authoritative engine. It starts only after roughly 1.5 seconds, never gates onboarding or insertion, and remains separate from final-engine scoring.
 
 The corpus contains at least 20 fresh opt-in audio/reference samples across technical vocabulary, corrections, enumeration, spoken commands, short dictations, two-minute passages, noise, and device changes. The cleanup corpus contains at least 10 separate raw-to-ideal pairs. Existing Raycast recordings are excluded unless Nate gives explicit opt-in for those recordings.
 
