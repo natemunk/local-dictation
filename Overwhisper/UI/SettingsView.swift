@@ -222,6 +222,13 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                 DebugRetentionControls(store: appState.debugSessionStore)
             }
+
+            Section("Clipboard") {
+                Toggle("Private Clipboard Mode", isOn: $appState.privateClipboardMode)
+                Text("Off by default so clipboard managers can retain dictations. When enabled, Local Dictation adds best-effort concealed and transient pasteboard markers; the transcript still remains on the clipboard after an insertion attempt.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
     }

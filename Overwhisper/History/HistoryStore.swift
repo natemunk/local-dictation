@@ -340,10 +340,12 @@ final class HistoryStore: @unchecked Sendable {
                 HistoryDeliveryStatus.delivered.rawValue,
                 HistoryDeliveryStatus.previewed.rawValue,
                 HistoryDeliveryStatus.pastedRaw.rawValue,
+                HistoryDeliveryStatus.pasteEventSent.rawValue,
+                HistoryDeliveryStatus.clipboardOnly.rawValue,
             ]
             let predicate = """
                 \(Column.timestamp) < ?
-                AND \(Column.deliveryStatus) IN (?, ?, ?)
+                AND \(Column.deliveryStatus) IN (?, ?, ?, ?, ?)
                 """
             let count = try Int.fetchOne(
                 db,

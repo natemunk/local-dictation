@@ -86,7 +86,12 @@ struct CleanupPipeline: Sendable {
                 let generated = try await refiner.refine(input)
                 do {
                     try validator.validate(generated: generated, against: input)
-                    return CleanupResult(text: generated, metadata: metadata, outcome: .accepted)
+                    let normalized = deterministicFallback.normalizeAccepted(
+                        generated,
+                        preserving: input.protectedSpans
+                    )
+                    try validator.validate(generated: normalized, against: input)
+                    return CleanupResult(text: normalized, metadata: metadata, outcome: .accepted)
                 } catch let failure as RefinementValidationFailure {
                     return try await fallbackResult(
                         input: input,

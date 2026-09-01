@@ -40,9 +40,7 @@ enum CleanupText {
     static func stringIndex(in text: String, atUTF8Offset offset: Int) -> String.Index? {
         guard offset >= 0, offset <= text.utf8.count else { return nil }
         let utf8Index = text.utf8.index(text.utf8.startIndex, offsetBy: offset)
-        guard let index = String.Index(utf8Index, within: text) else { return nil }
-        guard index == text.endIndex || text.indices.contains(index) else { return nil }
-        return index
+        return String.Index(utf8Index, within: text)
     }
 
     static func stringRange(in text: String, for range: CleanupTextRange) -> Range<String.Index>? {
@@ -81,6 +79,9 @@ enum CleanupText {
 }
 
 struct CleanupCommandProcessor: Sendable {
+    private static let sentenceBoundaryCharacters = CharacterSet(charactersIn: ".!?")
+    private static let closingBoundaryCharacters = CharacterSet(charactersIn: "\"'”’)]}")
+
     private static let recognizedExpression = try! NSRegularExpression(
         pattern: #"(?<![\p{L}\p{N}_])(?:make[ \t]+that[ \t]+a[ \t]+bullet[ \t]+list|new[ \t]+paragraph|scratch[ \t]+that|new[ \t]+line|bullet[ \t]+list)(?![\p{L}\p{N}_])"#,
         options: [.caseInsensitive]
@@ -94,11 +95,18 @@ struct CleanupCommandProcessor: Sendable {
     )
 
     func analyze(_ text: String) -> CleanupCommandResult {
-        let recognized = recognizedMatches(in: text)
+        analyze(FinalTranscript(text: text))
+    }
+
+    func analyze(_ transcript: FinalTranscript) -> CleanupCommandResult {
+        let analysis = commandAnalysis(
+            in: transcript.text,
+            boundaries: transcript.boundaries
+        )
         return CleanupCommandResult(
-            text: text,
-            recognizedCommands: recognized.map(\.occurrence),
-            unrecognizedCommandCandidates: unsupportedMatches(in: text)
+            text: transcript.text,
+            recognizedCommands: analysis.recognized.map(\.occurrence),
+            unrecognizedCommandCandidates: analysis.unrecognized
         )
     }
 
@@ -108,7 +116,8 @@ struct CleanupCommandProcessor: Sendable {
 
     func process(_ transcript: FinalTranscript) -> CleanupCommandResult {
         let text = transcript.text
-        let matches = recognizedMatches(in: text)
+        let analysis = commandAnalysis(in: text, boundaries: transcript.boundaries)
+        let matches = analysis.recognized
         var output = ""
         var outputBoundaryOffsets: [Int] = []
         var cursor = text.startIndex
@@ -172,7 +181,7 @@ struct CleanupCommandProcessor: Sendable {
         return CleanupCommandResult(
             text: output,
             recognizedCommands: matches.map(\.occurrence),
-            unrecognizedCommandCandidates: unsupportedMatches(in: text)
+            unrecognizedCommandCandidates: analysis.unrecognized
         )
     }
 
@@ -216,7 +225,46 @@ struct CleanupCommandProcessor: Sendable {
         let stringRange: Range<String.Index>
     }
 
-    private func recognizedMatches(in text: String) -> [RecognizedMatch] {
+    private struct CommandAnalysis {
+        let recognized: [RecognizedMatch]
+        let unrecognized: [CleanupUnrecognizedCommandCandidate]
+    }
+
+    private func commandAnalysis(
+        in text: String,
+        boundaries: [TranscriptBoundary]
+    ) -> CommandAnalysis {
+        let allMatches = allRecognizedMatches(in: text)
+        let recognized = allMatches.filter { match in
+            isStandalone(
+                match,
+                in: text,
+                boundaries: boundaries,
+                allMatches: allMatches
+            )
+        }
+        let recognizedRanges = Set(recognized.map { $0.occurrence.sourceRange })
+        let invalidRecognized = allMatches
+            .filter { !recognizedRanges.contains($0.occurrence.sourceRange) }
+            .map { match in
+                CleanupUnrecognizedCommandCandidate(
+                    phrase: match.occurrence.phrase,
+                    sourceRange: match.occurrence.sourceRange
+                )
+            }
+        let allUnrecognized = invalidRecognized + unsupportedMatches(in: text)
+        return CommandAnalysis(
+            recognized: recognized,
+            unrecognized: allUnrecognized.sorted {
+                if $0.sourceRange.lowerBound != $1.sourceRange.lowerBound {
+                    return $0.sourceRange.lowerBound < $1.sourceRange.lowerBound
+                }
+                return $0.sourceRange.upperBound < $1.sourceRange.upperBound
+            }
+        )
+    }
+
+    private func allRecognizedMatches(in text: String) -> [RecognizedMatch] {
         let fullRange = NSRange(text.startIndex..<text.endIndex, in: text)
         return Self.recognizedExpression.matches(in: text, range: fullRange).compactMap { match in
             guard let stringRange = Range(match.range, in: text) else { return nil }
@@ -231,6 +279,122 @@ struct CleanupCommandProcessor: Sendable {
                 stringRange: stringRange
             )
         }
+    }
+
+    private func isStandalone(
+        _ match: RecognizedMatch,
+        in text: String,
+        boundaries: [TranscriptBoundary],
+        allMatches: [RecognizedMatch]
+    ) -> Bool {
+        guard hasBoundary(
+            before: match.stringRange.lowerBound,
+            in: text,
+            boundaries: boundaries
+        ), hasBoundary(
+            after: match.stringRange.upperBound,
+            in: text,
+            boundaries: boundaries
+        ) else {
+            return false
+        }
+
+        guard match.occurrence.kind == .scratchThat else { return true }
+        return hasPriorBoundedPhrase(
+            before: match.stringRange.lowerBound,
+            in: text,
+            excluding: allMatches
+        )
+    }
+
+    private func hasBoundary(
+        before index: String.Index,
+        in text: String,
+        boundaries: [TranscriptBoundary]
+    ) -> Bool {
+        let prefix = text[..<index]
+        if prefix.allSatisfy(\.isWhitespace) {
+            return true
+        }
+
+        var cursor = index
+        while cursor > text.startIndex {
+            let previous = text.index(before: cursor)
+            let character = text[previous]
+            if character.isWhitespace || Self.closingBoundaryCharacters.contains(character.unicodeScalars.first!) {
+                cursor = previous
+                continue
+            }
+            if Self.sentenceBoundaryCharacters.contains(character.unicodeScalars.first!) {
+                return true
+            }
+            break
+        }
+
+        let targetOffset = text[..<index].utf8.count
+        return boundaries.contains { boundary in
+            guard isTrustworthy(boundary.source), boundary.utf8Offset <= targetOffset else {
+                return false
+            }
+            let gap = CleanupTextRange(boundary.utf8Offset, targetOffset)
+            return CleanupText.substring(in: text, range: gap)?.allSatisfy(\.isWhitespace) == true
+        }
+    }
+
+    private func hasBoundary(
+        after index: String.Index,
+        in text: String,
+        boundaries: [TranscriptBoundary]
+    ) -> Bool {
+        let suffix = text[index...]
+        if suffix.allSatisfy(\.isWhitespace) {
+            return true
+        }
+
+        var cursor = index
+        while cursor < text.endIndex {
+            let character = text[cursor]
+            if character.isWhitespace || Self.closingBoundaryCharacters.contains(character.unicodeScalars.first!) {
+                cursor = text.index(after: cursor)
+                continue
+            }
+            if Self.sentenceBoundaryCharacters.contains(character.unicodeScalars.first!) {
+                return true
+            }
+            break
+        }
+
+        let targetOffset = text[..<index].utf8.count
+        return boundaries.contains { boundary in
+            guard isTrustworthy(boundary.source), boundary.utf8Offset >= targetOffset else {
+                return false
+            }
+            let gap = CleanupTextRange(targetOffset, boundary.utf8Offset)
+            return CleanupText.substring(in: text, range: gap)?.allSatisfy(\.isWhitespace) == true
+        }
+    }
+
+    private func isTrustworthy(_ source: TranscriptBoundarySource) -> Bool {
+        switch source {
+        case .pause, .segment:
+            true
+        }
+    }
+
+    private func hasPriorBoundedPhrase(
+        before index: String.Index,
+        in text: String,
+        excluding commandMatches: [RecognizedMatch]
+    ) -> Bool {
+        let priorMatches = commandMatches.filter { $0.stringRange.upperBound <= index }
+        var cursor = text.startIndex
+        var priorText = ""
+        for match in priorMatches {
+            priorText.append(contentsOf: text[cursor..<match.stringRange.lowerBound])
+            cursor = match.stringRange.upperBound
+        }
+        priorText.append(contentsOf: text[cursor..<index])
+        return !CleanupText.lexicalTokens(in: priorText).isEmpty
     }
 
     private func unsupportedMatches(in text: String) -> [CleanupUnrecognizedCommandCandidate] {
@@ -277,10 +441,17 @@ struct CleanupCommandProcessor: Sendable {
     }
 
     private func trimDanglingBullet(in text: inout String) {
-        if text.hasSuffix("\n- ") {
-            text.removeLast(3)
-        } else if text == "- " {
-            text = ""
+        while true {
+            trimTrailingHorizontalWhitespace(in: &text)
+            if text == "-" {
+                text = ""
+                continue
+            }
+            if text.hasSuffix("\n-") {
+                text.removeLast(2)
+                continue
+            }
+            break
         }
     }
 
@@ -348,7 +519,7 @@ struct CleanupCommandProcessor: Sendable {
     private func makeLastParagraphABulletList(in text: inout String) {
         text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else {
-            text = "- "
+            text = ""
             return
         }
 

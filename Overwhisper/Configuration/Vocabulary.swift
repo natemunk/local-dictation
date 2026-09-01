@@ -174,8 +174,14 @@ struct VocabularyCatalog: Equatable, Sendable {
             protectedTerms: global.protectedTerms,
             patterns: global.patterns
         )
+        // Personal corrections are global user intent, not profile-specific
+        // behavior. Apply them last so an explicit personal correction wins
+        // over bundled or profile packs immediately after reload/import.
+        let orderedPackIDs = packIDs.filter {
+            $0.caseInsensitiveCompare("personal") != .orderedSame
+        } + (packs["personal"] == nil ? [] : ["personal"])
         var seen = Set<String>()
-        for id in packIDs where seen.insert(id).inserted {
+        for id in orderedPackIDs where seen.insert(id.lowercased()).inserted {
             if let pack = packs[id] {
                 selection = selection.combining(pack)
             }

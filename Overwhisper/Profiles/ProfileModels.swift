@@ -81,3 +81,13 @@ struct ProfileCatalog: Equatable, Sendable {
         profiles[id]
     }
 }
+
+enum TerminalProfilePolicy {
+    static func enforcingSafety(on profile: DictationProfile) -> DictationProfile {
+        var profile = profile
+        profile.mode = .literal
+        profile.formattingStyle = .terminal
+        profile.cleanupEnabled = false
+        return profile
+    }
+}

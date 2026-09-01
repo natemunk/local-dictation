@@ -4,6 +4,22 @@ extension ProfileCatalog {
     static let nativeDefaults: ProfileCatalog = {
         let profiles = [
             DictationProfile(
+                id: "terminal",
+                mode: .literal,
+                formattingStyle: .terminal,
+                cleanupEnabled: false,
+                vocabularyPackIDs: ["symphony"],
+                match: ProfileMatch(
+                    bundleIdentifiers: [
+                        "com.mitchellh.ghostty",
+                        "com.apple.Terminal",
+                        "com.googlecode.iterm2",
+                        "dev.warp.Warp",
+                        "dev.warp.Warp-Stable",
+                    ]
+                )
+            ),
+            DictationProfile(
                 id: "ghostty",
                 mode: .literal,
                 formattingStyle: .terminal,

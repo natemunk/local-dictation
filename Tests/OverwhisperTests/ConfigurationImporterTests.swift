@@ -43,6 +43,10 @@ struct ConfigurationImporterTests {
             loaded.snapshot.vocabulary.packs["personal"]?.literalPhrases
                 == file.literalPhrases
         )
+        #expect(
+            loaded.snapshot.vocabulary.selection(including: []).literalPhrases
+                .contains("OpenRouter")
+        )
     }
 
     @Test("malformed pasted input cannot replace an existing personal pack")

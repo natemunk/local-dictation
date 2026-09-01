@@ -42,6 +42,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let coordinator = DictationCoordinator(tapHoldThreshold: 0.350)
     private let configurationStore = ConfigurationStore()
     private let browserHostnameProvider = BrowserAutomationHostnameProvider()
+    private let pasteAgainQueue = SerializedPasteAgainQueue()
     private var configuration = ConfigurationSnapshot.typedDefaults
     private var profileResolver = ProfileResolver(catalog: .nativeDefaults)
     private var historyStore: HistoryStore?
@@ -64,6 +65,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var engineMenuItem: NSMenuItem?
     private var remoteMenuItem: NSMenuItem?
     private var lastTextMenuItem: NSMenuItem?
+    private var pasteLastMenuItem: NSMenuItem?
 
     private var cancellables = Set<AnyCancellable>()
     private var engineTask: Task<Void, Never>?
@@ -97,6 +99,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         engineTask?.cancel()
+        pasteAgainQueue.cancelPending()
         if let session = activeSession {
             session.finalizationTask?.cancel()
             session.streamingStartTask?.cancel()
@@ -149,7 +152,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         overlayWindow = OverlayWindow(appState: appState) { [weak self] in
             self?.cancelFromUI()
         }
-        textInserter = TextInserter()
+        let clipboardState = appState
+        textInserter = TextInserter(
+            privateClipboardMode: { [weak clipboardState] in
+                clipboardState?.privateClipboardMode ?? false
+            }
+        )
         let modelStore = OwnedModelStore()
         engineCoordinator = EngineCoordinator(
             initialSelection: appState.asrSelection,
@@ -391,6 +399,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         copyLast.isEnabled = false
         menu.addItem(copyLast)
         lastTextMenuItem = copyLast
+        let pasteLast = NSMenuItem(
+            title: "Paste Last Dictation",
+            action: #selector(pasteLast),
+            keyEquivalent: ""
+        )
+        pasteLast.target = self
+        pasteLast.isEnabled = false
+        menu.addItem(pasteLast)
+        pasteLastMenuItem = pasteLast
 
         menu.addItem(.separator())
         let history = NSMenuItem(title: "History…", action: #selector(openHistory), keyEquivalent: "")
@@ -661,6 +678,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        // Destination is intentionally resolved at finish so app/Space
+        // switching remains supported. A secure target is terminal: cancel
+        // optional EOU work, delete the WAV, and create no ASR/history/clipboard
+        // artifact for this session.
+        if destination?.isSecureField == true {
+            cancelStreamingSession(token: request.token)
+            if FileManager.default.fileExists(atPath: audioURL.path) {
+                try? FileManager.default.removeItem(at: audioURL)
+            }
+            updateSession(request.token) { $0.audioURL = nil }
+            appState.liveTranscript = LiveTranscript()
+            appState.overlayMessage = "Secure field · recording discarded"
+            completeSession(token: request.token, toastDuration: .milliseconds(250))
+            return
+        }
+
         let watchdog = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(120))
             guard !Task.isCancelled, let self, self.isCurrent(request.token) else { return }
@@ -783,6 +816,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         appState.lastTranscription = raw.text
         lastTextMenuItem?.isEnabled = true
+        pasteLastMenuItem?.isEnabled = true
 
         guard saveRawHistory(
             token: token,
@@ -842,6 +876,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         appState.lastTranscription = raw.text
         lastTextMenuItem?.isEnabled = true
+        pasteLastMenuItem?.isEnabled = true
 
         guard let profile = activeSession?.profile else { return }
         let cleanupMode: CleanupMode = request.mode == .literal
@@ -851,7 +886,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             : .clean
         updateSession(token) { $0.cleanupMode = cleanupMode }
         let commandAnalysis = cleanupMode == .clean
-            ? CleanupCommandProcessor().analyze(raw.text)
+            ? CleanupCommandProcessor().analyze(raw)
             : CleanupCommandResult(
                 text: raw.text,
                 recognizedCommands: [],
@@ -864,10 +899,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             unrecognizedCommands: commandAnalysis.unrecognizedCommandCandidates.map(\.phrase)
         ) else {
             updateSession(token) { $0.deliveredText = raw.text }
-            textInserter.copyOnly(raw.text)
+            let copied = textInserter.copyOnly(raw.text)
             failSession(
                 token: token,
-                "Raw history could not be saved. The transcript was copied to the clipboard; nothing was pasted."
+                copied
+                    ? "Raw history could not be saved. The transcript was copied to the clipboard; nothing was pasted."
+                    : "Raw history and clipboard writes both failed. Nothing was pasted."
             )
             return
         }
@@ -931,8 +968,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             await pasteCurrentText(
                 token: token,
-                showRawLabel: session.pastedRaw || cleanupMode == .literal,
-                failedPolish: session.pastedRaw
+                showRawLabel: session.pastedRaw || cleanupMode == .literal
             )
         }
     }
@@ -957,7 +993,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func pasteCurrentText(
         token: DictationSessionToken,
         showRawLabel: Bool,
-        failedPolish: Bool
+        reactivateDestination: Bool = false
     ) async {
         guard !Task.isCancelled,
               let session = activeSession,
@@ -968,19 +1004,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appState.phase = .pasting
         appState.overlayMessage = "Pasting"
         overlayWindow.show(position: appState.overlayPosition, token: token)
-        let outcome = await textInserter.insertText(
+        let insertionText = safeAutomaticInsertionText(
             session.deliveredText,
             destination: session.destination
         )
-        guard isCurrent(token), let current = activeSession else { return }
+        let outcome = await textInserter.insertText(
+            insertionText,
+            destination: session.destination,
+            reactivateDestination: reactivateDestination
+        )
+        guard isCurrent(token) else { return }
 
         switch outcome {
-        case .pasted:
-            appState.overlayMessage = showRawLabel ? "Pasted raw" : "Pasted"
+        case .pasteEventSent:
+            appState.overlayMessage = showRawLabel ? "Paste sent · raw" : "Paste sent"
             updateHistoryDelivery(
                 token: token,
-                status: failedPolish ? .pastedRaw : .delivered,
-                deliveredText: current.deliveredText
+                status: .pasteEventSent,
+                deliveredText: insertionText
             )
             updateSession(token) { $0.deliveryCommitted = true }
         case .clipboardOnly(let reason):
@@ -988,15 +1029,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             appState.lastError = reason
             updateHistoryDelivery(
                 token: token,
-                status: .failed,
-                deliveredText: current.deliveredText,
+                status: .clipboardOnly,
+                deliveredText: insertionText,
+                error: reason
+            )
+            updateSession(token) { $0.deliveryCommitted = true }
+        case .historyOnly(let reason):
+            appState.overlayMessage = "Saved to history"
+            appState.lastError = reason
+            updateHistoryDelivery(
+                token: token,
+                status: .historyOnly,
+                deliveredText: insertionText,
                 error: reason
             )
             updateSession(token) { $0.deliveryCommitted = true }
         case .cancelled:
+            updateHistoryDelivery(
+                token: token,
+                status: .cancelled,
+                deliveredText: insertionText,
+                error: "Insertion was cancelled"
+            )
             return
         }
-        appState.lastTranscription = current.deliveredText
+        appState.lastTranscription = insertionText
         completeSession(token: token, toastDuration: .milliseconds(250))
     }
 
@@ -1010,7 +1067,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             await self.pasteCurrentText(
                 token: token,
                 showRawLabel: session.pastedRaw || session.cleanupMode == .literal,
-                failedPolish: session.pastedRaw
+                reactivateDestination: true
             )
         }
         updateSession(token) { $0.finalizationTask = task }
@@ -1022,7 +1079,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             $0.deliveredText = text
             $0.deliveryCommitted = true
         }
-        textInserter.copyOnly(text)
+        if !textInserter.copyOnly(text) {
+            appState.lastError = "Could not copy the preview text to the clipboard"
+        }
         updateHistoryDelivery(token: token, status: .previewed, deliveredText: text)
         previewWindow.close(token: token)
         completeSession(token: token)
@@ -1044,11 +1103,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         cancelStreamingSession(token: token)
         if audioRecorder.isRecording { audioRecorder.cancelRecording() }
         if !session.deliveryCommitted,
-           !pasteMayHaveBeenCommitted,
-           let historyStore,
-           let historyID = session.historyID
-        {
-            _ = try? historyStore.delete(id: historyID)
+           let historyID = session.historyID,
+           let historyStore {
+            _ = try? historyStore.updateDelivery(
+                id: historyID,
+                with: HistoryDeliveryUpdate(
+                    status: .cancelled,
+                    deliveredText: session.deliveredText.isEmpty ? nil : session.deliveredText,
+                    totalLatency: Date().timeIntervalSince(session.startedAt),
+                    error: pasteMayHaveBeenCommitted
+                        ? "Cancelled while the paste event status was uncertain"
+                        : "Dictation was cancelled before delivery"
+                )
+            )
         }
         previewWindow.close(token: token)
         completeSession(token: token)
@@ -1260,12 +1327,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func resolveProfile(for destination: DictationDestination?) -> ResolvedProfile {
-        profileResolver.resolve(profileContext(for: destination))
+        if destination?.isTerminal == true,
+           let terminal = configuration.profiles["terminal"]
+                ?? ProfileCatalog.nativeDefaults["terminal"] {
+            return ResolvedProfile(
+                profile: TerminalProfilePolicy.enforcingSafety(on: terminal),
+                source: .accessibility
+            )
+        }
+        return profileResolver.resolve(profileContext(for: destination))
     }
 
     private func resolveProfileIncludingHostname(
         for destination: DictationDestination?
     ) async -> ResolvedProfile {
+        if destination?.isTerminal == true {
+            return resolveProfile(for: destination)
+        }
         let context = profileContext(for: destination)
         do {
             return try await profileResolver.resolve(
@@ -1291,6 +1369,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func profileDisplayName(_ profile: DictationProfile) -> String {
         "\(profile.id.capitalized) · \(profile.mode.rawValue.capitalized)"
+    }
+
+    private func safeAutomaticInsertionText(
+        _ text: String,
+        destination: DictationDestination?
+    ) -> String {
+        destination?.isTerminal == true
+            ? TerminalOutputSafety.collapseLineBreaks(text)
+            : text
     }
 
     private func selectedVocabulary(for profile: DictationProfile) -> VocabularyPack {
@@ -1367,16 +1454,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        switch profile.formattingStyle {
-        case .structured:
-            return base
-        case .chat, .prose, .plain, .terminal:
-            return ProfileFormattingRefiner(
-                base: base,
-                allowInferredBullets: false,
-                preserveParagraphBreakCount: true
-            )
-        }
+        return ProfileFormattingRefiner(
+            base: base,
+            allowInferredBullets: false,
+            preserveParagraphBreakCount: profile.formattingStyle != .structured
+        )
     }
 
     private func openAICompatibleRefiner(deadline: Duration) -> OpenAICompatibleRefiner? {
@@ -1547,12 +1629,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func repasteHistoryText(_ text: String) {
-        let destination = historyRepasteDestination
-        Task { [weak self] in
-            guard let self else { return }
-            let outcome = await self.textInserter.insertText(text, destination: destination)
-            if case .clipboardOnly(let reason) = outcome {
+        enqueuePasteAgain(
+            text,
+            destination: historyRepasteDestination,
+            reactivateDestination: true
+        )
+    }
+
+    private func enqueuePasteAgain(
+        _ text: String,
+        destination: DictationDestination?,
+        reactivateDestination: Bool
+    ) {
+        pasteAgainQueue.enqueue { @MainActor [weak self] in
+            guard let self, !Task.isCancelled else { return }
+            let insertionText = self.safeAutomaticInsertionText(
+                text,
+                destination: destination
+            )
+            let outcome = await self.textInserter.insertText(
+                insertionText,
+                destination: destination,
+                reactivateDestination: reactivateDestination
+            )
+            switch outcome {
+            case .pasteEventSent:
+                self.appState.lastError = nil
+            case .clipboardOnly(let reason), .historyOnly(let reason):
                 self.appState.lastError = reason
+            case .cancelled:
+                break
             }
         }
     }
@@ -1792,7 +1898,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func copyLast() {
         guard !appState.lastTranscription.isEmpty else { return }
-        textInserter.copyOnly(appState.lastTranscription)
+        if !textInserter.copyOnly(appState.lastTranscription) {
+            appState.lastError = "Could not copy the last dictation to the clipboard"
+        }
+    }
+
+    @objc private func pasteLast() {
+        guard !appState.lastTranscription.isEmpty else { return }
+        enqueuePasteAgain(
+            appState.lastTranscription,
+            destination: DictationDestination.captureFrontmost(),
+            reactivateDestination: false
+        )
     }
 
     @objc private func openConfiguration() {

@@ -4,23 +4,84 @@ import Testing
 
 @Suite("Cleanup commands and pipeline")
 struct CleanupPipelineTests {
-    @Test("explicit line and paragraph commands are deterministic")
+    @Test("sentence-bounded line and paragraph commands are deterministic")
     func lineAndParagraphCommands() {
         let result = CleanupCommandProcessor().process(
-            "first new line second new paragraph third"
+            "first. new line. second. new paragraph. third"
         )
 
-        #expect(result.text == "first\nsecond\n\nthird")
+        #expect(result.text == "first.\nsecond.\n\nthird")
         #expect(result.recognizedCommands.map(\.kind) == [.newLine, .newParagraph])
     }
 
-    @Test("scratch that replaces only the latest deterministic segment")
+    @Test("embedded command phrases remain literal and are recorded")
+    func embeddedCommandsRemainLiteral() {
+        let processor = CleanupCommandProcessor()
+
+        for phrase in ["the new line of products", "scratch that idea"] {
+            let result = processor.process(phrase)
+
+            #expect(result.text == phrase)
+            #expect(result.recognizedCommands.isEmpty)
+            #expect(result.unrecognizedCommandCandidates.map(\.phrase) == [
+                phrase == "the new line of products" ? "new line" : "scratch that"
+            ])
+        }
+    }
+
+    @Test("commands without an internal boundary are not inferred from prose")
+    func commandsRequireStandaloneSpans() {
+        let processor = CleanupCommandProcessor()
+        let ambiguous = processor.process("first new line second")
+        #expect(ambiguous.text == "first new line second")
+        #expect(ambiguous.recognizedCommands.isEmpty)
+        #expect(ambiguous.unrecognizedCommandCandidates.map(\.phrase) == ["new line"])
+
+        let raw = "first new line second"
+        let command = transcriptBoundary(raw, around: "new line")
+        let commandEnd = transcriptBoundary(raw, around: "new line", atEnd: true)
+        let bounded = processor.process(
+            FinalTranscript(text: raw, boundaries: [command, commandEnd])
+        )
+        #expect(bounded.text == "first\nsecond")
+        #expect(bounded.recognizedCommands.map(\.kind) == [.newLine])
+
+        let metadataOnly = processor.analyze(
+            FinalTranscript(text: raw, boundaries: [command, commandEnd])
+        )
+        #expect(metadataOnly.text == raw)
+        #expect(metadataOnly.recognizedCommands.map(\.kind) == [.newLine])
+    }
+
+    @Test("scratch that needs a nonempty bounded phrase")
     func scratchThat() {
         let processor = CleanupCommandProcessor()
 
-        #expect(processor.process("Tuesday scratch that Wednesday").text == "Wednesday")
+        let noPriorPhrase = processor.process("scratch that")
+        #expect(noPriorPhrase.text == "scratch that")
+        #expect(noPriorPhrase.recognizedCommands.isEmpty)
+        #expect(noPriorPhrase.unrecognizedCommandCandidates.map(\.phrase) == ["scratch that"])
+
+        let embedded = processor.process("Tuesday scratch that Wednesday")
+        #expect(embedded.text == "Tuesday scratch that Wednesday")
+        #expect(embedded.recognizedCommands.isEmpty)
+        #expect(embedded.unrecognizedCommandCandidates.map(\.phrase) == ["scratch that"])
+
+        let boundedRaw = "Keep this. remove me scratch that replacement"
+        let command = transcriptBoundary(boundedRaw, around: "scratch that")
+        let commandEnd = transcriptBoundary(boundedRaw, around: "scratch that", atEnd: true)
+        let removeMe = transcriptBoundary(boundedRaw, around: "remove me")
+        let bounded = processor.process(
+            FinalTranscript(
+                text: boundedRaw,
+                boundaries: [removeMe, command, commandEnd]
+            )
+        )
+        #expect(bounded.text == "Keep this. replacement")
+        #expect(bounded.recognizedCommands.map(\.kind) == [.scratchThat])
+
         #expect(
-            processor.process("Keep this. remove me scratch that replacement").text
+            processor.process("Keep this. remove me. scratch that. replacement").text
                 == "Keep this. replacement"
         )
     }
@@ -28,15 +89,13 @@ struct CleanupPipelineTests {
     @Test("scratch that uses an ASR pause boundary without punctuation")
     func scratchThatUsesASRPauseBoundary() async throws {
         let raw = "keep this remove me scratch that replacement"
+        let command = transcriptBoundary(raw, around: "scratch that")
+        let commandEnd = transcriptBoundary(raw, around: "scratch that", atEnd: true)
+        let removeMe = transcriptBoundary(raw, around: "remove me")
         let transcript = FinalTranscript(
             text: raw,
             language: "en",
-            boundaries: [
-                TranscriptBoundary(
-                    utf8Offset: "keep this ".utf8.count,
-                    source: .pause
-                )
-            ]
+            boundaries: [removeMe, command, commandEnd]
         )
         let pipeline = CleanupPipeline()
 
@@ -51,7 +110,7 @@ struct CleanupPipelineTests {
     @Test("scratch that falls back to the previous sentence boundary")
     func scratchThatUsesSentenceFallback() async throws {
         let result = try await CleanupPipeline().process(
-            "Keep this. remove me scratch that replacement",
+            "Keep this. remove me. scratch that. replacement",
             mode: .clean
         )
 
@@ -105,13 +164,47 @@ struct CleanupPipelineTests {
     func bulletCommands() {
         let processor = CleanupCommandProcessor()
 
-        let forward = processor.process("bullet list apples new line oranges")
+        let forwardRaw = "bullet list apples new line oranges"
+        let forward = processor.process(
+            FinalTranscript(
+                text: forwardRaw,
+                boundaries: [
+                    transcriptBoundary(forwardRaw, around: "bullet list", atEnd: true),
+                    transcriptBoundary(forwardRaw, around: "new line"),
+                    transcriptBoundary(forwardRaw, around: "new line", atEnd: true),
+                ]
+            )
+        )
         #expect(forward.text == "- apples\n- oranges")
         #expect(forward.recognizedCommands.map(\.kind) == [.bulletList, .newLine])
 
         let retroactive = processor.process("apples. oranges. make that a bullet list")
         #expect(retroactive.text == "- apples.\n- oranges.")
         #expect(retroactive.recognizedCommands.map(\.kind) == [.makeThatABulletList])
+    }
+
+    @Test("a standalone command does not leave an orphan bullet marker")
+    func standaloneBulletCommandsDoNotLeaveOrphans() {
+        let processor = CleanupCommandProcessor()
+
+        for command in ["bullet list", "make that a bullet list"] {
+            let result = processor.process(command)
+            #expect(result.text.isEmpty)
+            #expect(!result.text.contains("-"))
+        }
+
+        let sequence = "bullet list new line"
+        let sequenceResult = processor.process(
+            FinalTranscript(
+                text: sequence,
+                boundaries: [
+                    transcriptBoundary(sequence, around: "bullet list", atEnd: true),
+                    transcriptBoundary(sequence, around: "new line"),
+                ]
+            )
+        )
+        #expect(sequenceResult.text.isEmpty)
+        #expect(!sequenceResult.text.contains("-"))
     }
 
     @Test("unsupported command-like phrases remain text and become metadata")
@@ -250,8 +343,10 @@ struct CleanupPipelineTests {
 
         #expect(result.text == "um bullet list OpenRouter make that bold")
         #expect(result.outcome == .skippedLiteralMode)
-        #expect(result.metadata.recognizedCommands.map(\.kind) == [.bulletList])
-        #expect(result.metadata.unrecognizedCommandCandidates.map(\.phrase) == ["make that bold"])
+        #expect(result.metadata.recognizedCommands.isEmpty)
+        #expect(result.metadata.unrecognizedCommandCandidates.map(\.phrase) == [
+            "bullet list", "make that bold"
+        ])
         #expect(result.metadata.candidateDisfluencies.isEmpty)
     }
 
@@ -260,11 +355,11 @@ struct CleanupPipelineTests {
         let pipeline = CleanupPipeline()
 
         let result = try await pipeline.process(
-            "um bullet list alpha new line beta beta",
+            "um. bullet list. alpha. new line. beta beta",
             mode: .clean
         )
 
-        #expect(result.text == "- alpha\n- beta")
+        #expect(result.text == "- alpha.\n- beta")
         #expect(result.outcome == .accepted)
         #expect(result.metadata.recognizedCommands.map(\.kind) == [.bulletList, .newLine])
         #expect(result.metadata.candidateDisfluencies.map(\.text) == ["um", "beta"])
@@ -281,6 +376,36 @@ struct CleanupPipelineTests {
         #expect(result.text == "erm one two three four five six seven eight nine ten eleven")
         #expect(result.outcome == .accepted)
         #expect(result.metadata.candidateDisfluencies.map(\.text) == ["um", "uh", "erm"])
+    }
+
+    @Test("deterministic cleanup removes orphan punctuation after filler deletion")
+    func deterministicPunctuationCleanup() async throws {
+        let pipeline = CleanupPipeline()
+
+        let cases = [
+            ("um, we should ship.", "we should ship."),
+            ("we should um., ship", "we should ship."),
+            ("um uh, we should ship.", "we should ship."),
+            ("um, \"we should ship.\"", "\"we should ship.\""),
+            ("um, (we should ship).", "(we should ship)."),
+        ]
+
+        for (source, expected) in cases {
+            let result = try await pipeline.process(source, mode: .clean)
+            #expect(result.text == expected)
+        }
+    }
+
+    @Test("accepted model output receives safe punctuation normalization")
+    func acceptedModelOutputGetsSafePunctuationNormalization() async throws {
+        let pipeline = CleanupPipeline(
+            refiner: FixedCleanupRefiner(output: "we should ., ship")
+        )
+
+        let result = try await pipeline.process("we should um., ship", mode: .clean)
+
+        #expect(result.text == "we should ship.")
+        #expect(result.outcome == .accepted)
     }
 
     @Test("invalid generated text falls back deterministically with the validation failure")
@@ -316,4 +441,18 @@ private struct ExplodingCleanupRefiner: TextRefiner {
     func refine(_ input: TextRefinementInput) async throws -> String {
         throw UnexpectedCall()
     }
+}
+
+private func transcriptBoundary(
+    _ text: String,
+    around phrase: String,
+    atEnd: Bool = false,
+    source: TranscriptBoundarySource = .pause
+) -> TranscriptBoundary {
+    let range = text.range(of: phrase)!
+    let byteRange = CleanupText.byteRange(in: text, for: range)
+    return TranscriptBoundary(
+        utf8Offset: atEnd ? byteRange.upperBound : byteRange.lowerBound,
+        source: source
+    )
 }

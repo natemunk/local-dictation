@@ -1,6 +1,6 @@
 # Local Dictation v1 acceptance matrix
 
-Snapshot: 2026-08-31. “Implemented” refers only to source in this checkout. “Automated-verified” refers to the 85-test SwiftPM run across 16 suites on this host. “Fixture-verified” refers only to synthetic scorer fixtures. “Pending” and “blocked” rows are not product claims.
+Snapshot: 2026-08-31. “Implemented” refers only to source in this checkout. “Automated-verified” refers to the 143-test SwiftPM run across 24 suites on this host. “Fixture-verified” refers only to synthetic scorer fixtures. “Pending” and “blocked” rows are not product claims.
 
 ## Evidence states
 
@@ -43,11 +43,12 @@ Snapshot: 2026-08-31. “Implemented” refers only to source in this checkout. 
 | UX-006 | Escape always cancels active/in-flight work and discards temporary audio. | Unit plus temporary-file integration test. | Coordinator cancellation is automated-verified; app/file lifecycle is source-observed and manual integration remains. |
 | UX-007 | Non-activating overlay never steals focus across apps, Spaces, or full-screen windows. | Manual matrix with focus logging. | Pending manual. |
 | UX-008 | Destination/profile resolve at finish after arbitrary app switching. | Cross-app integration test. | Finish-time profile selection is automated-verified; real cross-app destination exercise pending. |
-| UX-009 | Preview returns to captured destination or leaves clipboard safely if invalid. | Preview destination invalidation tests. | Automated-verified for editable destination capture and invalid/focus-lost clipboard fallback; real AX preview round trip remains pending. |
+| UX-009 | Preview returns to the exact captured destination or reviewed focus token, otherwise leaves verified clipboard/history recovery. | Preview destination invalidation tests. | Automated-verified for tier classification, reactivation intent, invalid/focus-lost fallback, and secure refusal; real AX preview round trip remains pending. |
 | UX-010 | Ten-minute warning and fifteen-minute forced preview. | Clock/state/configuration tests plus long-session manual run. | Fifteen-minute routing and rejection of configured caps above 900 seconds are automated-verified; warning and long run remain manual. |
-| INS-001 | Clipboard+Command+V cutover path preserves all representations unless clipboard changed. | Rich clipboard integration tests. | Automated-verified against the macOS pasteboard for successful paste, pre-paste cancellation, and concurrent clipboard changes; cross-app rich-text matrix pending. |
-| INS-002 | Paste failure retains transcript in clipboard/history. | Injected failure plus app manual matrix. | Automated-verified for synthetic paste failure and concurrent clipboard ownership; real-app failure/manual matrix pending. |
-| INS-003 | Direct Accessibility insertion stays disabled per app until selection/rich-text/undo tests pass. | Settings/source audit and per-app matrix. | Required post-cutover. |
+| INS-001 | Clipboard+Command+V leaves transcript text current, uses no PID-only fallback or fixed paste delay, and never overwrites a concurrent copy. | Pasteboard/destination policy tests. | Automated-verified for exact/allowlisted tiers, persistent ordinary/private clipboard data, focus loss, and concurrent clipboard changes; cross-app matrix pending. |
+| INS-002 | Delivery reports `pasteEventSent`, verified `clipboardOnly`, `historyOnly`, or `cancelled`; Paste Again is serialized. | Injected failure/concurrency tests plus app manual matrix. | Automated-verified for synthetic paste failure, secure refusal, serialization, and concurrent clipboard ownership; real-app failure/manual matrix pending. |
+| INS-003 | Secure destinations produce no batch ASR, SQLite, clipboard, or paste artifact. | Secure AX role matrix and file/database inspection. | Destination classification and secure repaste are automated-verified; finish-time real-field evidence pending. |
+| INS-004 | Direct Accessibility insertion stays disabled per app until selection/rich-text/undo tests pass. | Settings/source audit and per-app matrix. | Required post-cutover. |
 
 ## Speech, cleanup, configuration, and history
 
@@ -108,10 +109,10 @@ Snapshot: 2026-08-31. “Implemented” refers only to source in this checkout. 
 | ID | Observation | Evidence | Consequence |
 |---|---|---|---|
 | TOOL-001 | Host is macOS 26.6.2 with Xcode 26.6 (17F113). Normal `xcrun --sdk macosx --find swiftc` fails while loading `libxcodebuildLoader.dylib`: `CoreDevice.framework` references `_XPCTypeBool`, expected in `Mercury.framework`. | Reproduced during this benchmark work. | Normal developer-tool resolution is unreliable. |
-| TOOL-002 | Direct SwiftPM invocation through the Xcode toolchain works when supplied the SDK plus Developer Framework search paths, even though `xcrun` remains broken. | Current run built the app and passed 85 tests in 16 suites. | Automated source contracts are usable on this host; the documented setup script contains the workaround. Repairing Xcode remains advisable for normal tooling. |
+| TOOL-002 | Direct SwiftPM invocation through the Xcode toolchain works when supplied the SDK plus Developer Framework search paths, even though `xcrun` remains broken. | Current run built the app and passed 143 tests in 24 suites. | Automated source contracts are usable on this host; the documented setup script contains the workaround. Repairing Xcode remains advisable for normal tooling. |
 | TOOL-003 | Pure benchmark sources compile with direct `swiftc`, explicit SDK, target `arm64-apple-macosx15.0`, and a writable module cache. | `Benchmark/verify-fixtures.sh` passed. | Scorer mechanics are independently verifiable; this does not clear TOOL-001/002 for the application. |
 | TOOL-004 | Source packaging puts required SwiftPM resource bundles under `Contents/Resources`, signs nested code before the app, and restores its generated dependency checkout. | Reusable app-bundle verifier plus isolated-home CI packaging with an explicit CI-only ad-hoc requirement. | Source implementation present; real per-machine identity creation and two-build TCC retention remain manual gates. Notarization and downloadable binary distribution remain deferred. |
 
 ## Manual application matrix still required
 
-Exercise Ghostty, Slack, Linear, Chrome, Safari, Gmail, Notion, and Notes with app/Space switching, unrelated typing during recording, empty audio, rich text, selected text, endpoint outage, permission denial/revocation, sleep/wake, microphone unplug/switch, and long sessions. Record source revision, build command, OS/hardware, result, and any retained artifacts for each run.
+Exercise Ghostty, Terminal, iTerm2, Warp, VS Code editor/integrated terminal, Slack, Linear, Chrome, Safari, Gmail, Notion, and Notes with wrong-field probes, secure fields, app/Space switching, unrelated typing during recording, empty audio, rich text, selected text, clipboard managers, endpoint outage, permission denial/revocation, sleep/wake, microphone unplug/switch, and long sessions. Record source revision, build command, OS/hardware, result, and any retained artifacts for each run.

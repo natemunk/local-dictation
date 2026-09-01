@@ -15,11 +15,13 @@ struct AppStatePreferencesTests {
         first.overlayPosition = .topRight
         first.selectedInputDeviceUID = "test-microphone"
         first.asrSelection = .whisperLargeV3Turbo
+        first.privateClipboardMode = true
 
         let restored = AppState(preferences: defaults)
         #expect(restored.overlayPosition == .topRight)
         #expect(restored.selectedInputDeviceUID == "test-microphone")
         #expect(restored.asrSelection == .whisperLargeV3Turbo)
+        #expect(restored.privateClipboardMode)
     }
 
     @Test("unknown persisted values fall back to safe defaults")

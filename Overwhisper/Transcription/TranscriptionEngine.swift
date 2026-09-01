@@ -94,8 +94,7 @@ struct FinalTranscript: Equatable, Sendable {
 
     private static func isCharacterBoundary(_ utf8Offset: Int, in text: String) -> Bool {
         let utf8Index = text.utf8.index(text.utf8.startIndex, offsetBy: utf8Offset)
-        guard let index = String.Index(utf8Index, within: text) else { return false }
-        return text.indices.contains(index)
+        return String.Index(utf8Index, within: text) != nil
     }
 }
 

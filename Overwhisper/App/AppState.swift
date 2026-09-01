@@ -112,6 +112,14 @@ final class AppState: ObservableObject {
     @Published var hotkeyMonitoringError: String?
     @Published var hasCompletedOnboarding = false
     @Published var retainDebugAudio: Bool
+    @Published var privateClipboardMode: Bool {
+        didSet {
+            preferences.set(
+                privateClipboardMode,
+                forKey: LocalDictationPreferenceKey.privateClipboardMode
+            )
+        }
+    }
     @Published var refinerAPIKey = KeychainStore.load(
         account: LocalDictationKeychainAccount.openAICompatibleRefiner
     ) ?? ""
@@ -151,6 +159,9 @@ final class AppState: ObservableObject {
             )
         }
         retainDebugAudio = preferences.bool(forKey: LocalDictationPreferenceKey.retainDebugAudio)
+        privateClipboardMode = preferences.bool(
+            forKey: LocalDictationPreferenceKey.privateClipboardMode
+        )
     }
 
     private static func migratedASRSelection(from preferences: UserDefaults) -> ASRSelection {
@@ -240,6 +251,7 @@ enum LocalDictationPreferenceKey {
     static let parakeetModel = "LocalDictation.parakeetModel.v1"
     static let whisperModel = "LocalDictation.whisperModel.v1"
     static let retainDebugAudio = "LocalDictation.retainDebugAudio.v1"
+    static let privateClipboardMode = "LocalDictation.privateClipboardMode.v1"
 }
 
 enum LocalDictationKeychainAccount {

@@ -52,7 +52,7 @@ A finishing Enter must be consumed before the foreground application receives it
 ## Overlay and destination
 
 - The overlay is a non-activating `NSPanel` that remains usable across Spaces and full-screen apps without stealing focus.
-- It shows waveform feedback and the states `Listening`, `Polishing`, `Pasting`, `Pasted raw`, and failure information.
+- It shows waveform feedback and the states `Listening`, `Polishing`, `Pasting`, `Paste sent · raw`, and failure information.
 - Destination application and profile resolve when recording finishes, so the user may switch windows and applications while recording.
 - Preview captures the focused destination before activating its editor. It pastes back only if the destination remains valid; otherwise the result stays on the clipboard.
 - A ten-minute session warns. At fifteen minutes, capture stops and routes to preview rather than automatic insertion.
@@ -148,12 +148,12 @@ Editable configuration lives under:
 
 - Bundled defaults merge with local overrides; local values win.
 - Invalid edits retain the last-known-good configuration and surface a non-blocking diagnostic.
-- A one-time importer accepts a user-supplied comma-separated Raycast vocabulary string and writes a personal pack. It never reads Raycast storage.
+- A one-time importer accepts a user-supplied comma-separated Raycast vocabulary string and writes a personal pack. It never reads Raycast storage. The personal pack is applied last to every profile immediately after a successful reload.
 - Vocabulary supports literal phrases, deterministic replacements, protected terms, and patterns such as `MYE-` followed by digits forced uppercase.
 
 Cutover profile matching uses bundle ID plus focused Accessibility role/subrole:
 
-- Ghostty: Literal; commands and inferred bullets off.
+- Ghostty, Terminal, iTerm2, Warp, and confidently identified VS Code integrated terminals: forced Literal; commands and inferred bullets off; line breaks collapsed before automatic insertion.
 - Slack: casual Clean; explicit bullets only.
 - Linear native: structured Clean; conservative inference; ticket IDs protected.
 - Apple Notes and native Notion: light cleanup with longer paragraphs.
@@ -165,13 +165,17 @@ Hostname profiles are post-cutover v1 work. They are opt-in because Chrome/Chrom
 ## Insertion, history, and retention
 
 - The cutover path uses clipboard plus synthetic Command+V.
-- Every pasteboard representation is snapshotted and restored only if the user has not copied something else in the meantime.
-- Paste failure leaves the result on the clipboard and in history.
+- Exact editable AX elements are the first insertion tier. A same-focus-token fallback is limited to the reviewed Slack, Linear, Chrome/Chromium, Safari, and native Notion bundle allowlist. Missing tokens, changed focus/app, unapproved apps, and timeouts are clipboard-only; PID-only insertion is prohibited.
+- Normal attempts leave ordinary transcript text on the clipboard. Private Clipboard Mode is off by default and adds best-effort concealed/transient markers without changing insertion semantics.
+- Clipboard restore and fixed pre/post-paste sleeps are absent. A concurrent user copy is never overwritten.
+- Delivery reports only `pasteEventSent`, verified `clipboardOnly`, `historyOnly`, or `cancelled`; posting Command+V is not proof that an editor accepted the paste.
+- Secure destinations discard the recording before batch ASR/history/clipboard use. History Paste Again also refuses secure fields without changing the clipboard.
+- Paste failure leaves the result on the clipboard when clipboard ownership is still verified and in history otherwise.
 - Direct `AXSelectedText` insertion is post-cutover and enabled per app only after rich-text, selection, and undo tests pass.
 - Raw text is saved immediately after ASR and before cleanup or insertion.
 - GRDB/SQLite with FTS5 stores timestamp, raw text, polished/delivered text, destination app, mode, delivery/refinement state and latency, and unrecognized command candidates.
 - History never stores browser hostname or page information.
-- Successful history retention defaults to 90 days and supports search, copy, repaste, raw-versus-polished inspection, failed-polish retry, delete entry, and delete all.
+- Successful history retention defaults to 90 days and supports search, copy, serialized Paste Again, raw-versus-polished inspection, failed-polish retry, delete entry, and delete all.
 - Temporary audio is deleted after ASR or cancellation, and crash orphans are cleaned on launch. Debug audio retention is explicit and capped at the latest 10 recordings.
 
 ## Distribution and non-goals

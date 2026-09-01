@@ -12,11 +12,18 @@ enum HistoryDeliveryStatus: String, Codable, CaseIterable, Sendable {
     case delivered = "delivered"
     case previewed = "previewed"
     case pastedRaw = "pasted_raw"
+    case pasteEventSent = "paste_event_sent"
+    case clipboardOnly = "clipboard_only"
+    case historyOnly = "history_only"
     case failed = "failed"
     case cancelled = "cancelled"
 
     var isSuccessful: Bool {
-        self == .delivered || self == .previewed || self == .pastedRaw
+        self == .delivered
+            || self == .previewed
+            || self == .pastedRaw
+            || self == .pasteEventSent
+            || self == .clipboardOnly
     }
 }
 

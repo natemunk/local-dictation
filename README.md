@@ -30,6 +30,8 @@ The global shortcut is Hyper+D (`Command+Control+Option+Shift+D`):
 
 If you type any other key while recording, Enter immediately and permanently returns to the foreground app for that session. The overlay says `Typing detected · Hyper+D to finish`; Hyper+D remains the finisher. Local Dictation never synthesizes Return and cannot auto-submit a form or terminal command.
 
+Insertion is deliberately conservative. Local Dictation posts Command+V only to the exact captured editable AX element or a reviewed same-focus-token app; otherwise it leaves verified text on the clipboard. It never uses a PID-only fallback or claims that posting a paste event proves an editor accepted it. Normal attempts leave ordinary text on the clipboard for clipboard-manager recovery. Optional **Private Clipboard Mode** adds best-effort concealed/transient markers. Secure fields discard the recording before batch transcription, history, or clipboard use. Terminal destinations are forced to Literal mode and automatic insertion removes every line break.
+
 The overlay warns at 10 minutes. Recording stops at the hard 15-minute cap and opens preview instead of inserting automatically; configuration may shorten this cap but cannot extend it.
 
 ## Source build
@@ -98,7 +100,7 @@ Editable TOML configuration is bootstrapped on first launch:
         └── symphony.toml
 ```
 
-Local values override typed defaults. A malformed edit is rejected transactionally and the last-known-good snapshot remains active. The Raycast importer accepts only a comma-separated string you explicitly paste; it never reads Raycast storage.
+Local values override typed defaults. A malformed edit is rejected transactionally and the last-known-good snapshot remains active. The Raycast importer accepts only a comma-separated string you explicitly paste; it never reads Raycast storage. Its `personal` pack is applied to every profile immediately after a successful reload.
 
 Native cutover profiles cover Ghostty, Slack, Linear, Notes, Notion, generic browsers, and a default Clean profile. Browser-hostname profiles are opt-in post-cutover behavior.
 

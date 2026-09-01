@@ -106,6 +106,38 @@ struct DeterministicRefiner: TextRefiner, Sendable {
         return normalizeFormatting(in: removed, preserving: shiftedProtectedSpans)
     }
 
+    func normalizeAccepted(
+        _ text: String,
+        preserving sourceSpans: [CleanupProtectedSpan]
+    ) -> String {
+        let sortedSpans = sourceSpans.sorted {
+            if $0.range.lowerBound != $1.range.lowerBound {
+                return $0.range.lowerBound < $1.range.lowerBound
+            }
+            return $0.range.upperBound < $1.range.upperBound
+        }
+        var cursor = text.startIndex
+        var generatedSpans: [CleanupProtectedSpan] = []
+        for span in sortedSpans {
+            guard let range = text.range(
+                of: span.text,
+                options: [],
+                range: cursor..<text.endIndex
+            ) else {
+                return text
+            }
+            generatedSpans.append(
+                CleanupProtectedSpan(
+                    name: span.name,
+                    text: span.text,
+                    range: CleanupText.byteRange(in: text, for: range)
+                )
+            )
+            cursor = range.upperBound
+        }
+        return normalizeFormatting(in: text, preserving: generatedSpans)
+    }
+
     private func remove(_ ranges: [CleanupTextRange], from text: String) -> String {
         var result = ""
         var cursor = text.startIndex
@@ -135,11 +167,6 @@ struct DeterministicRefiner: TextRefiner, Sendable {
             options: .regularExpression
         )
         normalized = normalized.replacingOccurrences(
-            of: #"([,;:])[ \t]*\1"#,
-            with: "$1",
-            options: .regularExpression
-        )
-        normalized = normalized.replacingOccurrences(
             of: #"[ \t]*\n[ \t]*"#,
             with: "\n",
             options: .regularExpression
@@ -149,12 +176,133 @@ struct DeterministicRefiner: TextRefiner, Sendable {
             with: "\n\n",
             options: .regularExpression
         )
+        normalized = normalizeCorePunctuation(in: normalized)
         normalized = normalized.trimmingCharacters(in: .whitespacesAndNewlines)
 
         for entry in protected.entries.reversed() {
             normalized = normalized.replacingOccurrences(of: entry.placeholder, with: entry.text)
         }
         return normalized
+    }
+
+    /// Applies only punctuation changes that cannot affect lexical tokens.
+    /// A mixed punctuation run left where a deleted token was (for example
+    /// `.,`) is removed and its sentence terminator is retained at the end.
+    /// This keeps the fallback useful without guessing new words or bullets.
+    private func normalizeCorePunctuation(in text: String) -> String {
+        let characters = Array(text)
+        var normalized: [Character] = []
+        var movedSentencePunctuation: Character?
+        var index = 0
+
+        while index < characters.count {
+            let character = characters[index]
+            guard isCorePunctuation(character) else {
+                normalized.append(character)
+                index += 1
+                continue
+            }
+
+            let runStart = index
+            while index < characters.count, isCorePunctuation(characters[index]) {
+                index += 1
+            }
+            let run = Array(characters[runStart..<index])
+            let next = nextNonWhitespace(in: characters, after: index)
+            let hasSentencePunctuation = run.contains(where: isSentencePunctuation)
+            let hasSoftPunctuation = run.contains(where: isSoftPunctuation)
+
+            if run.count > 1, hasSentencePunctuation,
+               (hasSoftPunctuation || run.count > 2),
+               next.map(isWordLike) == true {
+                movedSentencePunctuation = preferredSentencePunctuation(in: run)
+                continue
+            }
+
+            if run.count > 1 {
+                normalized.append(preferredPunctuation(in: run))
+            } else {
+                normalized.append(contentsOf: run)
+            }
+        }
+
+        while let first = normalized.first, first.isWhitespace {
+            normalized.removeFirst()
+        }
+        while let first = normalized.first, isCorePunctuation(first) {
+            normalized.removeFirst()
+            while let next = normalized.first, next.isWhitespace {
+                normalized.removeFirst()
+            }
+        }
+
+        while let last = normalized.last, isSoftPunctuation(last) {
+            normalized.removeLast()
+            while let previous = normalized.last, previous.isWhitespace {
+                normalized.removeLast()
+            }
+        }
+
+        if let movedSentencePunctuation,
+           !hasSentencePunctuationNearEnd(in: normalized) {
+            var insertionIndex = normalized.count
+            while insertionIndex > 0, isClosingDelimiter(normalized[insertionIndex - 1]) {
+                insertionIndex -= 1
+            }
+            normalized.insert(movedSentencePunctuation, at: insertionIndex)
+        }
+
+        return String(normalized)
+    }
+
+    private func isCorePunctuation(_ character: Character) -> Bool {
+        ",.;:!?".contains(character)
+    }
+
+    private func isSentencePunctuation(_ character: Character) -> Bool {
+        ".!?".contains(character)
+    }
+
+    private func isSoftPunctuation(_ character: Character) -> Bool {
+        ",;:".contains(character)
+    }
+
+    private func isClosingDelimiter(_ character: Character) -> Bool {
+        ")]}\"'”’".contains(character)
+    }
+
+    private func isWordLike(_ character: Character) -> Bool {
+        character.isLetter || character.isNumber || character == "\u{E000}"
+    }
+
+    private func nextNonWhitespace(
+        in characters: [Character],
+        after index: Int
+    ) -> Character? {
+        var cursor = index
+        while cursor < characters.count, characters[cursor].isWhitespace {
+            cursor += 1
+        }
+        return cursor < characters.count ? characters[cursor] : nil
+    }
+
+    private func preferredSentencePunctuation(in run: [Character]) -> Character {
+        run.last(where: isSentencePunctuation) ?? "."
+    }
+
+    private func preferredPunctuation(in run: [Character]) -> Character {
+        run.last ?? "."
+    }
+
+    private func hasSentencePunctuationNearEnd(in characters: [Character]) -> Bool {
+        var index = characters.count
+        while index > 0 {
+            let character = characters[index - 1]
+            guard character.isWhitespace || isClosingDelimiter(character) else { break }
+            index -= 1
+        }
+        guard index > 0 else { return false }
+        return isSentencePunctuation(characters[index - 1])
     }
 
     private struct ProtectedPlaceholder {

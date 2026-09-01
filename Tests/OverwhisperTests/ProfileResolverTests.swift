@@ -77,6 +77,24 @@ struct ProfileResolverTests {
         #expect(accessibilityFallback.source == .accessibility)
     }
 
+    @Test("terminal safety cannot be weakened by a configuration override")
+    func terminalSafetyOverride() {
+        let configured = DictationProfile(
+            id: "terminal",
+            mode: .clean,
+            formattingStyle: .structured,
+            cleanupEnabled: true,
+            vocabularyPackIDs: ["personal"]
+        )
+
+        let safe = TerminalProfilePolicy.enforcingSafety(on: configured)
+
+        #expect(safe.mode == .literal)
+        #expect(safe.formattingStyle == .terminal)
+        #expect(!safe.cleanupEnabled)
+        #expect(safe.vocabularyPackIDs == ["personal"])
+    }
+
     @Test("approved hostname can refine a browser without retaining its path")
     func hostnameFallback() throws {
         let resolver = ProfileResolver(

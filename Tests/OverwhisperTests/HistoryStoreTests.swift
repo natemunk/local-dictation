@@ -159,6 +159,39 @@ struct HistoryStoreTests {
         #expect(try store.fetch(id: recentSaved.id) != nil)
     }
 
+    @Test("honest insertion outcomes round-trip without claiming confirmed delivery")
+    func insertionOutcomeStatuses() throws {
+        let store = try HistoryStore.inMemory()
+        let sent = try saveEntry(
+            in: store,
+            timestamp: Date(),
+            rawText: "paste event only",
+            refinementStatus: .notRequested,
+            deliveryStatus: .pasteEventSent
+        )
+        let clipboard = try saveEntry(
+            in: store,
+            timestamp: Date(),
+            rawText: "clipboard recovery",
+            refinementStatus: .notRequested,
+            deliveryStatus: .clipboardOnly
+        )
+        let history = try saveEntry(
+            in: store,
+            timestamp: Date(),
+            rawText: "history recovery",
+            refinementStatus: .notRequested,
+            deliveryStatus: .historyOnly
+        )
+
+        #expect(try store.fetch(id: sent.id)?.deliveryStatus == .pasteEventSent)
+        #expect(try store.fetch(id: clipboard.id)?.deliveryStatus == .clipboardOnly)
+        #expect(try store.fetch(id: history.id)?.deliveryStatus == .historyOnly)
+        #expect(HistoryDeliveryStatus.pasteEventSent.isSuccessful)
+        #expect(HistoryDeliveryStatus.clipboardOnly.isSuccessful)
+        #expect(!HistoryDeliveryStatus.historyOnly.isSuccessful)
+    }
+
     @Test("FTS5 searches raw and polished text and follows updates")
     func fullTextSearch() throws {
         let store = try HistoryStore.inMemory()

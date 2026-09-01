@@ -2,37 +2,52 @@ import AppKit
 import Carbon.HIToolbox
 
 enum InsertionOutcome: Equatable, Sendable {
-    case pasted
+    /// Command+V was posted after every available safety check. This does not
+    /// claim that the destination accepted or rendered the paste.
+    case pasteEventSent
+    /// The transcript is verified as the current clipboard value.
     case clipboardOnly(reason: String)
+    /// No paste was posted and the transcript is not claimed to be retained on
+    /// the clipboard. Normal dictations remain recoverable from local history.
+    case historyOnly(reason: String)
     case cancelled
 }
 
 @MainActor
 final class TextInserter {
+    static let concealedPasteboardType = NSPasteboard.PasteboardType(
+        "org.nspasteboard.ConcealedType"
+    )
+    static let transientPasteboardType = NSPasteboard.PasteboardType(
+        "org.nspasteboard.TransientType"
+    )
+
     private let pasteboard: NSPasteboard
     private let accessibilityPermission: @MainActor () -> Bool
     private let pasteSimulator: @MainActor () -> Bool
-    private let delay: @MainActor (Duration) async throws -> Void
+    private let privateClipboardMode: @MainActor () -> Bool
+    private let yieldBeforeValidation: @MainActor () async -> Void
 
-    init() {
+    init(privateClipboardMode: @escaping @MainActor () -> Bool = { false }) {
         pasteboard = .general
         accessibilityPermission = { AXIsProcessTrusted() }
         pasteSimulator = { TextInserter.postSyntheticPaste() }
-        delay = { duration in
-            try await Task.sleep(for: duration)
-        }
+        self.privateClipboardMode = privateClipboardMode
+        yieldBeforeValidation = { await Task.yield() }
     }
 
     init(
         pasteboard: NSPasteboard,
         accessibilityPermission: @escaping @MainActor () -> Bool,
         pasteSimulator: @escaping @MainActor () -> Bool,
-        delay: @escaping @MainActor (Duration) async throws -> Void
+        privateClipboardMode: @escaping @MainActor () -> Bool = { false },
+        yieldBeforeValidation: @escaping @MainActor () async -> Void = { await Task.yield() }
     ) {
         self.pasteboard = pasteboard
         self.accessibilityPermission = accessibilityPermission
         self.pasteSimulator = pasteSimulator
-        self.delay = delay
+        self.privateClipboardMode = privateClipboardMode
+        self.yieldBeforeValidation = yieldBeforeValidation
     }
 
     static func hasAccessibilityPermission() -> Bool {
@@ -45,93 +60,106 @@ final class TextInserter {
         return AXIsProcessTrustedWithOptions(options)
     }
 
-    /// Uses the audited Overwhisper clipboard + synthetic Command+V path.
-    /// The destination field is validated after preview focus changes; direct
-    /// AX value mutation is deliberately not attempted in v1 cutover.
-    func insertText(_ text: String, destination: DictationDestination?) async -> InsertionOutcome {
+    /// Writes the transcript first, then immediately revalidates destination,
+    /// cancellation, and pasteboard ownership before posting Command+V. The
+    /// transcript remains on the clipboard after every normal attempt.
+    func insertText(
+        _ text: String,
+        destination: DictationDestination?,
+        reactivateDestination: Bool = false
+    ) async -> InsertionOutcome {
         guard !Task.isCancelled else { return .cancelled }
 
+        // Repasting history into a secure field must not touch the clipboard.
+        guard destination?.isSecureField != true else {
+            return .historyOnly(reason: "Secure fields cannot receive dictation or history paste")
+        }
+
+        guard let transcriptChangeCount = writeTranscript(text) else {
+            return .historyOnly(reason: "Could not write the transcript to the clipboard")
+        }
+
         guard accessibilityPermission() else {
-            retainOnClipboard(text, pasteboard: pasteboard)
-            return .clipboardOnly(reason: "Accessibility permission is not granted")
+            return clipboardOutcome(
+                text: text,
+                expectedChangeCount: transcriptChangeCount,
+                reason: "Accessibility permission is not granted"
+            )
         }
 
         guard let destination else {
-            retainOnClipboard(text, pasteboard: pasteboard)
-            return .clipboardOnly(reason: "No focused editable destination was captured")
+            return clipboardOutcome(
+                text: text,
+                expectedChangeCount: transcriptChangeCount,
+                reason: "No focused editable destination was captured"
+            )
         }
 
-        let destinationIsValid = await destination.reactivateAndValidate()
+        await yieldBeforeValidation()
         guard !Task.isCancelled else { return .cancelled }
-        guard destinationIsValid else {
-            retainOnClipboard(text, pasteboard: pasteboard)
-            return .clipboardOnly(reason: "The original destination field is no longer focused")
+        guard clipboardContainsTranscript(text, changeCount: transcriptChangeCount) else {
+            return .historyOnly(reason: "The clipboard changed before paste")
         }
 
-        let savedItems = Self.snapshot(pasteboard)
-        pasteboard.clearContents()
-        let wroteTranscript = pasteboard.setString(text, forType: .string)
-        let transcriptChangeCount = pasteboard.changeCount
-        guard wroteTranscript else {
-            restore(savedItems, ifUnchangedFrom: transcriptChangeCount, on: pasteboard)
-            return .clipboardOnly(reason: "Could not write the transcript to the clipboard")
+        let destinationIsValid = await destination.validateForInsertion(
+            reactivateIfNeeded: reactivateDestination
+        )
+        guard !Task.isCancelled else { return .cancelled }
+        guard destinationIsValid, destination.remainsValidForInsertion() else {
+            return clipboardOutcome(
+                text: text,
+                expectedChangeCount: transcriptChangeCount,
+                reason: "The original destination field is no longer focused"
+            )
         }
-
-        do {
-            try await delay(.milliseconds(75))
-            try Task.checkCancellation()
-        } catch {
-            restore(savedItems, ifUnchangedFrom: transcriptChangeCount, on: pasteboard)
-            return .cancelled
-        }
-
-        guard destination.remainsFocusedAndEditable() else {
-            return .clipboardOnly(reason: "The original destination field is no longer focused")
-        }
-        guard pasteboard.changeCount == transcriptChangeCount else {
-            return .clipboardOnly(reason: "The clipboard changed before paste")
+        guard clipboardContainsTranscript(text, changeCount: transcriptChangeCount) else {
+            return .historyOnly(reason: "The clipboard changed before paste")
         }
         guard pasteSimulator() else {
-            return .clipboardOnly(reason: "Could not create a synthetic paste event")
+            return clipboardOutcome(
+                text: text,
+                expectedChangeCount: transcriptChangeCount,
+                reason: "Could not create a synthetic paste event"
+            )
         }
 
-        // Give rich editors time to read all pasteboard representations.
-        try? await delay(.milliseconds(350))
-        restore(savedItems, ifUnchangedFrom: transcriptChangeCount, on: pasteboard)
-        return .pasted
+        return .pasteEventSent
     }
 
-    func copyOnly(_ text: String) {
-        retainOnClipboard(text, pasteboard: pasteboard)
+    @discardableResult
+    func copyOnly(_ text: String) -> Bool {
+        writeTranscript(text) != nil
     }
 
-    private func retainOnClipboard(_ text: String, pasteboard: NSPasteboard) {
+    private func writeTranscript(_ text: String) -> Int? {
         pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
+        let wrote: Bool
+        if privateClipboardMode() {
+            let item = NSPasteboardItem()
+            guard item.setString(text, forType: .string) else { return nil }
+            item.setData(Data(), forType: Self.concealedPasteboardType)
+            item.setData(Data(), forType: Self.transientPasteboardType)
+            wrote = pasteboard.writeObjects([item])
+        } else {
+            wrote = pasteboard.setString(text, forType: .string)
+        }
+        guard wrote else { return nil }
+        return pasteboard.changeCount
     }
 
-    private func restore(
-        _ items: [NSPasteboardItem],
-        ifUnchangedFrom changeCount: Int,
-        on pasteboard: NSPasteboard
-    ) {
-        guard pasteboard.changeCount == changeCount else { return }
-        pasteboard.clearContents()
-        if !items.isEmpty {
-            pasteboard.writeObjects(items)
-        }
+    private func clipboardContainsTranscript(_ text: String, changeCount: Int) -> Bool {
+        pasteboard.changeCount == changeCount
+            && pasteboard.string(forType: .string) == text
     }
 
-    static func snapshot(_ pasteboard: NSPasteboard) -> [NSPasteboardItem] {
-        (pasteboard.pasteboardItems ?? []).map { item in
-            let copy = NSPasteboardItem()
-            for type in item.types {
-                if let data = item.data(forType: type) {
-                    copy.setData(data, forType: type)
-                }
-            }
-            return copy
-        }
+    private func clipboardOutcome(
+        text: String,
+        expectedChangeCount: Int,
+        reason: String
+    ) -> InsertionOutcome {
+        clipboardContainsTranscript(text, changeCount: expectedChangeCount)
+            ? .clipboardOnly(reason: reason)
+            : .historyOnly(reason: reason)
     }
 
     private static func postSyntheticPaste() -> Bool {
