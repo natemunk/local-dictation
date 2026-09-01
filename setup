@@ -288,7 +288,8 @@ if [[ -e "$INSTALLED_APP" && "$STABLE_INSTALL_COMPLETED" == "true" ]]; then
       | /usr/bin/sed -n 's/^designated =>/designated =>/p' \
       | /usr/bin/head -n 1
   )
-  if [[ "$installed_requirement" != "$EXPECTED_REQUIREMENT" && $ROTATE_SIGNING_IDENTITY -eq 0 ]]; then
+  if [[ "${installed_requirement:l}" != "${EXPECTED_REQUIREMENT:l}" \
+     && $ROTATE_SIGNING_IDENTITY -eq 0 ]]; then
     print -u2 "The installed app's designated requirement does not match the configured identity."
     print -u2 "Refusing replacement. If you intentionally changed identities, run ./setup --rotate-signing-identity."
     exit 1

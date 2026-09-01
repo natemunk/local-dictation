@@ -83,7 +83,12 @@ actual_requirement=$(
     | /usr/bin/head -n 1
 )
 [[ -n "$actual_requirement" ]] || fail "no designated requirement was emitted"
-if [[ -n "$EXPECTED_REQUIREMENT" && "$actual_requirement" != "$EXPECTED_REQUIREMENT" ]]; then
+# `codesign` renders hexadecimal certificate slots in lowercase even when the
+# equivalent requirement was supplied with an uppercase fingerprint. Bundle ID,
+# architecture, and entitlements are checked independently above, so compare the
+# requirement language with only ASCII case normalized.
+if [[ -n "$EXPECTED_REQUIREMENT" \
+   && "${actual_requirement:l}" != "${EXPECTED_REQUIREMENT:l}" ]]; then
   fail "designated requirement drifted (expected: $EXPECTED_REQUIREMENT; actual: $actual_requirement)"
 fi
 
