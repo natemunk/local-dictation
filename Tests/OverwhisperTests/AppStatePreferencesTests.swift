@@ -125,11 +125,13 @@ struct AppStatePreferencesTests {
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         let state = AppState(preferences: defaults)
+        #expect(!state.basePermissionsReady)
         #expect(!state.onboardingReady)
 
         state.microphonePermissionGranted = true
         state.inputMonitoringGranted = true
         state.accessibilityGranted = true
+        #expect(state.basePermissionsReady)
         state.hotkeyMonitoringActive = true
         #expect(!state.onboardingReady)
 

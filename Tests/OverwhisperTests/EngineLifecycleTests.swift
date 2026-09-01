@@ -5,6 +5,16 @@ import Testing
 @Suite("Engine lifecycle", .serialized)
 @MainActor
 struct EngineLifecycleTests {
+    @Test("model preparation phases explain long-running first setup honestly")
+    func preparationPresentation() {
+        #expect(EngineLifecyclePhase.downloading.isPreparationWork)
+        #expect(EngineLifecyclePhase.preparing.isPreparationWork)
+        #expect(!EngineLifecyclePhase.ready.isPreparationWork)
+        #expect(EngineLifecyclePhase.downloading.userFacingTitle.contains("Downloading"))
+        #expect(EngineLifecyclePhase.preparing.userFacingTitle.contains("Optimizing"))
+        #expect(EngineLifecyclePhase.preparing.userFacingDetail?.contains("several minutes") == true)
+    }
+
     @Test("duration-aware Whisper deadline is bounded and monotonic")
     func whisperDeadlinePolicy() {
         #expect(ASRDeadlinePolicy.whisperTimeoutSeconds(audioDuration: 0) == 20)

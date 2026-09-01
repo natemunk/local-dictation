@@ -15,6 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let sessionController = DictationSessionController()
     private let configurationStore = ConfigurationStore()
     private let pasteAgainQueue = SerializedPasteAgainQueue()
+    private let modelStore = OwnedModelStore()
     private var configuration = ConfigurationSnapshot.typedDefaults
     private var profileResolver = ProfileResolver(catalog: .nativeDefaults)
     private var historyStore: HistoryStore?
@@ -41,6 +42,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var cancellables = Set<AnyCancellable>()
     private var engineTask: Task<Void, Never>?
+    private var modelMaintenanceTask: Task<Void, Never>?
     private var historyMaintenanceTask: Task<Void, Never>?
     private var engineReloadPending = false
     private var historyRepasteDestination: DictationDestination?
@@ -56,6 +58,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ) ?? .empty
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // SwiftUI's empty Settings scene can otherwise make this LSUIElement
+        // app eligible for AppKit automatic termination once every window is
+        // hidden. Local Dictation is a persistent menu-bar utility, so its
+        // global shortcut must remain available until the user explicitly
+        // chooses Quit.
+        ProcessInfo.processInfo.disableAutomaticTermination(
+            "Local Dictation is listening for its global menu-bar shortcut"
+        )
         cleanupOrphanedTemporaryAudio()
         NSApp.setActivationPolicy(.accessory)
 
@@ -66,17 +76,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupMenu()
         setupBindings()
         setupSleepWakeHandling()
+        cleanupStaleModelStaging()
+        refreshPermissionDiagnostics()
 
-        if appState.hasCompletedOnboarding {
+        if appState.hasCompletedOnboarding, appState.basePermissionsReady {
             requestHotkeyMonitoringIfPossible()
-            initializeEngine()
+            if appState.hotkeyMonitoringActive {
+                initializeEngine()
+            } else {
+                appState.hasCompletedOnboarding = false
+                showOnboarding()
+            }
         } else {
+            appState.hasCompletedOnboarding = false
             showOnboarding()
         }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         engineTask?.cancel()
+        modelMaintenanceTask?.cancel()
         historyMaintenanceTask?.cancel()
         pasteAgainQueue.cancelPending()
         if let session = activeSession {
@@ -137,7 +156,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 clipboardState?.privateClipboardMode ?? false
             }
         )
-        let modelStore = OwnedModelStore()
         engineCoordinator = EngineCoordinator(
             initialSelection: appState.asrSelection,
             store: modelStore,
@@ -289,7 +307,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     .checking, .downloading, .validating, .preparing, .repairing,
                 ].contains(status.phase)
                 self.appState.modelDownloadProgress = status.progress ?? 0
-                self.appState.currentlyDownloadingModel = self.appState.isDownloadingModel
+                self.appState.currentlyDownloadingModel = self.appState.isInitializingEngine
                     ? status.selection.displayName
                     : nil
                 if status.phase == .failed {
@@ -313,6 +331,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: NSWorkspace.didWakeNotification,
             object: nil
         )
+    }
+
+    private func cleanupStaleModelStaging() {
+        modelMaintenanceTask?.cancel()
+        modelMaintenanceTask = Task { [modelStore] in
+            _ = try? await modelStore.cleanupStaleStaging()
+        }
     }
 
     @objc private func systemWillSleep() {

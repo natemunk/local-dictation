@@ -457,6 +457,51 @@ public actor OwnedModelStore {
         try discardStaging(stagingDirectory, for: selection)
     }
 
+    /// Removes only UUID-named staging directories that have been untouched
+    /// for the requested interval. A long minimum age keeps a currently
+    /// running first-time download safe even if another copy of the app starts.
+    @discardableResult
+    public func cleanupStaleStaging(
+        olderThan age: TimeInterval = 24 * 60 * 60,
+        now: Date = Date()
+    ) throws -> Int {
+        guard age.isFinite, age >= 0, try existingOwnedDirectory(at: rootURL) else {
+            return 0
+        }
+
+        var removedCount = 0
+        let cutoff = now.addingTimeInterval(-age)
+        let keys: Set<URLResourceKey> = [
+            .isDirectoryKey,
+            .isSymbolicLinkKey,
+            .contentModificationDateKey,
+        ]
+
+        for selection in ASRSelection.allCases {
+            guard let versionRoot = try existingVersionRoot(for: selection) else { continue }
+            let stagingRoot = versionRoot.appendingPathComponent("staging", isDirectory: true)
+            guard try existingOwnedDirectory(at: stagingRoot) else { continue }
+
+            let candidates = try fileManager.contentsOfDirectory(
+                at: stagingRoot,
+                includingPropertiesForKeys: Array(keys),
+                options: [.skipsHiddenFiles]
+            )
+            for candidate in candidates {
+                guard UUID(uuidString: candidate.lastPathComponent) != nil else { continue }
+                let values = try candidate.resourceValues(forKeys: keys)
+                guard values.isDirectory == true,
+                      values.isSymbolicLink != true,
+                      let modified = values.contentModificationDate,
+                      modified <= cutoff
+                else { continue }
+                try discardStaging(candidate, for: selection)
+                removedCount += 1
+            }
+        }
+        return removedCount
+    }
+
     /// Quarantines a malformed current install so it can be replaced without
     /// deleting the user's last owned model payload.
     public func repair(for selection: ASRSelection) throws -> OwnedModelInstallation? {

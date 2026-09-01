@@ -142,11 +142,15 @@ final class AppState: ObservableObject {
     private var micProvenHealthy = false
 
     var onboardingReady: Bool {
+        basePermissionsReady
+            && hotkeyMonitoringActive
+            && engineReady
+    }
+
+    var basePermissionsReady: Bool {
         microphonePermissionGranted
             && inputMonitoringGranted
             && accessibilityGranted
-            && hotkeyMonitoringActive
-            && engineReady
     }
 
     init(preferences: UserDefaults = .standard) {

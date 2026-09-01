@@ -80,10 +80,15 @@ struct OnboardingView: View {
                 HStack(spacing: 10) {
                     ProgressView()
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Preparing the local speech model…")
+                        Text(appState.diagnosticRuntimeState.modelPhase.userFacingTitle)
                             .fontWeight(.semibold)
                         if let model = appState.currentlyDownloadingModel, !model.isEmpty {
                             Text(model)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        if let detail = appState.diagnosticRuntimeState.modelPhase.userFacingDetail {
+                            Text(detail)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -138,9 +143,7 @@ struct OnboardingView: View {
     }
 
     private var basePermissionsReady: Bool {
-        appState.microphonePermissionGranted
-            && appState.inputMonitoringGranted
-            && appState.accessibilityGranted
+        appState.basePermissionsReady
     }
 
     @ViewBuilder

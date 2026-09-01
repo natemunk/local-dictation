@@ -264,6 +264,42 @@ struct OwnedModelStoreTests {
         #expect(try await store.currentInstallation(for: selection) == nil)
     }
 
+    @Test("stale staging cleanup removes only old UUID-owned directories")
+    func cleanupStaleStaging() async throws {
+        let (root, store) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let selection = ASRSelection.parakeetV2
+        let stale = try await store.makeStagingDirectory(for: selection)
+        let recent = try await store.makeStagingDirectory(for: selection)
+        try writePayload(at: stale.appendingPathComponent("old/model.bin"))
+        try writePayload(at: recent.appendingPathComponent("active/model.bin"))
+
+        let stagingRoot = await store.stagingRoot(for: selection)
+        let unrelated = stagingRoot.appendingPathComponent("not-a-generation", isDirectory: true)
+        try FileManager.default.createDirectory(at: unrelated, withIntermediateDirectories: false)
+
+        let now = Date(timeIntervalSinceReferenceDate: 50_000)
+        try FileManager.default.setAttributes(
+            [.modificationDate: now.addingTimeInterval(-7_200)],
+            ofItemAtPath: stale.path
+        )
+        try FileManager.default.setAttributes(
+            [.modificationDate: now],
+            ofItemAtPath: recent.path
+        )
+
+        let removed = try await store.cleanupStaleStaging(
+            olderThan: 3_600,
+            now: now
+        )
+
+        #expect(removed == 1)
+        #expect(!FileManager.default.fileExists(atPath: stale.path))
+        #expect(FileManager.default.fileExists(atPath: recent.path))
+        #expect(FileManager.default.fileExists(atPath: unrelated.path))
+    }
+
     private func makeStore() throws -> (URL, OwnedModelStore) {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(

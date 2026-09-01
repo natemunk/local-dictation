@@ -166,14 +166,23 @@ struct SettingsView: View {
                     if appState.engineReady {
                         Text("Ready").foregroundStyle(.green)
                     } else if appState.isInitializingEngine || appState.isDownloadingModel {
-                        Text("Preparing…").foregroundStyle(.orange)
+                        Text(appState.diagnosticRuntimeState.modelPhase.userFacingTitle)
+                            .foregroundStyle(.orange)
                     } else {
                         Text("Unavailable").foregroundStyle(.red)
                     }
                 }
 
-                if appState.isDownloadingModel {
-                    ProgressView(value: appState.modelDownloadProgress)
+                if appState.diagnosticRuntimeState.modelPhase.isPreparationWork {
+                    HStack(alignment: .top, spacing: 10) {
+                        ProgressView()
+                            .controlSize(.small)
+                        if let detail = appState.diagnosticRuntimeState.modelPhase.userFacingDetail {
+                            Text(detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
 
                 HStack {

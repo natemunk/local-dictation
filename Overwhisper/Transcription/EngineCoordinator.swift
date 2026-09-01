@@ -13,6 +13,47 @@ enum EngineLifecyclePhase: String, Codable, Equatable, Sendable {
     case failed
 }
 
+extension EngineLifecyclePhase {
+    var isPreparationWork: Bool {
+        switch self {
+        case .checking, .downloading, .validating, .preparing, .repairing:
+            true
+        case .idle, .ready, .unavailable, .failed:
+            false
+        }
+    }
+
+    var userFacingTitle: String {
+        switch self {
+        case .idle: "Not prepared"
+        case .checking: "Checking local model…"
+        case .downloading: "Downloading local model…"
+        case .validating: "Validating local model…"
+        case .preparing: "Optimizing local model…"
+        case .ready: "Ready"
+        case .repairing: "Repairing local model…"
+        case .unavailable, .failed: "Unavailable"
+        }
+    }
+
+    var userFacingDetail: String? {
+        switch self {
+        case .checking:
+            "Checking the owned installation before loading it."
+        case .downloading:
+            "Downloading several model files to this Mac. The indicator may pause while a large file is finalized."
+        case .validating:
+            "Validating the complete download before it becomes available."
+        case .preparing:
+            "macOS is optimizing the model for this Mac. The first launch can take several minutes."
+        case .repairing:
+            "Replacing an incomplete or invalid owned model, then validating it again."
+        case .idle, .ready, .unavailable, .failed:
+            nil
+        }
+    }
+}
+
 struct EngineStatus: Equatable, Sendable {
     let selection: ASRSelection
     let phase: EngineLifecyclePhase
