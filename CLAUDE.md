@@ -35,13 +35,14 @@ cache and disables SwiftPM's nested sandbox for agent environments.
 For the documented end-to-end source install, run:
 
 ```sh
-./setup
-# or, when launch is not wanted:
+./setup --configure-signing # first install on a Mac
+./setup                     # subsequent rebuilds
+# or, after signing is configured, when launch is not wanted:
 ./setup --no-launch
 ```
 
 `setup` resolves pinned dependencies, runs tests unless explicitly skipped,
-builds the `LocalDictation` product, creates an ad-hoc-signed
+builds the `LocalDictation` product, creates a stable per-machine-signed
 `Local Dictation.app`, and installs it in `~/Applications`. Treat that
 installation as a user-visible side effect.
 

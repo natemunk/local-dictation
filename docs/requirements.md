@@ -21,7 +21,7 @@ The normative source is Nate's approved Local Dictation v1 implementation plan f
 - The app is a public, MIT-licensed, source-build macOS menu-bar application.
 - Audio remains local. Telemetry, cloud speech-to-text, Overseed services, and automatic update checks are removed rather than hidden behind settings.
 - Optional cleanup may use Apple Foundation Models or an explicitly configured OpenAI-compatible endpoint. A refiner receives transcript text and static cleanup rules only, never audio or destination context.
-- Source-build sharing is sufficient for developer coworkers. Developer ID signing, notarization, and downloadable binaries are deferred; they are not silently simulated by clearing quarantine.
+- Source-build sharing is sufficient for developer coworkers. Source installs use a stable, per-machine self-signed identity so TCC permissions survive rebuilds. Developer ID signing, notarization, and downloadable binaries are deferred; they are not silently simulated by clearing quarantine.
 
 ## Recording controls and state
 

@@ -95,8 +95,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
-        guard appState.hasCompletedOnboarding else { return }
-        requestHotkeyMonitoringIfPossible(prompt: false)
+        refreshPermissionDiagnostics()
+        if appState.hasCompletedOnboarding {
+            requestHotkeyMonitoringIfPossible(prompt: false)
+        } else if onboardingWindow != nil,
+                  appState.inputMonitoringGranted,
+                  appState.accessibilityGranted {
+            requestHotkeyMonitoringIfPossible(prompt: false)
+        }
     }
 
     func applicationShouldHandleReopen(
@@ -1185,14 +1191,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func initializeEngine(onCompletion: ((Bool) -> Void)? = nil) {
-        guard appState.hasCompletedOnboarding else {
-            onCompletion?(false)
-            return
-        }
         engineTask?.cancel()
         cancelStreamingSession()
         streamingTranscriber = nil
         transcriptionEngine = nil
+        appState.engineReady = false
         appState.isInitializingEngine = true
         engineTask = Task { [weak self] in
             guard let self else { return }
@@ -1247,8 +1250,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
             self.appState.isInitializingEngine = false
+            self.appState.engineReady = self.transcriptionEngine != nil
             self.updateEngineMenuItem()
-            onCompletion?(self.transcriptionEngine != nil)
+            onCompletion?(self.appState.engineReady)
         }
     }
 
@@ -1291,6 +1295,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func requestInputMonitoringPermission() {
+        let granted = CGRequestListenEventAccess()
+        refreshPermissionDiagnostics()
+        if !granted {
+            openPrivacyPane("Privacy_ListenEvent")
+        }
+    }
+
+    private func requestAccessibilityPermission() {
+        let granted = TextInserter.requestAccessibilityPermission()
+        refreshPermissionDiagnostics()
+        if !granted {
+            openPrivacyPane("Privacy_Accessibility")
+        }
+    }
+
     private func refreshPermissionDiagnostics() {
         appState.microphonePermissionGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
         appState.inputMonitoringGranted = CGPreflightListenEventAccess()
@@ -1308,22 +1328,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showOnboarding() {
-        let view = OnboardingView(appState: appState) { [weak self] in
-            guard let self else { return }
-            self.initializeEngine { [weak self] prepared in
-                guard let self else { return }
-                guard prepared else {
-                    self.appState.hasCompletedOnboarding = false
-                    return
-                }
-                UserDefaults.standard.set(true, forKey: Self.onboardingKey)
-                self.onboardingWindow?.close()
-                self.onboardingWindow = nil
-                self.requestHotkeyMonitoringIfPossible()
-            }
-        }
+        refreshPermissionDiagnostics()
+        let view = OnboardingView(
+            appState: appState,
+            onRefreshPermissions: { [weak self] in self?.refreshPermissionDiagnostics() },
+            onRequestMicrophone: { [weak self] in self?.requestMicrophonePermission() },
+            onRequestInputMonitoring: { [weak self] in self?.requestInputMonitoringPermission() },
+            onRequestAccessibility: { [weak self] in self?.requestAccessibilityPermission() },
+            onPrepareAndFinish: { [weak self] in self?.prepareAndCompleteOnboarding() }
+        )
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 600, height: 500),
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 590),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -1334,6 +1349,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         onboardingWindow = window
+    }
+
+    private func prepareAndCompleteOnboarding() {
+        refreshPermissionDiagnostics()
+        guard appState.microphonePermissionGranted,
+              appState.inputMonitoringGranted,
+              appState.accessibilityGranted
+        else {
+            appState.lastError = "Microphone, Input Monitoring, and Accessibility must all be enabled first."
+            return
+        }
+
+        requestHotkeyMonitoringIfPossible(prompt: false)
+        guard appState.hotkeyMonitoringActive else {
+            appState.lastError = "Hyper+D is not ready yet. Re-enable Input Monitoring, then return to Local Dictation."
+            return
+        }
+
+        let complete: (Bool) -> Void = { [weak self] prepared in
+            guard let self else { return }
+            self.refreshPermissionDiagnostics()
+            guard prepared, self.appState.onboardingReady else {
+                self.appState.hasCompletedOnboarding = false
+                if self.appState.lastError == nil {
+                    self.appState.lastError = "Setup is waiting for the selected model and Hyper+D listener to become ready."
+                }
+                return
+            }
+            self.appState.hasCompletedOnboarding = true
+            UserDefaults.standard.set(true, forKey: Self.onboardingKey)
+            self.onboardingWindow?.close()
+            self.onboardingWindow = nil
+        }
+
+        if appState.engineReady {
+            complete(true)
+        } else {
+            initializeEngine(onCompletion: complete)
+        }
     }
 
     @objc private func toggleFromMenu() {

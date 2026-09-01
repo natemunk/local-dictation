@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 struct SettingsView: View {
@@ -15,6 +16,12 @@ struct SettingsView: View {
     let onOpenAccessibility: () -> Void
     let onImportRaycastVocabulary: (String) -> Void
 
+    private let permissionRefreshTimer = Timer.publish(
+        every: 1,
+        on: .main,
+        in: .common
+    ).autoconnect()
+
     var body: some View {
         TabView {
             general
@@ -26,6 +33,8 @@ struct SettingsView: View {
         }
         .frame(width: 610, height: 540)
         .padding(18)
+        .onAppear(perform: onRefreshPermissions)
+        .onReceive(permissionRefreshTimer) { _ in onRefreshPermissions() }
     }
 
     private var general: some View {
@@ -68,7 +77,7 @@ struct SettingsView: View {
                         .buttonStyle(.borderedProminent)
                 }
 
-                Text("Source builds are ad-hoc signed. If System Settings says Local Dictation is on while this panel says Needs attention, switch it off and on. If that does not refresh it, remove the stale row and add this exact installed app again.")
+                Text("Source builds use a stable per-machine signing identity. Permission state refreshes while this window is open; an identity rotation is the only rebuild that should require a new one-time permission reset.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -114,7 +123,6 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .onAppear(perform: onRefreshPermissions)
     }
 
     private func permissionRow(_ title: String, granted: Bool) -> some View {

@@ -46,18 +46,26 @@ Requirements:
 From a fresh clone:
 
 ```sh
-./setup
+./setup --configure-signing
 ```
+
+That first command explains and asks permission to create a ten-year, per-machine
+local code-signing identity in the login keychain. It records only the public
+label, certificate fingerprints, and designated requirement under
+`~/Library/Application Support/Local Dictation/Signing/`; it never exports the
+private key. Use plain `./setup` for later rebuilds. A normal setup fails closed
+instead of silently falling back to ad-hoc signing.
 
 The setup script:
 
 1. Validates macOS, architecture, Xcode, SDK, Swift, and Git.
 2. Resolves the pinned packages.
 3. Runs the unit and contract tests.
-4. Builds and ad-hoc signs `Local Dictation.app`.
-5. Installs it at `~/Applications/Local Dictation.app` and launches it.
+4. Builds, resource-checks, and signs `Local Dictation.app` with the configured identity.
+5. Verifies its identifier, architecture, entitlements, resources, signature, and designated requirement.
+6. Installs it at `~/Applications/Local Dictation.app` and launches it.
 
-Previous local builds are retained under `.build/installed-app-backups/` rather than beside the installed app, so Launch Services sees only one `com.natemunk.LocalDictation` application in `~/Applications`.
+Previous local builds are retained under `~/Library/Application Support/Local Dictation/Installed App Backups/` rather than beside the installed app, so Launch Services sees only one `com.natemunk.LocalDictation` application in `~/Applications` and a SwiftPM clean cannot erase the backup.
 
 It works around the known local Xcode 26.6 `xcrun` private-framework mismatch by invoking the Xcode toolchain and macOS SDK directly when necessary. SwiftPM keeps its package checkout, cache, and build scratch data under `.build`, which can require substantial additional disk space beyond the app and model. It does not clear quarantine or pretend to notarize the build. Use `./setup --no-launch` in automation or `./setup --skip-tests` only when a test failure has already been investigated.
 
@@ -69,9 +77,9 @@ On first launch, macOS asks for:
 - Input Monitoring for Hyper+D and the Enter/Escape safety interlock.
 - Accessibility for clipboard plus synthetic Command+V insertion.
 
-The source build is ad-hoc signed, so its code identity changes whenever the executable is rebuilt. macOS may therefore require Input Monitoring and Accessibility to be removed and re-added after an update. Settings → General shows the current permission and Hyper+D listener state, opens both privacy panes, and can retry the listener after permission is restored.
+After the first stable-signed install, setup guides one final removal and re-add of the old Microphone, Input Monitoring, and Accessibility rows. Later builds use the exact same certificate-backed designated requirement, and setup aborts if that identity drifts. Intentional replacement requires `./setup --rotate-signing-identity` and another one-time permission reset. Settings → General refreshes permission and Hyper+D listener health while it is visible.
 
-No speech model is downloaded before you choose **Finish Setup & Download Local Model** in onboarding. That explicit action downloads the selected model to the Mac; the default model is roughly 600 MB, and later transcription remains local.
+No speech model is downloaded before you choose **Prepare & Finish Setup** in onboarding. Onboarding completes only after Microphone, Input Monitoring, Accessibility, the Hyper+D event tap, and the selected local model are all ready. That explicit action downloads the selected model to the Mac; the default model is roughly 600 MB, and later transcription remains local.
 
 Browser Automation is not required. It is requested per browser only if the optional hostname-profile setting is enabled.
 

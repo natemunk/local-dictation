@@ -32,7 +32,7 @@ jobs:
         shell: zsh {0}
         run: |
           isolated_home=$(mktemp -d "$RUNNER_TEMP/local-dictation-home.XXXXXX")
-          HOME="$isolated_home" ./setup --no-launch --skip-tests
+          HOME="$isolated_home" ./setup --no-launch --skip-tests --ci-adhoc-signing
 
           app="$isolated_home/Applications/Local Dictation.app"
           plist="$app/Contents/Info.plist"
@@ -60,5 +60,13 @@ jobs:
           architectures=$(/usr/bin/lipo -archs "$binary")
           [[ "$architectures" == "arm64" ]] || {
             print -u2 "::error::expected an arm64-only executable, found: $architectures"
+            exit 1
+          }
+
+          first_requirement=$(/usr/bin/codesign -d -r- "$app" 2>&1 | /usr/bin/sed -n 's/^designated =>/designated =>/p')
+          HOME="$isolated_home" ./setup --no-launch --skip-tests --ci-adhoc-signing
+          second_requirement=$(/usr/bin/codesign -d -r- "$app" 2>&1 | /usr/bin/sed -n 's/^designated =>/designated =>/p')
+          [[ -n "$first_requirement" && "$first_requirement" == "$second_requirement" ]] || {
+            print -u2 "::error::designated requirement drifted across two packaged builds"
             exit 1
           }

@@ -4,11 +4,17 @@ set -euo pipefail
 PROJECT_ROOT=${0:A:h}
 LAUNCH_APP=1
 RUN_TESTS=1
+CONFIGURE_SIGNING=0
+ROTATE_SIGNING_IDENTITY=0
+CI_ADHOC_SIGNING=0
 
 for argument in "$@"; do
   case "$argument" in
     --no-launch) LAUNCH_APP=0 ;;
     --skip-tests) RUN_TESTS=0 ;;
+    --configure-signing) CONFIGURE_SIGNING=1 ;;
+    --rotate-signing-identity) CONFIGURE_SIGNING=1; ROTATE_SIGNING_IDENTITY=1 ;;
+    --ci-adhoc-signing) CI_ADHOC_SIGNING=1 ;;
     *) print -u2 "Unknown option: $argument"; exit 64 ;;
   esac
 done
@@ -22,6 +28,49 @@ MACOS_MAJOR=$(sw_vers -productVersion | cut -d. -f1)
 if (( MACOS_MAJOR < 15 )); then
   print -u2 "Local Dictation v1 requires macOS 15 or newer."
   exit 1
+fi
+
+SIGNING_STATE_ROOT=${LOCAL_DICTATION_SIGNING_STATE_DIR:-"$HOME/Library/Application Support/Local Dictation/Signing"}
+SIGNING_STATE_FILE="$SIGNING_STATE_ROOT/identity.plist"
+EXPECTED_REQUIREMENT='designated => identifier "com.natemunk.LocalDictation"'
+SIGNING_IDENTITY="-"
+SIGNING_WAS_STABLE=0
+STABLE_INSTALL_COMPLETED=false
+
+if (( CI_ADHOC_SIGNING )); then
+  if [[ "${CI:-}" != "true" && "${LOCAL_DICTATION_ALLOW_ADHOC_CI:-}" != "1" ]]; then
+    print -u2 "--ci-adhoc-signing is restricted to CI or an explicit LOCAL_DICTATION_ALLOW_ADHOC_CI=1 test environment."
+    exit 1
+  fi
+elif (( CONFIGURE_SIGNING )); then
+  signing_arguments=()
+  (( ROTATE_SIGNING_IDENTITY )) && signing_arguments+=(--rotate)
+  "$PROJECT_ROOT/scripts/configure-local-signing.sh" "${signing_arguments[@]}"
+fi
+
+if (( ! CI_ADHOC_SIGNING )); then
+  if [[ ! -f "$SIGNING_STATE_FILE" ]]; then
+    print -u2 "No stable Local Dictation signing identity is configured."
+    print -u2 "Run: ./setup --configure-signing"
+    print -u2 "Regular setup refuses ad-hoc signing because it would invalidate macOS permissions on every rebuild."
+    exit 1
+  fi
+
+  SIGNING_IDENTITY=$(/usr/bin/plutil -extract IdentitySHA1 raw "$SIGNING_STATE_FILE" 2>/dev/null || true)
+  EXPECTED_REQUIREMENT=$(/usr/bin/plutil -extract ExpectedDesignatedRequirement raw "$SIGNING_STATE_FILE" 2>/dev/null || true)
+  STABLE_INSTALL_COMPLETED=$(/usr/bin/plutil -extract StableInstallCompleted raw "$SIGNING_STATE_FILE" 2>/dev/null || true)
+  if [[ ! "$SIGNING_IDENTITY" =~ '^[A-Fa-f0-9]{40}$' || -z "$EXPECTED_REQUIREMENT" ]]; then
+    print -u2 "The Local Dictation signing metadata is invalid."
+    print -u2 "Run ./setup --rotate-signing-identity to replace it intentionally."
+    exit 1
+  fi
+  if ! /usr/bin/security find-identity -v -p codesigning \
+      | /usr/bin/grep -Fq "$SIGNING_IDENTITY"; then
+    print -u2 "The recorded Local Dictation code-signing identity is missing or untrusted."
+    print -u2 "Run ./setup --rotate-signing-identity to replace it intentionally."
+    exit 1
+  fi
+  SIGNING_WAS_STABLE=1
 fi
 
 XCODE_DEVELOPER_ROOT=${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}
@@ -120,6 +169,7 @@ restore_dependency_patch() {
   if [[ -d "$TRANSFORMERS_CHECKOUT/.git" ]]; then
     "$GIT_BIN" -C "$TRANSFORMERS_CHECKOUT" checkout -- Sources/Hub/Hub.swift >/dev/null 2>&1 || true
     /bin/rm -f "$TRANSFORMERS_HUB_BACKUP"
+    /bin/rm -f "${TRANSFORMERS_HUB_SOURCE}.rej" "${TRANSFORMERS_HUB_SOURCE}.rej.orig"
   fi
 }
 
@@ -187,28 +237,102 @@ plutil -replace CFBundleShortVersionString -string 0.1.0 "$PLIST"
 plutil -replace CFBundleVersion -string 1 "$PLIST"
 plutil -replace LSMinimumSystemVersion -string 15.0 "$PLIST"
 
-for resource_bundle in "$BIN_DIRECTORY"/*.bundle(N); do
+resource_bundles=("$BIN_DIRECTORY"/*.bundle(N))
+if (( ${#resource_bundles[@]} == 0 )); then
+  print -u2 "Build completed without any SwiftPM resource bundles; refusing to create an incomplete app."
+  exit 1
+fi
+for resource_bundle in "${resource_bundles[@]}"; do
   ditto "$resource_bundle" "$STAGED_APP/Contents/Resources/${resource_bundle:t}"
 done
 
-codesign --force --deep --sign - \
+required_resource_bundles=(
+  LocalDictation_LocalDictation.bundle
+  GRDB_GRDB.bundle
+  swift-transformers_Hub.bundle
+)
+for bundle_name in "${required_resource_bundles[@]}"; do
+  if [[ ! -d "$STAGED_APP/Contents/Resources/$bundle_name" ]]; then
+    print -u2 "Required SwiftPM resource bundle is missing: $bundle_name"
+    exit 1
+  fi
+done
+
+# Sign nested Mach-O code deliberately before signing the outer app. Resource
+# bundles are data-only and are sealed by the final app signature.
+while IFS= read -r -d '' nested_candidate; do
+  [[ "$nested_candidate" == "$STAGED_APP/Contents/MacOS/LocalDictation" ]] && continue
+  if /usr/bin/file -b "$nested_candidate" | /usr/bin/grep -q 'Mach-O'; then
+    codesign --force --sign "$SIGNING_IDENTITY" --timestamp=none "$nested_candidate"
+  fi
+done < <(/usr/bin/find "$STAGED_APP/Contents" -type f -print0)
+
+codesign --force --sign "$SIGNING_IDENTITY" \
+  --timestamp=none \
+  --options runtime \
+  --requirements "=$EXPECTED_REQUIREMENT" \
   --entitlements "$PROJECT_ROOT/Overwhisper/Overwhisper.entitlements" \
   "$STAGED_APP"
+
+verification_arguments=("$STAGED_APP" --expected-requirement "$EXPECTED_REQUIREMENT")
+(( CI_ADHOC_SIGNING )) && verification_arguments+=(--allow-adhoc)
+"$PROJECT_ROOT/scripts/verify-app-bundle.sh" "${verification_arguments[@]}"
 
 USER_APPLICATIONS="$HOME/Applications"
 INSTALLED_APP="$USER_APPLICATIONS/Local Dictation.app"
 mkdir -p "$USER_APPLICATIONS"
+
+if [[ -e "$INSTALLED_APP" && "$STABLE_INSTALL_COMPLETED" == "true" ]]; then
+  installed_requirement=$(
+    /usr/bin/codesign -d -r- "$INSTALLED_APP" 2>&1 \
+      | /usr/bin/sed -n 's/^designated =>/designated =>/p' \
+      | /usr/bin/head -n 1
+  )
+  if [[ "$installed_requirement" != "$EXPECTED_REQUIREMENT" && $ROTATE_SIGNING_IDENTITY -eq 0 ]]; then
+    print -u2 "The installed app's designated requirement does not match the configured identity."
+    print -u2 "Refusing replacement. If you intentionally changed identities, run ./setup --rotate-signing-identity."
+    exit 1
+  fi
+fi
+
+INSTALL_STAGING="$USER_APPLICATIONS/.Local Dictation.install.$$"
+/bin/rm -rf "$INSTALL_STAGING"
+ditto "$STAGED_APP" "$INSTALL_STAGING"
+installed_verification_arguments=("$INSTALL_STAGING" --expected-requirement "$EXPECTED_REQUIREMENT")
+(( CI_ADHOC_SIGNING )) && installed_verification_arguments+=(--allow-adhoc)
+"$PROJECT_ROOT/scripts/verify-app-bundle.sh" "${installed_verification_arguments[@]}"
+
+BACKUP_APP=""
 if [[ -e "$INSTALLED_APP" ]]; then
-  BACKUP_DIRECTORY="$PROJECT_ROOT/.build/installed-app-backups"
+  BACKUP_DIRECTORY="$HOME/Library/Application Support/Local Dictation/Installed App Backups"
   mkdir -p "$BACKUP_DIRECTORY"
   BACKUP_APP="$BACKUP_DIRECTORY/Local Dictation previous $(date +%Y%m%d-%H%M%S).app"
   mv "$INSTALLED_APP" "$BACKUP_APP"
   print "Previous build moved to: $BACKUP_APP"
 fi
-ditto "$STAGED_APP" "$INSTALLED_APP"
+if ! mv "$INSTALL_STAGING" "$INSTALLED_APP"; then
+  if [[ -n "$BACKUP_APP" && -e "$BACKUP_APP" ]]; then
+    mv "$BACKUP_APP" "$INSTALLED_APP"
+  fi
+  print -u2 "Installation failed; the previous app was restored."
+  exit 1
+fi
+
+if (( SIGNING_WAS_STABLE )); then
+  /usr/bin/plutil -replace StableInstallCompleted -bool true "$SIGNING_STATE_FILE"
+fi
 
 print "Installed: $INSTALLED_APP"
 print "Configuration: $HOME/.config/local-dictation"
+if (( SIGNING_WAS_STABLE )) && [[ "$STABLE_INSTALL_COMPLETED" != "true" ]]; then
+  print ""
+  print "Stable signing is now installed. Perform the one final macOS permission reset:"
+  print "  1. Quit Local Dictation."
+  print "  2. In System Settings → Privacy & Security, remove the old Local Dictation rows"
+  print "     from Microphone, Input Monitoring, and Accessibility."
+  print "  3. Launch this exact app and grant the three permissions once."
+  print "Subsequent builds signed by this identity should retain those permissions."
+fi
 if (( LAUNCH_APP )); then
   open "$INSTALLED_APP"
   print "Local Dictation launched. Complete the three documented permission prompts, then press Hyper+D."

@@ -1,6 +1,6 @@
 --- a/Sources/Hub/Hub.swift
 +++ b/Sources/Hub/Hub.swift
-@@ -319,3 +319,8 @@ extension Hub {
+@@ -319,4 +319,9 @@ extension Hub {
      static func fallbackTokenizerConfig(for modelType: String) -> Config? {
          // Fallback tokenizer configuration files are located in the `Sources/Hub/Resources` directory
 -        guard let url = Bundle.module.url(forResource: "\(modelType)_tokenizer_config", withExtension: "json") else {
@@ -10,3 +10,4 @@
 +            .appendingPathComponent("swift-transformers_Hub.bundle", isDirectory: true)
 +        let resourceBundle = packagedBundleURL.flatMap(Bundle.init(url:)) ?? Bundle.module
 +        guard let url = resourceBundle.url(forResource: "\(modelType)_tokenizer_config", withExtension: "json") else {
+             return nil

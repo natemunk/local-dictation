@@ -128,6 +128,7 @@ final class AppState: ObservableObject {
     @Published var modelDownloadProgress: Double = 0
     @Published var isDownloadingModel = false
     @Published var isInitializingEngine = false
+    @Published var engineReady = false
     @Published var downloadedModels: Set<String> = []
     @Published var parakeetDownloadedModels: Set<String> = []
     @Published var currentlyDownloadingModel: String?
@@ -152,6 +153,14 @@ final class AppState: ObservableObject {
     private var lastAudibleAt: TimeInterval = 0
     private var hasHeardAudio = false
     private var micProvenHealthy = false
+
+    var onboardingReady: Bool {
+        microphonePermissionGranted
+            && inputMonitoringGranted
+            && accessibilityGranted
+            && hotkeyMonitoringActive
+            && engineReady
+    }
 
     init(preferences: UserDefaults = .standard) {
         self.preferences = preferences

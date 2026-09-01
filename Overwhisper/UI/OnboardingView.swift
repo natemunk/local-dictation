@@ -1,13 +1,21 @@
 import AVFoundation
 import AppKit
+import Combine
 import SwiftUI
 
 struct OnboardingView: View {
     @ObservedObject var appState: AppState
-    let onComplete: () -> Void
-    @State private var microphoneGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
-    @State private var accessibilityGranted = AXIsProcessTrusted()
-    @State private var inputMonitoringGranted = CGPreflightListenEventAccess()
+    let onRefreshPermissions: () -> Void
+    let onRequestMicrophone: () -> Void
+    let onRequestInputMonitoring: () -> Void
+    let onRequestAccessibility: () -> Void
+    let onPrepareAndFinish: () -> Void
+
+    private let permissionRefreshTimer = Timer.publish(
+        every: 1,
+        on: .main,
+        in: .common
+    ).autoconnect()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -24,22 +32,34 @@ struct OnboardingView: View {
                     permissionRow(
                         title: "Microphone",
                         detail: "Records a temporary 16 kHz mono WAV for local ASR.",
-                        granted: microphoneGranted,
-                        action: requestMicrophone
+                        granted: appState.microphonePermissionGranted,
+                        action: onRequestMicrophone
                     )
                     Divider()
                     permissionRow(
                         title: "Input Monitoring",
                         detail: "Recognizes Hyper+D and safely owns Enter/Escape during a session.",
-                        granted: inputMonitoringGranted,
-                        action: requestInputMonitoring
+                        granted: appState.inputMonitoringGranted,
+                        action: onRequestInputMonitoring
                     )
                     Divider()
                     permissionRow(
                         title: "Accessibility",
                         detail: "Pastes with Command+V without taking focus from your destination.",
-                        granted: accessibilityGranted,
-                        action: requestAccessibility
+                        granted: appState.accessibilityGranted,
+                        action: onRequestAccessibility
+                    )
+                    Divider()
+                    statusRow(
+                        title: "Hyper+D listener",
+                        detail: "The event tap is running and receiving global shortcut events.",
+                        ready: appState.hotkeyMonitoringActive
+                    )
+                    Divider()
+                    statusRow(
+                        title: "Selected speech model",
+                        detail: "The chosen local engine has loaded and passed preparation.",
+                        ready: appState.engineReady
                     )
                 }
                 .padding(4)
@@ -50,7 +70,7 @@ struct OnboardingView: View {
             Text("Finishing setup downloads the selected speech model directly to this Mac. No model is downloaded until you choose the button below; transcription then runs locally.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Text("Browser Automation is optional and is requested later only if you enable hostname profiles. It is not needed for first dictation.")
+            Text("The first model download contacts its documented model host. Microphone audio and transcripts remain on this Mac.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -80,16 +100,21 @@ struct OnboardingView: View {
                 Text("Shortcut: Hyper+D")
                     .font(.system(.body, design: .monospaced).weight(.semibold))
                 Spacer()
-                Button("Finish Setup & Download Local Model") {
-                    appState.hasCompletedOnboarding = true
-                    onComplete()
+                Button(appState.onboardingReady ? "Finish Setup" : "Prepare & Finish Setup") {
+                    onPrepareAndFinish()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(!microphoneGranted || appState.isInitializingEngine || appState.isDownloadingModel)
+                .disabled(
+                    !basePermissionsReady
+                        || appState.isInitializingEngine
+                        || appState.isDownloadingModel
+                )
             }
         }
         .padding(28)
-        .frame(width: 600, height: 500)
+        .frame(width: 620, height: 590)
+        .onAppear(perform: onRefreshPermissions)
+        .onReceive(permissionRefreshTimer) { _ in onRefreshPermissions() }
     }
 
     @ViewBuilder
@@ -112,30 +137,30 @@ struct OnboardingView: View {
         }
     }
 
-    private func requestMicrophone() {
-        Task {
-            microphoneGranted = await AVCaptureDevice.requestAccess(for: .audio)
-        }
+    private var basePermissionsReady: Bool {
+        appState.microphonePermissionGranted
+            && appState.inputMonitoringGranted
+            && appState.accessibilityGranted
     }
 
-    private func requestInputMonitoring() {
-        inputMonitoringGranted = CGRequestListenEventAccess()
-        if !inputMonitoringGranted {
-            openPrivacyPane("Privacy_ListenEvent")
+    @ViewBuilder
+    private func statusRow(
+        title: String,
+        detail: String,
+        ready: Bool
+    ) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: ready ? "checkmark.circle.fill" : "clock.badge.exclamationmark")
+                .foregroundStyle(ready ? .green : .orange)
+                .font(.title3)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).fontWeight(.semibold)
+                Text(detail).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Text(ready ? "Ready" : "Not ready")
+                .font(.caption)
+                .foregroundStyle(ready ? Color.green : Color.orange)
         }
-    }
-
-    private func requestAccessibility() {
-        accessibilityGranted = TextInserter.requestAccessibilityPermission()
-        if !accessibilityGranted {
-            openPrivacyPane("Privacy_Accessibility")
-        }
-    }
-
-    private func openPrivacyPane(_ anchor: String) {
-        guard let url = URL(
-            string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)"
-        ) else { return }
-        NSWorkspace.shared.open(url)
     }
 }

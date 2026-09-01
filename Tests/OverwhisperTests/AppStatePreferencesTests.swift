@@ -44,4 +44,27 @@ struct AppStatePreferencesTests {
         #expect(state.parakeetModel == .v2English)
         #expect(state.whisperModel == .smallEn)
     }
+
+    @Test("onboarding readiness requires permissions tap health and a prepared engine")
+    @MainActor
+    func onboardingReadinessRequiresEveryGate() throws {
+        let suiteName = "AppStatePreferencesTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let state = AppState(preferences: defaults)
+        #expect(!state.onboardingReady)
+
+        state.microphonePermissionGranted = true
+        state.inputMonitoringGranted = true
+        state.accessibilityGranted = true
+        state.hotkeyMonitoringActive = true
+        #expect(!state.onboardingReady)
+
+        state.engineReady = true
+        #expect(state.onboardingReady)
+
+        state.hotkeyMonitoringActive = false
+        #expect(!state.onboardingReady)
+    }
 }
