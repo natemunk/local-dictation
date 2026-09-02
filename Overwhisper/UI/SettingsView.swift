@@ -332,7 +332,7 @@ private enum PrivacyDataDeletion: String, Identifiable {
         case .analytics:
             "This removes analytics only. Raw and polished transcript history remains available."
         case .everything:
-            "This permanently removes transcript history and transcript-free analytics. Configuration, models, and retained debug audio are not changed."
+            "This permanently removes transcript history, transcript-free analytics, and retained debug sessions (including debug audio and transcript metadata). Configuration and downloaded models are not changed."
         }
     }
 
@@ -353,7 +353,7 @@ private struct DebugRetentionControls: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Spacer()
-            Button("Delete Retained Audio", role: .destructive) {
+            Button("Delete Retained Debug Sessions", role: .destructive) {
                 store.clear()
             }
             .disabled(store.sessions.isEmpty)

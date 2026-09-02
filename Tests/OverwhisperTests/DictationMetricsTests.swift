@@ -280,6 +280,63 @@ struct DictationMetricsTests {
         #expect(try await store.metricCount() == 0)
     }
 
+    @Test("delete everything checkpoints and scrubs persisted text")
+    func deleteEverythingScrubsPersistentFiles() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let databaseURL = directory.appendingPathComponent("history.sqlite")
+        let store = try HistoryStore(databaseURL: databaseURL)
+        let marker = "private-marker-\(UUID().uuidString)"
+        let history = try await store.saveRaw(
+            HistoryRawCapture(rawText: marker, mode: .literal)
+        )
+        _ = try await store.upsertMetric(
+            DictationMetricEvent(
+                eventID: history.id,
+                completedAt: Date(),
+                recordingDurationSeconds: 1,
+                rawWordCount: 1,
+                deliveredWordCount: 1,
+                dictationMode: "literal",
+                speechEngine: "fluidaudio",
+                speechModel: "parakeet-v2",
+                cleanupBackend: "none",
+                cleanupOutcome: "not_requested",
+                asrLatencySeconds: 0.1,
+                cleanupLatencySeconds: nil,
+                stopToDeliveryLatencySeconds: 0.2,
+                deliveryOutcome: "paste_event_sent",
+                recognizedCommandCount: 0,
+                wordsRemoved: 0,
+                destinationBundleIdentifier: marker,
+                destinationDisplayName: marker,
+                sourceKind: .measured,
+                timingComplete: true,
+                eventRevision: 1,
+                schemaVersion: DictationMetricEvent.currentSchemaVersion
+            )
+        )
+
+        // Home Base may keep an idle read-only connection open while the user
+        // clears Local Dictation data. That connection must not prevent the
+        // checkpoint/vacuum path from completing.
+        var readerConfiguration = Configuration()
+        readerConfiguration.readonly = true
+        let reader = try DatabaseQueue(
+            path: databaseURL.path,
+            configuration: readerConfiguration
+        )
+        try await reader.read { db in
+            _ = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM dictation_metrics")
+        }
+
+        #expect(try persistedDatabaseFiles(databaseURL).contains(marker: marker))
+        let deleted = try await store.deleteEverything()
+        #expect(deleted.history == 1)
+        #expect(deleted.metrics == 1)
+        #expect(!(try persistedDatabaseFiles(databaseURL).contains(marker: marker)))
+    }
+
     @Test("read-only SQLite clients remain available during metric writes")
     func concurrentReadOnlyAccess() async throws {
         let directory = try makeTemporaryDirectory()
@@ -355,5 +412,23 @@ struct DictationMetricsTests {
             withIntermediateDirectories: true
         )
         return directory
+    }
+
+    private func persistedDatabaseFiles(_ databaseURL: URL) throws -> Data {
+        var combined = Data()
+        for url in [
+            databaseURL,
+            URL(fileURLWithPath: databaseURL.path + "-wal"),
+            URL(fileURLWithPath: databaseURL.path + "-shm"),
+        ] where FileManager.default.fileExists(atPath: url.path) {
+            combined.append(try Data(contentsOf: url))
+        }
+        return combined
+    }
+}
+
+private extension Data {
+    func contains(marker: String) -> Bool {
+        range(of: Data(marker.utf8)) != nil
     }
 }

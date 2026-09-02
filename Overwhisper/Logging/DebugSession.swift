@@ -25,14 +25,17 @@ final class DebugSessionStore: ObservableObject {
   private let maxSessions = 10
   private let metadataFileName = "sessions.json"
   private let audioDirectoryName = "audio"
+  private let rootDirectoryOverride: URL?
 
-  init() {
+  init(rootDirectory: URL? = nil) {
+    rootDirectoryOverride = rootDirectory
     load()
   }
 
   // MARK: - Paths
 
   var rootDirectory: URL {
+    if let rootDirectoryOverride { return rootDirectoryOverride }
     let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
       .first!
     let bundleId = Bundle.main.bundleIdentifier ?? "com.natemunk.LocalDictation"
@@ -120,14 +123,24 @@ final class DebugSessionStore: ObservableObject {
     persist()
   }
 
-  func clear() {
-    for session in sessions {
-      if let url = audioURL(for: session) {
-        try? FileManager.default.removeItem(at: url)
-      }
-    }
+  /// Removes the entire retained-debug directory so transcript metadata,
+  /// known recordings, and any orphaned files all share one deletion scope.
+  @discardableResult
+  func clear() -> Bool {
     sessions = []
-    persist()
+    guard FileManager.default.fileExists(atPath: rootDirectory.path) else {
+      return true
+    }
+    do {
+      try FileManager.default.removeItem(at: rootDirectory)
+      return true
+    } catch {
+      AppLogger.app.error("DebugSessionStore could not delete retained debug data")
+      // At minimum, replace the metadata index with an empty value if the
+      // directory itself could not be removed.
+      persist()
+      return false
+    }
   }
 
   func delete(_ session: TranscriptionDebugSession) {

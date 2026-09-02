@@ -38,6 +38,10 @@ struct DictationSession {
     var warnedAtTenMinutes = false
     var durationCapTriggered = false
     var audioURL: URL?
+    /// Owns the async destination-capture/recording-stop bridge. Keeping this
+    /// task on the generation prevents a cancelled session from stopping a
+    /// replacement recording after an Accessibility retry returns.
+    var captureFinishTask: Task<Void, Never>?
     var finalizationTask: Task<Void, Never>?
     var streamingStartTask: Task<AsyncStream<TranscriptUpdate>?, Never>?
     var streamingUpdatesTask: Task<Void, Never>?

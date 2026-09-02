@@ -124,9 +124,7 @@ struct RefinementValidator: Sendable {
         for span in sorted {
             let key = Data(span.text.utf8)
             guard matchesByText[key] == nil else { continue }
-            let expected = sorted.lazy.filter {
-                Data($0.text.utf8) == key
-            }.count
+            let expected = protectedOccurrenceCount(of: span.text, in: sorted)
             let matches = atomicMatches(
                 of: span.text,
                 in: generated,
@@ -144,22 +142,35 @@ struct RefinementValidator: Sendable {
             matchesByText[key] = matches
         }
 
-        var consumedByText: [Data: Int] = [:]
         var cursor = 0
         for span in sorted {
             let key = Data(span.text.utf8)
-            let consumed = consumedByText[key, default: 0]
             guard let matches = matchesByText[key],
-                  consumed < matches.count,
-                  matches[consumed].lowerBound >= cursor
+                  let match = matches.first(where: { $0.lowerBound >= cursor })
             else {
                 throw RefinementValidationFailure.protectedSpanOrderChanged(
                     name: span.name,
                     text: span.text
                 )
             }
-            cursor = matches[consumed].upperBound
-            consumedByText[key] = consumed + 1
+            cursor = match.upperBound
+        }
+    }
+
+    /// Counts declared protected occurrences plus atomic occurrences nested
+    /// inside another declared protected span. A ticket identifier can, for
+    /// example, be protected once on its own and once as part of a protected
+    /// URL without making unchanged output look like a duplicate.
+    private func protectedOccurrenceCount(
+        of text: String,
+        in protectedSpans: [CleanupProtectedSpan]
+    ) -> Int {
+        protectedSpans.reduce(into: 0) { count, container in
+            count += atomicMatches(
+                of: text,
+                in: container.text,
+                outputBytes: Array(container.text.utf8)
+            ).count
         }
     }
 

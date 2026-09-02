@@ -350,6 +350,27 @@ struct CleanupPipelineTests {
         #expect(detector.candidates(in: text, excluding: [protected]).map(\.text) == ["Um", "you know"])
     }
 
+    @Test("repetition cleanup requires horizontal whitespace and skips numbers")
+    func conservativeRepetitionDetection() async throws {
+        let pipeline = CleanupPipeline()
+        let unchanged = [
+            "a big, big problem",
+            "a big; big problem",
+            "a big\nbig problem",
+            "room 3 3",
+        ]
+
+        for source in unchanged {
+            let result = try await pipeline.process(source, mode: .clean)
+            #expect(result.text == source)
+            #expect(!result.metadata.candidateDisfluencies.contains { $0.kind == .repetition })
+        }
+
+        let removed = try await pipeline.process("we we should ship", mode: .clean)
+        #expect(removed.text == "we should ship")
+        #expect(removed.metadata.candidateDisfluencies.map(\.text) == ["we"])
+    }
+
     @Test("literal mode keeps commands and filler, applies vocabulary, and skips the refiner")
     func literalMode() async throws {
         let pipeline = CleanupPipeline(
@@ -482,6 +503,21 @@ struct CleanupPipelineTests {
             return
         }
         #expect(token == "definitely")
+    }
+
+    @Test("a rejected deterministic fallback returns the normalized input")
+    func rejectedDeterministicFallbackReturnsInput() async throws {
+        let pipeline = CleanupPipeline(refiner: FixedCleanupRefiner(output: "-"))
+
+        let result = try await pipeline.process("bullet list. um", mode: .clean)
+
+        #expect(result.text == "- um")
+        #expect(result.metadata.recognizedCommands.map(\.kind) == [.bulletList])
+        guard case let .deterministicFallback(.validationFailure(failure)) = result.outcome else {
+            Issue.record("Expected a validation-triggered deterministic fallback")
+            return
+        }
+        #expect(failure == .explicitBulletFormattingRemoved)
     }
 }
 

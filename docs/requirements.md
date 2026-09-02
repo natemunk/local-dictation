@@ -175,15 +175,15 @@ Browser hostname profiles and Apple Events execution are removed from v1. Generi
 - Secure destinations discard the recording before batch ASR/history/clipboard use. History Paste Again also refuses secure fields without changing the clipboard.
 - Paste failure leaves the result on the clipboard when clipboard ownership is still verified and in history otherwise.
 - Direct `AXSelectedText` insertion is post-cutover and enabled per app only after rich-text, selection, and undo tests pass.
-- Raw text is saved immediately after ASR and before cleanup or insertion.
+- Raw text is saved immediately after ASR and before cleanup or insertion when history is healthy. If history is unavailable, the raw result is copied to the clipboard for recovery, a persistent warning is shown, and dictation continues instead of becoming copy-only.
 - Actor-isolated GRDB/SQLite uses WAL plus FTS5 and stores timestamp, raw text, polished/delivered text, destination app, mode, ASR/refiner outcomes, validation-failure kind, delivery/refinement state and latency, and unrecognized command candidates.
 - History never stores browser hostname or page information.
 - All successful, failed, pending, and cancelled history defaults to 90-day retention, pruned at launch and daily. History supports FTS plus escaped literal fallback, copy, serialized Paste Again, raw-versus-polished inspection, explicit vocabulary correction, delete entry, and delete all.
 - A separate `dictation_metrics` table stores one generation-safe row per nonsecure finalized attempt. It contains only wall completion time, monotonic durations, integer word/command counts, bounded mode/engine/model/backend/outcome labels, and optional destination app identity—never transcript text, audio, URLs, window titles, field contents, clipboard contents, or dynamic errors.
 - Canonical timing boundaries are recording start→stop, stop→final ASR, cleanup invocation→result/fallback, and stop→final paste-event/preview/clipboard/failure/cancellation decision. The row records the actual ASR and cleanup path used. Late delivery updates use the same event UUID and a monotonically increasing revision.
 - Legacy history is backfilled once with only honestly recoverable values. Its history timestamp is the best available legacy event time; missing recording/ASR/engine/model/backend/command measurements remain `NULL`, `source_kind` is `legacy_history`, and `timing_complete` is false.
-- Local analytics and destination-app analytics are separate default-on preferences. Analytics failure or opt-out cannot block dictation. Transcript history deletion/retention never deletes metrics; Reset Analytics deletes metrics only; Delete Everything transactionally deletes both database datasets.
-- Temporary audio is deleted after ASR or cancellation, and crash orphans are cleaned on launch. Debug audio retention is explicit and capped at the latest 10 recordings.
+- Local analytics and destination-app analytics are separate default-on preferences. Analytics failure or opt-out cannot block dictation. Transcript history deletion/retention never deletes metrics; Reset Analytics deletes metrics only; Delete Everything transactionally deletes both database datasets, checkpoints and vacuums the database, and removes retained debug-session audio and transcript metadata.
+- Temporary audio is deleted after ASR or cancellation, and crash orphans are cleaned on launch. Debug retention is explicit, capped at the latest 10 sessions, and has a dedicated whole-directory delete action.
 
 ## Diagnostics and performance instrumentation
 

@@ -105,6 +105,64 @@ private struct AudioMachTimebase: Sendable {
     }
 }
 
+/// Lock-free health state shared by the render callback and the main-thread
+/// watchdog. It deliberately starts without a timestamp: the watchdog is
+/// seeded immediately before `AudioOutputUnitStart`, after setup has finished.
+final class AudioRenderHealthState: @unchecked Sendable {
+    /// A single Core Audio render error can be transient during device churn.
+    /// Three back-to-back failures still surface a persistent failure quickly.
+    static let terminalConsecutiveFailureThreshold: UInt64 = 3
+
+    private let lastCallbackTickStorage = Atomic<UInt64>(0)
+    private let lastRenderErrorStorage = Atomic<Int64>(0)
+    private let consecutiveRenderFailureCountStorage = Atomic<UInt64>(0)
+
+    var lastCallbackTick: UInt64 {
+        lastCallbackTickStorage.load(ordering: .acquiring)
+    }
+
+    var lastRenderError: OSStatus? {
+        let value = lastRenderErrorStorage.load(ordering: .relaxed)
+        return value == 0 ? nil : OSStatus(value)
+    }
+
+    var consecutiveRenderFailureCount: UInt64 {
+        consecutiveRenderFailureCountStorage.load(ordering: .acquiring)
+    }
+
+    var terminalRenderError: OSStatus? {
+        guard consecutiveRenderFailureCount
+                >= Self.terminalConsecutiveFailureThreshold
+        else {
+            return nil
+        }
+        return lastRenderError
+    }
+
+    func resetForAudioUnitStart(at tick: UInt64 = mach_continuous_time()) {
+        lastCallbackTickStorage.store(tick, ordering: .releasing)
+        consecutiveRenderFailureCountStorage.store(0, ordering: .releasing)
+        lastRenderErrorStorage.store(0, ordering: .releasing)
+    }
+
+    @inline(__always)
+    func recordCallback(at tick: UInt64 = mach_continuous_time()) {
+        lastCallbackTickStorage.store(tick, ordering: .relaxed)
+    }
+
+    @inline(__always)
+    func recordRenderSuccess() {
+        consecutiveRenderFailureCountStorage.store(0, ordering: .relaxed)
+        lastRenderErrorStorage.store(0, ordering: .relaxed)
+    }
+
+    @inline(__always)
+    func recordRenderFailure(_ status: OSStatus) {
+        lastRenderErrorStorage.store(Int64(status), ordering: .relaxed)
+        consecutiveRenderFailureCountStorage.wrappingAdd(1, ordering: .releasing)
+    }
+}
+
 /// Refcon owned by one active AudioUnit. The render callback touches only this
 /// object: one AudioUnitRender call, preallocated buffer metadata, and atomics.
 final class RealtimeAudioRenderContext: @unchecked Sendable {
@@ -114,9 +172,8 @@ final class RealtimeAudioRenderContext: @unchecked Sendable {
     private let claimedBufferList: PlanarAudioBufferList
     private let discardBufferList: PlanarAudioBufferList
     private let timebase: AudioMachTimebase
-    private let lastCallbackTickStorage: Atomic<UInt64>
+    private let healthState = AudioRenderHealthState()
     private let callbackCounter = Atomic<UInt64>(0)
-    private let lastRenderErrorStorage = Atomic<Int64>(0)
     private let oversizedCallbackCounter = Atomic<UInt64>(0)
 
     init(
@@ -138,16 +195,14 @@ final class RealtimeAudioRenderContext: @unchecked Sendable {
             ownsSampleStorage: true
         )
         timebase = AudioMachTimebase()
-        lastCallbackTickStorage = Atomic<UInt64>(mach_continuous_time())
     }
 
     var callbackCount: UInt64 {
         callbackCounter.load(ordering: .relaxed)
     }
 
-    var lastRenderError: OSStatus? {
-        let value = lastRenderErrorStorage.load(ordering: .relaxed)
-        return value == 0 ? nil : OSStatus(value)
+    var terminalRenderError: OSStatus? {
+        healthState.terminalRenderError
     }
 
     var oversizedCallbackCount: UInt64 {
@@ -155,10 +210,16 @@ final class RealtimeAudioRenderContext: @unchecked Sendable {
     }
 
     func secondsSinceLastCallback(now: UInt64 = mach_continuous_time()) -> TimeInterval {
-        timebase.seconds(
-            from: lastCallbackTickStorage.load(ordering: .acquiring),
+        let lastCallbackTick = healthState.lastCallbackTick
+        guard lastCallbackTick > 0 else { return 0 }
+        return timebase.seconds(
+            from: lastCallbackTick,
             to: now
         )
+    }
+
+    func resetCallbackWatchdogForAudioUnitStart() {
+        healthState.resetForAudioUnitStart()
     }
 
     @inline(__always)
@@ -168,15 +229,12 @@ final class RealtimeAudioRenderContext: @unchecked Sendable {
         busNumber: UInt32,
         frameCount: UInt32
     ) -> OSStatus {
-        lastCallbackTickStorage.store(mach_continuous_time(), ordering: .relaxed)
+        healthState.recordCallback()
         callbackCounter.wrappingAdd(1, ordering: .relaxed)
 
         guard frameCount <= UInt32(ring.maxFrames) else {
             oversizedCallbackCounter.wrappingAdd(1, ordering: .relaxed)
-            lastRenderErrorStorage.store(
-                Int64(kAudioUnitErr_TooManyFramesToProcess),
-                ordering: .relaxed
-            )
+            healthState.recordRenderFailure(kAudioUnitErr_TooManyFramesToProcess)
             return kAudioUnitErr_TooManyFramesToProcess
         }
 
@@ -191,10 +249,11 @@ final class RealtimeAudioRenderContext: @unchecked Sendable {
                 claimedBufferList.pointer
             )
             if status == noErr {
+                healthState.recordRenderSuccess()
                 _ = ring.publish(slot)
             } else {
                 _ = ring.cancelProducerClaim(slot)
-                lastRenderErrorStorage.store(Int64(status), ordering: .relaxed)
+                healthState.recordRenderFailure(status)
             }
             return status
         }
@@ -208,8 +267,10 @@ final class RealtimeAudioRenderContext: @unchecked Sendable {
             frameCount,
             discardBufferList.pointer
         )
-        if status != noErr {
-            lastRenderErrorStorage.store(Int64(status), ordering: .relaxed)
+        if status == noErr {
+            healthState.recordRenderSuccess()
+        } else {
+            healthState.recordRenderFailure(status)
         }
         return status
     }
@@ -358,7 +419,9 @@ final class AudioCaptureRuntime: @unchecked Sendable {
                 return
             }
 
-            Thread.sleep(forTimeInterval: 0.000_5)
+            // A 2 ms idle poll avoids a 2 kHz spin while adding at most about
+            // 2 ms to an otherwise-idle drain request.
+            Thread.sleep(forTimeInterval: 0.002)
         }
     }
 

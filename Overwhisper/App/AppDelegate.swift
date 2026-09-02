@@ -99,6 +99,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         historyMaintenanceTask?.cancel()
         pasteAgainQueue.cancelPending()
         if let session = activeSession {
+            session.captureFinishTask?.cancel()
             session.finalizationTask?.cancel()
             session.streamingStartTask?.cancel()
             session.streamingUpdatesTask?.cancel()
@@ -452,10 +453,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             case .finish(let request):
                 beginFinalization(request)
-                Task { @MainActor [weak self] in
+                guard isCurrent(request.token) else { continue }
+                let task = Task { @MainActor [weak self] in
                     await Task.yield()
                     await self?.finishCapture(request)
                 }
+                updateSession(request.token) { $0.captureFinishTask = task }
             case .cancel(let token):
                 cancelSessionImmediately(token: token)
             case .interleavedTypingChanged(let token, let detected):
@@ -690,6 +693,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let destination = await DictationDestination.captureFrontmostWithRetry()
+        // Accessibility retries do not necessarily observe Swift task
+        // cancellation. Re-check generation ownership before touching the
+        // process-wide recorder so Escape + an immediate restart cannot let an
+        // old finish task stop the new recording.
+        guard !Task.isCancelled, isCurrent(request.token) else { return }
         let initialProfile = resolveProfile(for: destination).profile
         updateSession(request.token) {
             $0.destination = destination
@@ -700,7 +708,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let audioURL: URL
         do {
             audioURL = try await audioRecorder.stopRecording()
-            updateSession(request.token) { $0.audioURL = audioURL }
+            guard !Task.isCancelled, isCurrent(request.token) else {
+                if FileManager.default.fileExists(atPath: audioURL.path) {
+                    try? FileManager.default.removeItem(at: audioURL)
+                }
+                return
+            }
+            updateSession(request.token) {
+                $0.audioURL = audioURL
+                $0.captureFinishTask = nil
+            }
         } catch {
             failSession(token: request.token, "Could not finish the recording: \(error.localizedDescription)")
             return
@@ -886,49 +903,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lastTextMenuItem?.isEnabled = true
         pasteLastMenuItem?.isEnabled = true
 
-        guard await saveRawHistory(
+        let historySaved = await saveRawHistory(
             token: token,
             mode: .literal,
             asrLatency: asrLatency,
             unrecognizedCommands: []
-        ) else {
-            failSession(
-                token: token,
-                "Batch transcription failed and the EOU recovery transcript could not be saved. Nothing was pasted."
-            )
-            return
-        }
+        )
+        guard !Task.isCancelled, isCurrent(token) else { return }
 
-        guard let historyStore,
-              let id = activeSession?.historyID
-        else {
-            failSession(token: token, "EOU recovery history is unavailable. Nothing was pasted.")
-            return
-        }
-        do {
-            _ = try await historyStore.finalize(
-                id: id,
-                with: HistoryFinalization(
-                    polishedText: raw.text,
-                    refinementStatus: .notRequested,
-                    deliveryStatus: .pending,
-                    refinementLatency: nil,
-                    totalLatency: activeSession.map {
-                        Date().timeIntervalSince($0.startedAt)
-                    },
-                    error: "Batch ASR failed; EOU preview fallback: \(batchError.localizedDescription)",
-                    asrSelection: activeSession?.asrSelection.rawValue,
-                    asrOutcome: "eou_preview_fallback",
-                    refinerBackend: "none",
-                    refinementOutcome: "not_requested"
+        if historySaved,
+           let historyStore,
+           let id = activeSession?.historyID {
+            do {
+                _ = try await historyStore.finalize(
+                    id: id,
+                    with: HistoryFinalization(
+                        polishedText: raw.text,
+                        refinementStatus: .notRequested,
+                        deliveryStatus: .pending,
+                        refinementLatency: nil,
+                        totalLatency: activeSession.map {
+                            Date().timeIntervalSince($0.startedAt)
+                        },
+                        error: "Batch ASR failed; EOU preview fallback: \(batchError.localizedDescription)",
+                        asrSelection: activeSession?.asrSelection.rawValue,
+                        asrOutcome: "eou_preview_fallback",
+                        refinerBackend: "none",
+                        refinementOutcome: "not_requested"
+                    )
                 )
-            )
-        } catch {
-            failSession(
-                token: token,
-                "EOU recovery history could not be finalized. Nothing was pasted."
-            )
-            return
+            } catch {
+                appState.lastError = "EOU recovery history could not be finalized: \(error.localizedDescription)"
+            }
+        } else {
+            let copied = textInserter.copyOnly(raw.text)
+            appState.lastError = copied
+                ? "History is unavailable; the EOU recovery transcript was copied and opened in Preview."
+                : "History and clipboard recovery are unavailable; the EOU transcript remains open in Preview."
         }
         showPreview(token: token)
     }
@@ -974,21 +985,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 recognizedCommands: [],
                 unrecognizedCommandCandidates: []
             )
-        guard await saveRawHistory(
+        let historySaved = await saveRawHistory(
             token: token,
             mode: cleanupMode,
             asrLatency: asrLatency,
             unrecognizedCommands: commandAnalysis.unrecognizedCommandCandidates.map(\.phrase)
-        ) else {
-            updateSession(token) { $0.deliveredText = raw.text }
+        )
+        guard !Task.isCancelled, isCurrent(token) else { return }
+        if !historySaved {
+            // History is a recovery layer, not a runtime dependency. Secure the
+            // immutable ASR result on the clipboard, surface a durable warning,
+            // and continue through the normal cleanup/delivery path.
             let copied = textInserter.copyOnly(raw.text)
-            failSession(
-                token: token,
-                copied
-                    ? "Raw history could not be saved. The transcript was copied to the clipboard; nothing was pasted."
-                    : "Raw history and clipboard writes both failed. Nothing was pasted."
-            )
-            return
+            appState.lastError = copied
+                ? "History is unavailable; dictation continued with clipboard recovery."
+                : "History and the recovery clipboard write failed; dictation delivery will still be attempted."
         }
 
         let refinerBackend = cleanupMode == .clean
@@ -1282,6 +1293,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let pasteMayHaveBeenCommitted = appState.phase == .pasting
         updateSession(token) {
             $0.cancellationRequested = true
+            $0.captureFinishTask?.cancel()
             $0.finalizationTask?.cancel()
             $0.streamingStartTask?.cancel()
             $0.streamingUpdatesTask?.cancel()
@@ -1407,6 +1419,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ session: DictationSession,
         hideOverlay: Bool = true
     ) {
+        session.captureFinishTask?.cancel()
         session.finalizationTask?.cancel()
         session.streamingStartTask?.cancel()
         session.streamingUpdatesTask?.cancel()
@@ -2438,11 +2451,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 _ = try await historyStore.deleteEverything()
                 guard let self else { return }
+                let debugDataCleared = self.appState.debugSessionStore.clear()
                 self.appState.lastTranscription = ""
                 self.lastTextMenuItem?.isEnabled = false
                 self.pasteLastMenuItem?.isEnabled = false
                 self.historyWindow?.refresh()
-                self.appState.lastError = nil
+                self.appState.lastError = debugDataCleared
+                    ? nil
+                    : "Database history was deleted, but some retained debug files could not be removed."
             } catch {
                 self?.appState.lastError = "Could not delete Local Dictation data: \(error.localizedDescription)"
             }

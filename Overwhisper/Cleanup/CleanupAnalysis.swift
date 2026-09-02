@@ -801,7 +801,11 @@ struct CleanupDisfluencyDetector: Sendable {
             for index in 1..<tokens.count where tokens[index - 1].canonical == tokens[index].canonical {
                 let gap = CleanupTextRange(tokens[index - 1].range.upperBound, tokens[index].range.lowerBound)
                 let gapText = CleanupText.substring(in: text, range: gap) ?? ""
-                guard gapText.rangeOfCharacter(from: CharacterSet(charactersIn: ".!?\n")) == nil else {
+                guard !tokens[index].canonical.allSatisfy({ $0.isNumber }),
+                      !gapText.isEmpty,
+                      gapText.rangeOfCharacter(from: .whitespaces.inverted) == nil,
+                      gapText.rangeOfCharacter(from: .newlines) == nil
+                else {
                     continue
                 }
                 let confidence: CleanupDisfluencyConfidence = possiblyIntentionalRepetitions

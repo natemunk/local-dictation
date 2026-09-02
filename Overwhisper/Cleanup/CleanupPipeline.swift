@@ -134,8 +134,12 @@ struct CleanupPipeline: Sendable {
         let fallback = try await deterministicFallback.refine(input)
         do {
             try validator.validate(generated: fallback, against: input)
-        } catch let failure as RefinementValidationFailure {
-            throw CleanupPipelineError.deterministicFallbackRejected(failure)
+        } catch is RefinementValidationFailure {
+            return CleanupResult(
+                text: input.transcript,
+                metadata: metadata,
+                outcome: .deterministicFallback(reason)
+            )
         }
         return CleanupResult(
             text: fallback,

@@ -403,6 +403,7 @@ final class AudioRecorder: ObservableObject {
             }
 
             runtime.startConsumer()
+            renderContext.resetCallbackWatchdogForAudioUnitStart()
             status = AudioOutputUnitStart(unit)
             guard status == noErr else {
                 throw AudioRecorderError.deviceConfigurationFailed
@@ -518,10 +519,13 @@ final class AudioRecorder: ObservableObject {
             return
         }
         if !captureFailureHandled,
-           let renderError = runtime.renderContext.lastRenderError {
+           let renderError = runtime.renderContext.terminalRenderError {
             captureFailureHandled = true
             onCaptureFailure?(
-                "The microphone render callback failed (OSStatus \(renderError))."
+                "The microphone render callback failed "
+                    + "at least "
+                    + "\(AudioRenderHealthState.terminalConsecutiveFailureThreshold) "
+                    + "times in a row (OSStatus \(renderError))."
             )
             return
         }

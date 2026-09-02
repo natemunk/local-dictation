@@ -28,6 +28,41 @@ struct AudioCaptureProcessorTests {
         }
     }
 
+    @Test("ragged native blocks preserve exact cumulative sample accounting")
+    func raggedBlockSampleCounts() async throws {
+        let blockPattern = [127, 1_024, 73, 2_047, 509, 331, 4_093]
+
+        for rate in [44_100.0, 48_000.0, 96_000.0] {
+            let harness = try ProcessorHarness(sampleRate: rate, channels: 1)
+            let totalInputFrames = Int(rate) + 137
+            var remaining = totalInputFrames
+            var blockIndex = 0
+
+            while remaining > 0 {
+                let frames = min(blockPattern[blockIndex % blockPattern.count], remaining)
+                try harness.process(frameCount: frames, values: [0.25])
+                remaining -= frames
+                blockIndex += 1
+            }
+
+            let metrics = try harness.processor.finish()
+            let chunks = await collect(harness.source.stream)
+            let file = try AVAudioFile(forReading: harness.url)
+            let expectedOutputFrames = Int64(
+                floor(Double(totalInputFrames) * 16_000 / rate)
+            )
+
+            #expect(metrics.acceptedInputFrames == Int64(totalInputFrames))
+            #expect(metrics.emittedOutputFrames == expectedOutputFrames)
+            #expect(
+                chunks.reduce(0) { $0 + $1.samples.count }
+                    == Int(expectedOutputFrames)
+            )
+            #expect(file.length == expectedOutputFrames)
+            try? FileManager.default.removeItem(at: harness.url)
+        }
+    }
+
     @Test("multichannel capture meters and converts only the primary input channel")
     func primaryChannelIsCanonical() async throws {
         let harness = try ProcessorHarness(sampleRate: 48_000, channels: 4)

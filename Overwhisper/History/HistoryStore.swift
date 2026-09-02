@@ -90,11 +90,13 @@ actor HistoryStore {
         var configuration = Configuration()
         configuration.journalMode = .wal
         let database = try DatabaseQueue(path: databaseURL.path, configuration: configuration)
+        try Self.enableSecureDeletion(in: database)
         self.database = database
         try Self.makeMigrator().migrate(database)
     }
 
     private init(database: DatabaseQueue) throws {
+        try Self.enableSecureDeletion(in: database)
         self.database = database
         try Self.makeMigrator().migrate(database)
     }
@@ -638,7 +640,7 @@ actor HistoryStore {
 
     @discardableResult
     func deleteEverything() throws -> (history: Int, metrics: Int) {
-        try database.write { db in
+        let deleted = try database.write { db in
             let history = try Int.fetchOne(
                 db,
                 sql: "SELECT COUNT(*) FROM \(Self.tableName)"
@@ -651,6 +653,16 @@ actor HistoryStore {
             try db.execute(sql: "DELETE FROM \(Self.metricsTableName)")
             return (history, metrics)
         }
+        // A logical DELETE alone can leave prior values in free pages or the
+        // WAL. This explicit destructive action also checkpoints and rebuilds
+        // the database so deleted transcript text and destination metadata do
+        // not remain recoverable from ordinary database files.
+        try database.writeWithoutTransaction { db in
+            _ = try db.checkpoint(.truncate)
+            try db.execute(sql: "VACUUM")
+            _ = try db.checkpoint(.truncate)
+        }
+        return deleted
     }
 
     /// Removes every history entry older than the policy cutoff, regardless of
@@ -694,6 +706,12 @@ actor HistoryStore {
     }
 
     // MARK: - Migration and schema diagnostics
+
+    private static func enableSecureDeletion(in database: DatabaseQueue) throws {
+        try database.writeWithoutTransaction { db in
+            try db.execute(sql: "PRAGMA secure_delete = ON")
+        }
+    }
 
     static func makeMigrator() -> DatabaseMigrator {
         var migrator = DatabaseMigrator()

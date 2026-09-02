@@ -208,6 +208,25 @@ struct CleanupValidatorTests {
         #expect(try validator.validate(generated: source, against: input) == source)
     }
 
+    @Test("protected terms may also occur inside a protected URL")
+    func nestedProtectedOccurrences() throws {
+        let url = "https://linear.app/myeducator/issue/MYE-2076"
+
+        for source in [
+            "Open MYE-2076 at \(url)",
+            "Open \(url) then MYE-2076",
+        ] {
+            let vocabulary = try CleanupVocabularyProcessor().process(source)
+            let input = TextRefinementInput(
+                transcript: vocabulary.text,
+                candidateDisfluencies: [],
+                protectedSpans: vocabulary.protectedSpans
+            )
+
+            #expect(try validator.validate(generated: source, against: input) == source)
+        }
+    }
+
     @Test("bullet formatting requires and preserves an explicit command result")
     func bulletsStayExplicit() {
         let prose = TextRefinementInput(
