@@ -12,15 +12,18 @@ actor HistoryStore {
     static let searchMigrationIdentifier = "history_fts_v1"
     static let searchBundleMigrationIdentifier = "history_fts_v2"
     static let metadataMigrationIdentifier = "history_metadata_v2"
+    static let metricsMigrationIdentifier = "dictation_metrics_v1"
     static let expectedMigrationIdentifiers = [
         schemaMigrationIdentifier,
         searchMigrationIdentifier,
         searchBundleMigrationIdentifier,
         metadataMigrationIdentifier,
+        metricsMigrationIdentifier,
     ]
 
     private static let tableName = "dictation_history"
     private static let searchTableName = "dictation_history_fts"
+    private static let metricsTableName = "dictation_metrics"
 
     private enum Column {
         static let rowID = "row_id"
@@ -46,6 +49,33 @@ actor HistoryStore {
         static let refinementOutcome = "refinement_outcome"
         static let validationFailureKind = "validation_failure_kind"
         static let stopToPasteLatency = "stop_to_paste_latency"
+    }
+
+    private enum MetricsColumn {
+        static let eventID = "event_id"
+        static let completedAt = "completed_at"
+        static let recordingDurationSeconds = "recording_duration_seconds"
+        static let rawWordCount = "raw_word_count"
+        static let deliveredWordCount = "delivered_word_count"
+        static let dictationMode = "dictation_mode"
+        static let speechEngine = "speech_engine"
+        static let speechModel = "speech_model"
+        static let cleanupBackend = "cleanup_backend"
+        static let cleanupOutcome = "cleanup_outcome"
+        static let asrLatencySeconds = "asr_latency_seconds"
+        static let cleanupLatencySeconds = "cleanup_latency_seconds"
+        static let stopToDeliveryLatencySeconds = "stop_to_delivery_latency_seconds"
+        static let deliveryOutcome = "delivery_outcome"
+        static let recognizedCommandCount = "recognized_command_count"
+        static let wordsRemoved = "words_removed"
+        static let destinationBundleIdentifier = "destination_bundle_identifier"
+        static let destinationDisplayName = "destination_display_name"
+        static let sourceKind = "source_kind"
+        static let timingComplete = "timing_complete"
+        static let createdAt = "created_at"
+        static let updatedAt = "updated_at"
+        static let eventRevision = "event_revision"
+        static let schemaVersion = "schema_version"
     }
 
     private let database: DatabaseQueue
@@ -444,6 +474,185 @@ actor HistoryStore {
         }
     }
 
+    /// Explicit transcript-only deletion. Metrics intentionally have no
+    /// foreign key to history and remain available after this operation.
+    @discardableResult
+    func deleteTranscriptHistory() throws -> Int {
+        try deleteAll()
+    }
+
+    // MARK: - Transcript-free metrics
+
+    /// Inserts or revises one attempt without ever accepting transcript text.
+    /// A higher lifecycle revision wins even when asynchronous tasks complete
+    /// out of order. Analytics-disabled callers perform no database write.
+    @discardableResult
+    func upsertMetric(
+        _ event: DictationMetricEvent,
+        analyticsEnabled: Bool = true
+    ) throws -> Bool {
+        guard analyticsEnabled else { return false }
+        let now = Date()
+        return try database.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO \(Self.metricsTableName) (
+                        \(MetricsColumn.eventID),
+                        \(MetricsColumn.completedAt),
+                        \(MetricsColumn.recordingDurationSeconds),
+                        \(MetricsColumn.rawWordCount),
+                        \(MetricsColumn.deliveredWordCount),
+                        \(MetricsColumn.dictationMode),
+                        \(MetricsColumn.speechEngine),
+                        \(MetricsColumn.speechModel),
+                        \(MetricsColumn.cleanupBackend),
+                        \(MetricsColumn.cleanupOutcome),
+                        \(MetricsColumn.asrLatencySeconds),
+                        \(MetricsColumn.cleanupLatencySeconds),
+                        \(MetricsColumn.stopToDeliveryLatencySeconds),
+                        \(MetricsColumn.deliveryOutcome),
+                        \(MetricsColumn.recognizedCommandCount),
+                        \(MetricsColumn.wordsRemoved),
+                        \(MetricsColumn.destinationBundleIdentifier),
+                        \(MetricsColumn.destinationDisplayName),
+                        \(MetricsColumn.sourceKind),
+                        \(MetricsColumn.timingComplete),
+                        \(MetricsColumn.createdAt),
+                        \(MetricsColumn.updatedAt),
+                        \(MetricsColumn.eventRevision),
+                        \(MetricsColumn.schemaVersion)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(\(MetricsColumn.eventID)) DO UPDATE SET
+                        \(MetricsColumn.completedAt) = excluded.\(MetricsColumn.completedAt),
+                        \(MetricsColumn.recordingDurationSeconds) = excluded.\(MetricsColumn.recordingDurationSeconds),
+                        \(MetricsColumn.rawWordCount) = excluded.\(MetricsColumn.rawWordCount),
+                        \(MetricsColumn.deliveredWordCount) = excluded.\(MetricsColumn.deliveredWordCount),
+                        \(MetricsColumn.dictationMode) = excluded.\(MetricsColumn.dictationMode),
+                        \(MetricsColumn.speechEngine) = excluded.\(MetricsColumn.speechEngine),
+                        \(MetricsColumn.speechModel) = excluded.\(MetricsColumn.speechModel),
+                        \(MetricsColumn.cleanupBackend) = excluded.\(MetricsColumn.cleanupBackend),
+                        \(MetricsColumn.cleanupOutcome) = excluded.\(MetricsColumn.cleanupOutcome),
+                        \(MetricsColumn.asrLatencySeconds) = excluded.\(MetricsColumn.asrLatencySeconds),
+                        \(MetricsColumn.cleanupLatencySeconds) = excluded.\(MetricsColumn.cleanupLatencySeconds),
+                        \(MetricsColumn.stopToDeliveryLatencySeconds) = excluded.\(MetricsColumn.stopToDeliveryLatencySeconds),
+                        \(MetricsColumn.deliveryOutcome) = excluded.\(MetricsColumn.deliveryOutcome),
+                        \(MetricsColumn.recognizedCommandCount) = excluded.\(MetricsColumn.recognizedCommandCount),
+                        \(MetricsColumn.wordsRemoved) = excluded.\(MetricsColumn.wordsRemoved),
+                        \(MetricsColumn.destinationBundleIdentifier) = excluded.\(MetricsColumn.destinationBundleIdentifier),
+                        \(MetricsColumn.destinationDisplayName) = excluded.\(MetricsColumn.destinationDisplayName),
+                        \(MetricsColumn.sourceKind) = excluded.\(MetricsColumn.sourceKind),
+                        \(MetricsColumn.timingComplete) = excluded.\(MetricsColumn.timingComplete),
+                        \(MetricsColumn.updatedAt) = excluded.\(MetricsColumn.updatedAt),
+                        \(MetricsColumn.eventRevision) = excluded.\(MetricsColumn.eventRevision),
+                        \(MetricsColumn.schemaVersion) = excluded.\(MetricsColumn.schemaVersion)
+                    WHERE excluded.\(MetricsColumn.eventRevision) > \(Self.metricsTableName).\(MetricsColumn.eventRevision)
+                    """,
+                arguments: [
+                    event.eventID.uuidString.lowercased(),
+                    event.completedAt,
+                    event.recordingDurationSeconds,
+                    max(0, event.rawWordCount),
+                    max(0, event.deliveredWordCount),
+                    event.dictationMode,
+                    event.speechEngine,
+                    event.speechModel,
+                    event.cleanupBackend,
+                    event.cleanupOutcome,
+                    event.asrLatencySeconds,
+                    event.cleanupLatencySeconds,
+                    event.stopToDeliveryLatencySeconds,
+                    event.deliveryOutcome,
+                    event.recognizedCommandCount,
+                    event.wordsRemoved,
+                    event.destinationBundleIdentifier,
+                    event.destinationDisplayName,
+                    event.sourceKind.rawValue,
+                    event.timingComplete,
+                    now,
+                    now,
+                    event.eventRevision,
+                    event.schemaVersion,
+                ]
+            )
+            return db.changesCount > 0
+        }
+    }
+
+    func fetchMetric(eventID: UUID) throws -> DictationMetricEvent? {
+        try database.read { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: "SELECT * FROM \(Self.metricsTableName) WHERE \(MetricsColumn.eventID) = ?",
+                arguments: [eventID.uuidString.lowercased()]
+            ) else { return nil }
+            return try Self.decodeMetric(row)
+        }
+    }
+
+    func fetchMetrics(limit: Int = 100) throws -> [DictationMetricEvent] {
+        guard limit > 0 else { return [] }
+        return try database.read { db in
+            try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT * FROM \(Self.metricsTableName)
+                    ORDER BY \(MetricsColumn.completedAt) DESC
+                    LIMIT ?
+                    """,
+                arguments: [limit]
+            ).map(Self.decodeMetric)
+        }
+    }
+
+    func metricCount(sourceKind: DictationMetricSourceKind? = nil) throws -> Int {
+        try database.read { db in
+            if let sourceKind {
+                return try Int.fetchOne(
+                    db,
+                    sql: "SELECT COUNT(*) FROM \(Self.metricsTableName) WHERE \(MetricsColumn.sourceKind) = ?",
+                    arguments: [sourceKind.rawValue]
+                ) ?? 0
+            }
+            return try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM \(Self.metricsTableName)") ?? 0
+        }
+    }
+
+    /// Repair/test seam for the same insert-only backfill used by the migration.
+    /// It is deliberately not called on every launch so Reset Analytics remains
+    /// durable while transcript history is retained.
+    @discardableResult
+    func backfillLegacyMetrics() throws -> Int {
+        try database.write { db in
+            try Self.backfillLegacyMetrics(in: db)
+        }
+    }
+
+    @discardableResult
+    func resetAnalytics() throws -> Int {
+        try database.write { db in
+            let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM \(Self.metricsTableName)") ?? 0
+            try db.execute(sql: "DELETE FROM \(Self.metricsTableName)")
+            return count
+        }
+    }
+
+    @discardableResult
+    func deleteEverything() throws -> (history: Int, metrics: Int) {
+        try database.write { db in
+            let history = try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM \(Self.tableName)"
+            ) ?? 0
+            let metrics = try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM \(Self.metricsTableName)"
+            ) ?? 0
+            try db.execute(sql: "DELETE FROM \(Self.tableName)")
+            try db.execute(sql: "DELETE FROM \(Self.metricsTableName)")
+            return (history, metrics)
+        }
+    }
+
     /// Removes every history entry older than the policy cutoff, regardless of
     /// delivery or refinement outcome. Callers can use this at launch and from
     /// a daily maintenance task.
@@ -547,6 +756,42 @@ actor HistoryStore {
             }
         }
 
+        migrator.registerMigration(metricsMigrationIdentifier) { db in
+            try db.create(table: metricsTableName) { table in
+                table.column(MetricsColumn.eventID, .text).primaryKey()
+                table.column(MetricsColumn.completedAt, .datetime).notNull().indexed()
+                table.column(MetricsColumn.recordingDurationSeconds, .double)
+                table.column(MetricsColumn.rawWordCount, .integer).notNull().defaults(to: 0)
+                table.column(MetricsColumn.deliveredWordCount, .integer).notNull().defaults(to: 0)
+                table.column(MetricsColumn.dictationMode, .text)
+                table.column(MetricsColumn.speechEngine, .text)
+                table.column(MetricsColumn.speechModel, .text)
+                table.column(MetricsColumn.cleanupBackend, .text)
+                table.column(MetricsColumn.cleanupOutcome, .text)
+                table.column(MetricsColumn.asrLatencySeconds, .double)
+                table.column(MetricsColumn.cleanupLatencySeconds, .double)
+                table.column(MetricsColumn.stopToDeliveryLatencySeconds, .double)
+                table.column(MetricsColumn.deliveryOutcome, .text).notNull()
+                table.column(MetricsColumn.recognizedCommandCount, .integer)
+                table.column(MetricsColumn.wordsRemoved, .integer)
+                table.column(MetricsColumn.destinationBundleIdentifier, .text)
+                table.column(MetricsColumn.destinationDisplayName, .text)
+                table.column(MetricsColumn.sourceKind, .text).notNull()
+                table.column(MetricsColumn.timingComplete, .boolean)
+                    .notNull()
+                    .defaults(to: false)
+                table.column(MetricsColumn.createdAt, .datetime).notNull()
+                table.column(MetricsColumn.updatedAt, .datetime).notNull()
+                table.column(MetricsColumn.eventRevision, .integer)
+                    .notNull()
+                    .defaults(to: 0)
+                table.column(MetricsColumn.schemaVersion, .integer)
+                    .notNull()
+                    .defaults(to: DictationMetricEvent.currentSchemaVersion)
+            }
+            _ = try backfillLegacyMetrics(in: db)
+        }
+
         return migrator
     }
 
@@ -621,6 +866,24 @@ actor HistoryStore {
         }
     }
 
+    func metricsDatabaseColumnNames() throws -> [String] {
+        try database.read { db in
+            try String.fetchAll(
+                db,
+                sql: "SELECT name FROM pragma_table_info('\(Self.metricsTableName)') ORDER BY cid"
+            )
+        }
+    }
+
+    func metricsForeignKeyCount() throws -> Int {
+        try database.read { db in
+            try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM pragma_foreign_key_list('\(Self.metricsTableName)')"
+            ) ?? 0
+        }
+    }
+
     func databaseSchemaObjectNames() throws -> [String] {
         try database.read { db in
             try String.fetchAll(
@@ -636,6 +899,162 @@ actor HistoryStore {
     }
 
     // MARK: - Record mapping
+
+    private static func backfillLegacyMetrics(in db: Database) throws -> Int {
+        let rows = try Row.fetchAll(
+            db,
+            sql: """
+                SELECT
+                    \(Column.id),
+                    \(Column.timestamp),
+                    \(Column.rawText),
+                    \(Column.polishedText),
+                    \(Column.destinationBundleIdentifier),
+                    \(Column.destinationDisplayName),
+                    \(Column.mode),
+                    \(Column.deliveryStatus),
+                    \(Column.refinementStatus),
+                    \(Column.refinementLatency),
+                    \(Column.refinementOutcome),
+                    \(Column.stopToPasteLatency)
+                FROM \(tableName)
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM \(metricsTableName)
+                    WHERE \(metricsTableName).\(MetricsColumn.eventID) = \(tableName).\(Column.id)
+                )
+                """
+        )
+        let now = Date()
+        var insertedCount = 0
+
+        for row in rows {
+            let storedID: String = row[Column.id]
+            guard UUID(uuidString: storedID) != nil else { continue }
+            let rawText: String = row[Column.rawText]
+            let polishedText: String? = row[Column.polishedText]
+            let mode: String = row[Column.mode]
+            let deliveryOutcome: String = row[Column.deliveryStatus]
+            let refinementStatus: String = row[Column.refinementStatus]
+            let refinementOutcome: String? = row[Column.refinementOutcome]
+            let deliveredText = polishedText ?? rawText
+            let rawWordCount = DictationWordCounter.count(rawText)
+            let deliveredWordCount = legacyOutcomeMakesTextAvailable(deliveryOutcome)
+                ? DictationWordCounter.count(deliveredText)
+                : 0
+            let cleanupRan = mode == HistoryDictationMode.clean.rawValue
+                && polishedText != nil
+                && refinementStatus != HistoryRefinementStatus.pending.rawValue
+                && refinementStatus != HistoryRefinementStatus.notRequested.rawValue
+            let wordsRemoved = cleanupRan
+                ? max(0, rawWordCount - DictationWordCounter.count(deliveredText))
+                : nil
+
+            try db.execute(
+                sql: """
+                    INSERT OR IGNORE INTO \(metricsTableName) (
+                        \(MetricsColumn.eventID),
+                        \(MetricsColumn.completedAt),
+                        \(MetricsColumn.recordingDurationSeconds),
+                        \(MetricsColumn.rawWordCount),
+                        \(MetricsColumn.deliveredWordCount),
+                        \(MetricsColumn.dictationMode),
+                        \(MetricsColumn.speechEngine),
+                        \(MetricsColumn.speechModel),
+                        \(MetricsColumn.cleanupBackend),
+                        \(MetricsColumn.cleanupOutcome),
+                        \(MetricsColumn.asrLatencySeconds),
+                        \(MetricsColumn.cleanupLatencySeconds),
+                        \(MetricsColumn.stopToDeliveryLatencySeconds),
+                        \(MetricsColumn.deliveryOutcome),
+                        \(MetricsColumn.recognizedCommandCount),
+                        \(MetricsColumn.wordsRemoved),
+                        \(MetricsColumn.destinationBundleIdentifier),
+                        \(MetricsColumn.destinationDisplayName),
+                        \(MetricsColumn.sourceKind),
+                        \(MetricsColumn.timingComplete),
+                        \(MetricsColumn.createdAt),
+                        \(MetricsColumn.updatedAt),
+                        \(MetricsColumn.eventRevision),
+                        \(MetricsColumn.schemaVersion)
+                    ) VALUES (?, ?, NULL, ?, ?, ?, NULL, NULL, NULL, ?, NULL, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                    """,
+                arguments: [
+                    storedID.lowercased(),
+                    row[Column.timestamp] as Date,
+                    rawWordCount,
+                    deliveredWordCount,
+                    mode,
+                    refinementOutcome ?? refinementStatus,
+                    row[Column.refinementLatency] as TimeInterval?,
+                    row[Column.stopToPasteLatency] as TimeInterval?,
+                    deliveryOutcome,
+                    wordsRemoved,
+                    row[Column.destinationBundleIdentifier] as String?,
+                    row[Column.destinationDisplayName] as String?,
+                    DictationMetricSourceKind.legacyHistory.rawValue,
+                    false,
+                    now,
+                    now,
+                    DictationMetricEvent.currentSchemaVersion,
+                ]
+            )
+            insertedCount += db.changesCount
+        }
+        return insertedCount
+    }
+
+    private static func legacyOutcomeMakesTextAvailable(_ rawValue: String) -> Bool {
+        guard let status = HistoryDeliveryStatus(rawValue: rawValue) else { return false }
+        switch status {
+        case .delivered, .previewed, .pastedRaw, .pasteEventSent, .clipboardOnly:
+            return true
+        case .pending, .historyOnly, .failed, .cancelled:
+            return false
+        }
+    }
+
+    private static func decodeMetric(_ row: Row) throws -> DictationMetricEvent {
+        let storedID: String = row[MetricsColumn.eventID]
+        guard let eventID = UUID(uuidString: storedID) else {
+            throw HistoryStoreError.invalidStoredValue(
+                column: MetricsColumn.eventID,
+                value: storedID
+            )
+        }
+        let storedSourceKind: String = row[MetricsColumn.sourceKind]
+        guard let sourceKind = DictationMetricSourceKind(rawValue: storedSourceKind) else {
+            throw HistoryStoreError.invalidStoredValue(
+                column: MetricsColumn.sourceKind,
+                value: storedSourceKind
+            )
+        }
+
+        return DictationMetricEvent(
+            eventID: eventID,
+            completedAt: row[MetricsColumn.completedAt],
+            recordingDurationSeconds: row[MetricsColumn.recordingDurationSeconds],
+            rawWordCount: row[MetricsColumn.rawWordCount],
+            deliveredWordCount: row[MetricsColumn.deliveredWordCount],
+            dictationMode: row[MetricsColumn.dictationMode],
+            speechEngine: row[MetricsColumn.speechEngine],
+            speechModel: row[MetricsColumn.speechModel],
+            cleanupBackend: row[MetricsColumn.cleanupBackend],
+            cleanupOutcome: row[MetricsColumn.cleanupOutcome],
+            asrLatencySeconds: row[MetricsColumn.asrLatencySeconds],
+            cleanupLatencySeconds: row[MetricsColumn.cleanupLatencySeconds],
+            stopToDeliveryLatencySeconds: row[MetricsColumn.stopToDeliveryLatencySeconds],
+            deliveryOutcome: row[MetricsColumn.deliveryOutcome],
+            recognizedCommandCount: row[MetricsColumn.recognizedCommandCount],
+            wordsRemoved: row[MetricsColumn.wordsRemoved],
+            destinationBundleIdentifier: row[MetricsColumn.destinationBundleIdentifier],
+            destinationDisplayName: row[MetricsColumn.destinationDisplayName],
+            sourceKind: sourceKind,
+            timingComplete: row[MetricsColumn.timingComplete],
+            eventRevision: row[MetricsColumn.eventRevision],
+            schemaVersion: row[MetricsColumn.schemaVersion]
+        )
+    }
 
     private static func fetchEntry(_ id: UUID, in db: Database) throws -> HistoryEntry? {
         guard let row = try Row.fetchOne(

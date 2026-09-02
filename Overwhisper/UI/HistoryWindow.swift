@@ -124,10 +124,10 @@ private final class HistoryViewModel: ObservableObject {
         }
     }
 
-    func deleteAll() {
+    func deleteTranscriptHistory() {
         Task { @MainActor [weak self, store] in
             do {
-                _ = try await store.deleteAll()
+                _ = try await store.deleteTranscriptHistory()
                 guard let self else { return }
                 self.selection = nil
                 self.reload()
@@ -180,15 +180,21 @@ private struct HistoryView: View {
             ToolbarItemGroup {
                 Button("Delete Entry", systemImage: "trash", action: viewModel.deleteSelected)
                     .disabled(viewModel.selectedEntry == nil)
-                Button("Delete All", systemImage: "trash.slash") { showingDeleteAll = true }
+                Button("Delete Transcript History", systemImage: "trash.slash") {
+                    showingDeleteAll = true
+                }
                     .disabled(viewModel.entries.isEmpty)
             }
         }
-        .alert("Delete all dictation history?", isPresented: $showingDeleteAll) {
-            Button("Delete All", role: .destructive, action: viewModel.deleteAll)
+        .alert("Delete all transcript history?", isPresented: $showingDeleteAll) {
+            Button(
+                "Delete Transcript History",
+                role: .destructive,
+                action: viewModel.deleteTranscriptHistory
+            )
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This permanently removes all raw and polished transcripts. Audio is not stored here.")
+            Text("This permanently removes all raw and polished transcripts. Transcript-free analytics are retained; reset them separately in Settings → Privacy.")
         }
         .alert(
             "History Error",

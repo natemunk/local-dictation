@@ -17,6 +17,10 @@ struct SettingsView: View {
     let onImportRaycastVocabulary: (String) -> Void
     let onVerifyModel: () -> Void
     let onRepairModel: () -> Void
+    let onResetAnalytics: () -> Void
+    let onDeleteEverything: () -> Void
+
+    @State private var pendingDataDeletion: PrivacyDataDeletion?
 
     private let permissionRefreshTimer = Timer.publish(
         every: 1,
@@ -222,7 +226,7 @@ struct SettingsView: View {
             Section("Invariant") {
                 Label("Microphone audio never leaves this Mac", systemImage: "checkmark.shield.fill")
                     .foregroundStyle(.green)
-                Text("There is no telemetry SDK, cloud speech engine, automatic updater, or Overseed service in this build.")
+                Text("There is no outbound telemetry SDK, cloud speech engine, automatic updater, or Overseed service in this build.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Text("Network access is limited to first-time model downloads from the documented model host and any text-only refiner you explicitly configure.")
@@ -265,8 +269,78 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            Section("Local analytics") {
+                Toggle("Transcript-free analytics", isOn: $appState.analyticsEnabled)
+                Toggle(
+                    "Include destination app name",
+                    isOn: $appState.destinationAnalyticsEnabled
+                )
+                .disabled(!appState.analyticsEnabled)
+
+                Text("Enabled by default. Local Dictation stores counts, timings, engine choices, and outcomes in the local history database—never transcript text, audio, URLs, window titles, field contents, or error messages. Home Base may read this table locally; dictation never depends on Home Base running.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                HStack {
+                    Button("Transcript History…", action: onOpenHistory)
+                    Button("Reset Analytics…", role: .destructive) {
+                        pendingDataDeletion = .analytics
+                    }
+                    Spacer()
+                    Button("Delete Everything…", role: .destructive) {
+                        pendingDataDeletion = .everything
+                    }
+                }
+                .disabled(appState.phase.hasActiveSession)
+            }
         }
         .formStyle(.grouped)
+        .alert(item: $pendingDataDeletion) { deletion in
+            Alert(
+                title: Text(deletion.title),
+                message: Text(deletion.message),
+                primaryButton: .destructive(Text(deletion.buttonTitle)) {
+                    switch deletion {
+                    case .analytics:
+                        onResetAnalytics()
+                    case .everything:
+                        onDeleteEverything()
+                    }
+                },
+                secondaryButton: .cancel()
+            )
+        }
+    }
+}
+
+private enum PrivacyDataDeletion: String, Identifiable {
+    case analytics
+    case everything
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .analytics: "Reset transcript-free analytics?"
+        case .everything: "Delete all Local Dictation data?"
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .analytics:
+            "This removes analytics only. Raw and polished transcript history remains available."
+        case .everything:
+            "This permanently removes transcript history and transcript-free analytics. Configuration, models, and retained debug audio are not changed."
+        }
+    }
+
+    var buttonTitle: String {
+        switch self {
+        case .analytics: "Reset Analytics"
+        case .everything: "Delete Everything"
+        }
     }
 }
 

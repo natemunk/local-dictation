@@ -542,10 +542,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         do {
             let samples = try audioRecorder.startRecording()
+            let recordingStartedAtUptime = ProcessInfo.processInfo.systemUptime
             DictationPerformanceSignposts.emit(.captureReady, correlationID: token.generation)
             updateSession(token) {
                 $0.captureWatchdog?.cancel()
                 $0.captureWatchdog = nil
+                $0.metricTiming.markRecordingStarted(at: recordingStartedAtUptime)
             }
             if activeSession?.streamingTranscriber == nil {
                 appState.overlayMessage = "Listening · live text unavailable"
@@ -663,13 +665,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func beginFinalization(_ request: DictationFinishRequest) {
         guard isCurrent(request.token) else { return }
+        let stoppedAt = Date()
+        let stoppedAtUptime = ProcessInfo.processInfo.systemUptime
         DictationPerformanceSignposts.emit(
             .stop,
             correlationID: request.token.generation
         )
         updateSession(request.token) {
             $0.state = .finalizing
-            $0.stoppedAt = Date()
+            $0.stoppedAt = stoppedAt
+            $0.metricTiming.markRecordingStopped(at: stoppedAtUptime)
+            $0.metricDictationMode = request.mode == .literal ? .literal : .clean
         }
         appState.endRecordingClock()
         appState.phase = .finalizing
@@ -683,7 +689,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let destination = DictationDestination.captureFrontmost()
+        let destination = await DictationDestination.captureFrontmostWithRetry()
         let initialProfile = resolveProfile(for: destination).profile
         updateSession(request.token) {
             $0.destination = destination
@@ -740,7 +746,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-            let started = ContinuousClock.now
+            let engineStarted = ContinuousClock.now
             let streamingFinalTask = Task { [weak self] in
                 await self?.finishStreamingTranscript(token: request.token)
             }
@@ -748,12 +754,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let resolvedProfile = self.resolveProfile(for: destination)
                 try Task.checkCancellation()
                 guard self.isCurrent(request.token) else { return }
-                self.updateSession(request.token) { $0.profile = resolvedProfile.profile }
+                self.updateSession(request.token) {
+                    $0.profile = resolvedProfile.profile
+                    $0.metricDictationMode = request.mode == .literal
+                        || resolvedProfile.profile.mode == .literal
+                        || !resolvedProfile.profile.cleanupEnabled
+                        ? .literal
+                        : .clean
+                }
                 self.appState.activeProfileName = self.profileDisplayName(resolvedProfile.profile)
                 self.appState.customVocabulary = self.asrVocabularyBias(for: resolvedProfile.profile)
 
                 guard let engine = self.activeSession?.engine else {
                     throw LocalDictationError.engineUnavailable
+                }
+                if let selection = self.activeSession?.asrSelection {
+                    self.updateSession(request.token) {
+                        $0.metricSpeechEngine = Self.metricsSpeechEngine(for: selection)
+                        $0.metricSpeechModel = selection.modelVariant
+                    }
                 }
                 let raw = try await engine.transcribe(audioURL: audioURL)
                 let decision = ASRFinalizationPolicy.authoritative(raw)
@@ -767,7 +786,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.cancelStreamingSession(token: request.token)
                 try Task.checkCancellation()
                 guard self.isCurrent(request.token) else { return }
-                let asrLatency = started.duration(to: .now).seconds
+                let asrCompletedAtUptime = ProcessInfo.processInfo.systemUptime
+                self.updateSession(request.token) {
+                    $0.metricTiming.markASRCompleted(at: asrCompletedAtUptime)
+                }
+                let asrLatency = self.activeSession?.metricTiming.asrLatencySeconds
+                    ?? engineStarted.duration(to: .now).seconds
                 self.retainDebugRecordingIfEnabled(
                     at: audioURL,
                     transcript: raw.text,
@@ -785,6 +809,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             } catch {
                 guard !Task.isCancelled, self.isCurrent(request.token) else { return }
+                let failureAtUptime = ProcessInfo.processInfo.systemUptime
+                if self.activeSession?.metricSpeechEngine != nil {
+                    self.updateSession(request.token) {
+                        $0.metricTiming.markASRCompleted(at: failureAtUptime)
+                    }
+                }
                 DictationPerformanceSignposts.emit(
                     .asr,
                     correlationID: request.token.generation
@@ -797,7 +827,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if let fallback {
                     assert(fallback.delivery == .previewOnly)
                     assert(!fallback.commandsAllowed)
-                    let latency = started.duration(to: .now).seconds
+                    let latency = self.activeSession?.metricTiming.asrLatencySeconds
+                        ?? engineStarted.duration(to: .now).seconds
                     self.retainDebugRecordingIfEnabled(
                         at: audioURL,
                         transcript: fallback.transcript.text,
@@ -816,7 +847,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.retainDebugRecordingIfEnabled(
                     at: audioURL,
                     transcript: "",
-                    latency: started.duration(to: .now).seconds,
+                    latency: self.activeSession?.metricTiming.asrLatencySeconds
+                        ?? engineStarted.duration(to: .now).seconds,
                     error: error.localizedDescription,
                     token: request.token
                 )
@@ -839,6 +871,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             session.rawText = raw.text
             session.deliveredText = raw.text
             session.cleanupMode = .literal
+            session.metricDictationMode = .literal
+            session.metricSpeechEngine = "fluidaudio"
+            session.metricSpeechModel = "parakeet-eou-320ms"
+            session.metricCleanupBackend = "none"
+            session.recognizedCommandCount = 0
             session.refinementStatus = .notRequested
             session.asrOutcome = "eou_preview_fallback"
             session.refinerBackend = "none"
@@ -919,7 +956,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             || !profile.cleanupEnabled
             ? .literal
             : .clean
-        updateSession(token) { $0.cleanupMode = cleanupMode }
+        let metricsCleanupBackend = cleanupMode == .clean
+            ? configuredMetricsCleanupBackendName()
+            : "none"
+        updateSession(token) {
+            $0.cleanupMode = cleanupMode
+            $0.metricDictationMode = cleanupMode == .literal ? .literal : .clean
+            if cleanupMode == .literal {
+                $0.metricCleanupBackend = "none"
+                $0.recognizedCommandCount = 0
+            }
+        }
         let commandAnalysis = cleanupMode == .clean
             ? CleanupCommandProcessor().analyze(raw)
             : CleanupCommandResult(
@@ -944,26 +991,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let refinementStarted = Date()
         let refinerBackend = cleanupMode == .clean
             ? configuredRefinerBackendName()
             : "none"
         if cleanupMode == .clean {
             guard coordinator.transition(token: token, to: .polishing) else { return }
-            updateSession(token) { $0.state = .polishing }
+            updateSession(token) {
+                $0.state = .polishing
+                $0.metricCleanupBackend = metricsCleanupBackend
+            }
             appState.phase = .polishing
             appState.overlayMessage = "Polishing"
         }
 
         do {
-            let result = try await makeCleanupPipeline(for: profile).process(
+            let cleanupPipeline = makeCleanupPipeline(for: profile)
+            if cleanupMode == .clean {
+                let cleanupStartedAtUptime = ProcessInfo.processInfo.systemUptime
+                updateSession(token) {
+                    $0.metricTiming.markCleanupStarted(at: cleanupStartedAtUptime)
+                }
+            }
+            let result = try await cleanupPipeline.process(
                 raw,
                 mode: cleanupMode
             )
             try Task.checkCancellation()
             guard isCurrent(token) else { return }
+            let cleanupCompletedAtUptime = ProcessInfo.processInfo.systemUptime
             updateSession(token) { session in
                 session.deliveredText = result.text
+                session.recognizedCommandCount = cleanupMode == .clean
+                    ? result.metadata.recognizedCommands.count
+                    : 0
+                if cleanupMode == .clean {
+                    session.metricTiming.markCleanupCompleted(at: cleanupCompletedAtUptime)
+                }
                 session.refinerBackend = refinerBackend
                 session.validationFailureKind = nil
                 session.refinementError = nil
@@ -993,7 +1056,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             await finalizeHistoryBeforeDelivery(
                 token: token,
-                refinementLatency: Date().timeIntervalSince(refinementStarted)
+                refinementLatency: activeSession?.metricTiming.cleanupLatencySeconds
             )
             DictationPerformanceSignposts.emit(
                 .cleanup,
@@ -1003,8 +1066,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         } catch {
             guard isCurrent(token) else { return }
+            let cleanupCompletedAtUptime = ProcessInfo.processInfo.systemUptime
             updateSession(token) {
                 $0.deliveredText = $0.rawText
+                $0.recognizedCommandCount = 0
+                if cleanupMode == .clean {
+                    $0.metricTiming.markCleanupCompleted(at: cleanupCompletedAtUptime)
+                }
                 $0.refinementStatus = cleanupMode == .literal ? .notRequested : .failed
                 $0.refinerBackend = refinerBackend
                 $0.refinementOutcome = cleanupMode == .literal
@@ -1017,12 +1085,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 await markHistoryPolishFailed(
                     token: token,
                     error.localizedDescription,
-                    refinementLatency: Date().timeIntervalSince(refinementStarted)
+                    refinementLatency: activeSession?.metricTiming.cleanupLatencySeconds
                 )
             } else {
                 await finalizeHistoryBeforeDelivery(
                     token: token,
-                    refinementLatency: Date().timeIntervalSince(refinementStarted)
+                    refinementLatency: nil
                 )
             }
             DictationPerformanceSignposts.emit(
@@ -1058,6 +1126,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             isRemoteRefiner: appState.isRemoteRefiner,
             token: token
         )
+        queueMeasuredMetric(
+            token: token,
+            outcome: .previewed,
+            deliveredText: session.deliveredText
+        )
     }
 
     private func pasteCurrentText(
@@ -1089,10 +1162,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         switch outcome {
         case .pasteEventSent:
+            let deliveryStatus: HistoryDeliveryStatus = session.pastedRaw
+                ? .pastedRaw
+                : .pasteEventSent
             appState.overlayMessage = showRawLabel ? "Paste sent · raw" : "Paste sent"
             await updateHistoryDelivery(
                 token: token,
-                status: .pasteEventSent,
+                status: deliveryStatus,
+                deliveredText: insertionText
+            )
+            queueMeasuredMetric(
+                token: token,
+                outcome: deliveryStatus,
                 deliveredText: insertionText
             )
             updateSession(token) { $0.deliveryCommitted = true }
@@ -1105,6 +1186,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 deliveredText: insertionText,
                 error: reason
             )
+            queueMeasuredMetric(
+                token: token,
+                outcome: .clipboardOnly,
+                deliveredText: insertionText
+            )
             updateSession(token) { $0.deliveryCommitted = true }
         case .historyOnly(let reason):
             appState.overlayMessage = "Saved to history"
@@ -1115,6 +1201,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 deliveredText: insertionText,
                 error: reason
             )
+            queueMeasuredMetric(
+                token: token,
+                outcome: .historyOnly,
+                deliveredText: insertionText
+            )
             updateSession(token) { $0.deliveryCommitted = true }
         case .cancelled:
             await updateHistoryDelivery(
@@ -1122,6 +1213,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 status: .cancelled,
                 deliveredText: insertionText,
                 error: "Insertion was cancelled"
+            )
+            queueMeasuredMetric(
+                token: token,
+                outcome: .cancelled,
+                deliveredText: insertionText
             )
             return
         }
@@ -1163,6 +1259,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 deliveredText: text
             )
             guard self.isCurrent(token) else { return }
+            self.queueMeasuredMetric(
+                token: token,
+                outcome: .previewed,
+                deliveredText: text
+            )
             self.completeSession(token: token)
         }
     }
@@ -1185,6 +1286,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             $0.streamingStartTask?.cancel()
             $0.streamingUpdatesTask?.cancel()
         }
+        queueMeasuredMetric(
+            token: token,
+            outcome: .cancelled,
+            deliveredText: activeSession?.deliveredText
+        )
         cancelStreamingSession(token: token)
         if audioRecorder.isRecording { audioRecorder.cancelRecording() }
         guard let session = activeSession, session.token == token else { return }
@@ -1237,6 +1343,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             $0.finalizationWatchdog?.cancel()
             $0.finalizationWatchdog = nil
         }
+        queueMeasuredMetric(
+            token: token,
+            outcome: .failed,
+            deliveredText: session.deliveredText
+        )
         cancelStreamingSession(token: token)
         if audioRecorder?.isRecording == true { audioRecorder.cancelRecording() }
         _ = coordinator.transition(token: token, to: .failed)
@@ -1605,6 +1716,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func configuredMetricsCleanupBackendName() -> String {
+        guard appState.experimentalModelCleanupEnabled else {
+            return "deterministic"
+        }
+        switch configuration.app.refinerMode {
+        case .deterministic:
+            return "deterministic"
+        case .openAICompatible:
+            switch configuredRefinerEndpointDisposition {
+            case .loopback:
+                return "local_endpoint"
+            case .remoteAllowed:
+                return "remote_endpoint"
+            case nil:
+                return "deterministic"
+            }
+        case .auto:
+            switch configuredRefinerEndpointDisposition {
+            case .loopback:
+                return "local_endpoint"
+            case .remoteAllowed:
+                return "remote_endpoint"
+            case nil:
+                return SystemAppleFoundationModelAdapter().availability() == .available
+                    ? "apple"
+                    : "deterministic"
+            }
+        }
+    }
+
+    private static func metricsSpeechEngine(for selection: ASRSelection) -> String {
+        selection.isParakeet ? "fluidaudio" : "whisperkit"
+    }
+
     private static func historyValidationFailureKind(
         _ failure: RefinementValidationFailure
     ) -> String {
@@ -1705,6 +1850,97 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
+    /// Captures only integer counts and operational metadata before crossing
+    /// into the database actor. Transcript strings never enter the metric model.
+    private func queueMeasuredMetric(
+        token: DictationSessionToken,
+        outcome: HistoryDeliveryStatus,
+        deliveredText: String? = nil,
+        completedAt: Date = Date(),
+        completedAtUptime: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) {
+        guard appState.analyticsEnabled,
+              let historyStore,
+              let current = activeSession,
+              current.token == token,
+              current.destination?.isSecureField != true
+        else { return }
+
+        updateSession(token) { session in
+            session.metricTiming.markRecordingStopped(at: completedAtUptime)
+            session.metricEventRevision &+= 1
+            if session.metricEventRevision <= 0 { session.metricEventRevision = 1 }
+        }
+        guard let session = activeSession, session.token == token else { return }
+
+        let finalText = deliveredText ?? session.deliveredText
+        let rawWordCount = DictationWordCounter.count(session.rawText)
+        let textWasMadeAvailable: Bool
+        switch outcome {
+        case .delivered, .previewed, .pastedRaw, .pasteEventSent, .clipboardOnly:
+            textWasMadeAvailable = true
+        case .pending, .historyOnly, .failed, .cancelled:
+            textWasMadeAvailable = false
+        }
+        let deliveredWordCount = textWasMadeAvailable
+            ? DictationWordCounter.count(finalText)
+            : 0
+        let cleanupCompleted = session.metricTiming.cleanupLatencySeconds != nil
+        let wordsRemoved = cleanupCompleted
+            ? max(0, rawWordCount - DictationWordCounter.count(finalText))
+            : nil
+        let attemptedASR = session.metricSpeechEngine != nil
+        let expectedCleanup = session.metricCleanupBackend != nil
+            && session.metricCleanupBackend != "none"
+        let timingComplete = session.metricTiming.recordingDurationSeconds != nil
+            && session.metricTiming.stopToDeliveryLatencySeconds(
+                completedAtUptime: completedAtUptime
+            ) != nil
+            && (!attemptedASR || session.metricTiming.asrLatencySeconds != nil)
+            && (!expectedCleanup || cleanupCompleted)
+        let destinationMetadata = DictationMetricDestinationMetadata(
+            bundleIdentifier: session.destination?.bundleIdentifier,
+            displayName: session.destination?.applicationName,
+            analyticsEnabled: appState.destinationAnalyticsEnabled
+        )
+
+        let event = DictationMetricEvent(
+            eventID: token.id,
+            completedAt: completedAt,
+            recordingDurationSeconds: session.metricTiming.recordingDurationSeconds,
+            rawWordCount: rawWordCount,
+            deliveredWordCount: deliveredWordCount,
+            dictationMode: session.metricDictationMode?.rawValue,
+            speechEngine: session.metricSpeechEngine,
+            speechModel: session.metricSpeechModel,
+            cleanupBackend: session.metricCleanupBackend,
+            cleanupOutcome: session.refinementOutcome,
+            asrLatencySeconds: session.metricTiming.asrLatencySeconds,
+            cleanupLatencySeconds: session.metricTiming.cleanupLatencySeconds,
+            stopToDeliveryLatencySeconds: session.metricTiming.stopToDeliveryLatencySeconds(
+                completedAtUptime: completedAtUptime
+            ),
+            deliveryOutcome: outcome.rawValue,
+            recognizedCommandCount: session.recognizedCommandCount,
+            wordsRemoved: wordsRemoved,
+            destinationBundleIdentifier: destinationMetadata.bundleIdentifier,
+            destinationDisplayName: destinationMetadata.displayName,
+            sourceKind: .measured,
+            timingComplete: timingComplete,
+            eventRevision: session.metricEventRevision,
+            schemaVersion: DictationMetricEvent.currentSchemaVersion
+        )
+
+        Task { [historyStore] in
+            do {
+                _ = try await historyStore.upsertMetric(event)
+            } catch {
+                // Analytics is best-effort and must never interrupt dictation.
+                AppLogger.app.error("Transcript-free metric persistence failed")
+            }
+        }
+    }
+
     private func saveRawHistory(
         token: DictationSessionToken,
         mode: CleanupMode,
@@ -1760,7 +1996,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func finalizeHistoryBeforeDelivery(
         token: DictationSessionToken,
-        refinementLatency: TimeInterval
+        refinementLatency: TimeInterval?
     ) async {
         guard let historyStore,
               let session = activeSession,
@@ -1831,7 +2067,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               session.token == token,
               let id = session.historyID
         else { return }
-        let stopToPasteLatency = status == .pasteEventSent
+        let stopToPasteLatency = status == .pasteEventSent || status == .pastedRaw
             ? session.stoppedAt.map { Date().timeIntervalSince($0) }
             : nil
         do {
@@ -2180,6 +2416,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         historyWindow?.show()
     }
 
+    private func resetAnalytics() {
+        guard appState.phase == .idle || appState.phase == .failed,
+              let historyStore
+        else { return }
+        Task { @MainActor [weak self, historyStore] in
+            do {
+                _ = try await historyStore.resetAnalytics()
+                self?.appState.lastError = nil
+            } catch {
+                self?.appState.lastError = "Could not reset local analytics: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func deleteEverything() {
+        guard appState.phase == .idle || appState.phase == .failed,
+              let historyStore
+        else { return }
+        Task { @MainActor [weak self, historyStore] in
+            do {
+                _ = try await historyStore.deleteEverything()
+                guard let self else { return }
+                self.appState.lastTranscription = ""
+                self.lastTextMenuItem?.isEnabled = false
+                self.pasteLastMenuItem?.isEnabled = false
+                self.historyWindow?.refresh()
+                self.appState.lastError = nil
+            } catch {
+                self?.appState.lastError = "Could not delete Local Dictation data: \(error.localizedDescription)"
+            }
+        }
+    }
+
     @objc private func openSettings() {
         if let settingsWindow {
             settingsWindow.makeKeyAndOrderFront(nil)
@@ -2202,7 +2471,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.importRaycastVocabulary(text)
             },
             onVerifyModel: { [weak self] in self?.verifySelectedModel() },
-            onRepairModel: { [weak self] in self?.confirmRepairSelectedModel() }
+            onRepairModel: { [weak self] in self?.confirmRepairSelectedModel() },
+            onResetAnalytics: { [weak self] in self?.resetAnalytics() },
+            onDeleteEverything: { [weak self] in self?.deleteEverything() }
         )
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 646, height: 580),

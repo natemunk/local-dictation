@@ -168,7 +168,7 @@ Browser hostname profiles and Apple Events execution are removed from v1. Generi
 ## Insertion, history, and retention
 
 - The cutover path uses clipboard plus synthetic Command+V.
-- Exact editable AX elements are the first insertion tier. A same-focus-token fallback is limited to the reviewed Slack, Linear, Chrome/Chromium, Safari, and native Notion bundle allowlist. Missing tokens, changed focus/app, unapproved apps, and timeouts are clipboard-only; PID-only insertion is prohibited.
+- Exact editable AX elements are the first insertion tier. Finish-time capture retries transient AX focus/editability misses for at most 250 ms and may use the system-wide focused element only after AX verifies that its PID matches the captured frontmost application. A same-focus-token fallback is limited to the reviewed Claude, Codex/ChatGPT, Ghostty, Slack, Linear, Chrome/Chromium, Safari, native Notion, and Todoist bundle allowlist. When one of those apps exposes no focused field token, a final reviewed fallback requires the same captured PID and focused AX window to remain frontmost through delivery. Missing window tokens, changed focus/app/window, unapproved apps, and timeouts are clipboard-only; unrestricted PID-only insertion is prohibited.
 - Normal attempts leave ordinary transcript text on the clipboard. Private Clipboard Mode is off by default and adds best-effort concealed/transient markers without changing insertion semantics.
 - Clipboard restore and fixed pre/post-paste sleeps are absent. A concurrent user copy is never overwritten.
 - Delivery reports only `pasteEventSent`, verified `clipboardOnly`, `historyOnly`, or `cancelled`; posting Command+V is not proof that an editor accepted the paste.
@@ -179,6 +179,10 @@ Browser hostname profiles and Apple Events execution are removed from v1. Generi
 - Actor-isolated GRDB/SQLite uses WAL plus FTS5 and stores timestamp, raw text, polished/delivered text, destination app, mode, ASR/refiner outcomes, validation-failure kind, delivery/refinement state and latency, and unrecognized command candidates.
 - History never stores browser hostname or page information.
 - All successful, failed, pending, and cancelled history defaults to 90-day retention, pruned at launch and daily. History supports FTS plus escaped literal fallback, copy, serialized Paste Again, raw-versus-polished inspection, explicit vocabulary correction, delete entry, and delete all.
+- A separate `dictation_metrics` table stores one generation-safe row per nonsecure finalized attempt. It contains only wall completion time, monotonic durations, integer word/command counts, bounded mode/engine/model/backend/outcome labels, and optional destination app identity—never transcript text, audio, URLs, window titles, field contents, clipboard contents, or dynamic errors.
+- Canonical timing boundaries are recording start→stop, stop→final ASR, cleanup invocation→result/fallback, and stop→final paste-event/preview/clipboard/failure/cancellation decision. The row records the actual ASR and cleanup path used. Late delivery updates use the same event UUID and a monotonically increasing revision.
+- Legacy history is backfilled once with only honestly recoverable values. Its history timestamp is the best available legacy event time; missing recording/ASR/engine/model/backend/command measurements remain `NULL`, `source_kind` is `legacy_history`, and `timing_complete` is false.
+- Local analytics and destination-app analytics are separate default-on preferences. Analytics failure or opt-out cannot block dictation. Transcript history deletion/retention never deletes metrics; Reset Analytics deletes metrics only; Delete Everything transactionally deletes both database datasets.
 - Temporary audio is deleted after ASR or cancellation, and crash orphans are cleaned on launch. Debug audio retention is explicit and capped at the latest 10 recordings.
 
 ## Diagnostics and performance instrumentation

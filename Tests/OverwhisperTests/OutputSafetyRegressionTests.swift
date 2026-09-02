@@ -25,13 +25,22 @@ struct OutputSafetyRegressionTests {
                 allowsFocusTokenFallback: false
             )
         })
+        let unapprovedWindow = DictationDestination.captureFrontmost(candidateProvider: {
+            candidate(
+                focusTokenAvailable: false,
+                focusedWindowTokenAvailable: true,
+                focusedElementIsEditable: false,
+                allowsFocusedWindowFallback: false
+            )
+        })
 
         #expect(missing == nil)
         #expect(noToken == nil)
         #expect(unapprovedToken == nil)
+        #expect(unapprovedWindow == nil)
     }
 
-    @Test("exact editable and allowlisted focus-token tiers remain distinct")
+    @Test("exact editable, focus-token, and focused-window tiers remain distinct")
     @MainActor
     func insertionTiers() throws {
         let exact = try #require(
@@ -47,9 +56,20 @@ struct OutputSafetyRegressionTests {
                 )
             })
         )
+        let focusedWindow = try #require(
+            DictationDestination.captureFrontmost(candidateProvider: {
+                candidate(
+                    focusTokenAvailable: false,
+                    focusedWindowTokenAvailable: true,
+                    focusedElementIsEditable: false,
+                    allowsFocusedWindowFallback: true
+                )
+            })
+        )
 
         #expect(exact.insertionTier == .exactEditableElement)
         #expect(allowlisted.insertionTier == .allowlistedFocusToken)
+        #expect(focusedWindow.insertionTier == .allowlistedFocusedWindow)
     }
 
     @Test("tier-two product allowlist is explicit and rejects adjacent apps")
@@ -66,10 +86,110 @@ struct OutputSafetyRegressionTests {
             )
         )
         #expect(
+            DictationDestination.isApprovedFocusTokenFallback(
+                bundleIdentifier: "com.openai.codex"
+            )
+        )
+        for bundleIdentifier in [
+            "com.anthropic.claudefordesktop",
+            "com.mitchellh.ghostty",
+            "com.openai.chat",
+            "com.openai.atlas",
+            "com.todoist.mac.Todoist",
+        ] {
+            #expect(
+                DictationDestination.isApprovedFocusTokenFallback(
+                    bundleIdentifier: bundleIdentifier
+                )
+            )
+        }
+        #expect(
             !DictationDestination.isApprovedFocusTokenFallback(
                 bundleIdentifier: "com.example.UnreviewedEditor"
             )
         )
+    }
+
+    @Test("system-wide focus is a PID-checked fallback to app-scoped focus")
+    @MainActor
+    func systemWideFocusFallbackIsProcessBound() {
+        #expect(
+            DictationDestination.selectFocusedElement(
+                applicationScoped: "application",
+                systemWide: "system",
+                systemWideProcessIdentifier: 42,
+                expectedProcessIdentifier: 42
+            ) == "application"
+        )
+        #expect(
+            DictationDestination.selectFocusedElement(
+                applicationScoped: nil as String?,
+                systemWide: "system",
+                systemWideProcessIdentifier: 42,
+                expectedProcessIdentifier: 42
+            ) == "system"
+        )
+        #expect(
+            DictationDestination.selectFocusedElement(
+                applicationScoped: nil as String?,
+                systemWide: "other-app",
+                systemWideProcessIdentifier: 99,
+                expectedProcessIdentifier: 42
+            ) == nil
+        )
+    }
+
+    @Test("destination capture retries a transient AX editability miss")
+    @MainActor
+    func destinationCaptureRetriesTransientMiss() async throws {
+        var captureAttempts = 0
+        var waitCount = 0
+
+        let destination = try #require(
+            await DictationDestination.captureFrontmostWithRetry(
+                candidateProvider: {
+                    captureAttempts += 1
+                    return candidate(
+                        bundleIdentifier: "com.openai.codex",
+                        focusedElementIsEditable: captureAttempts > 1,
+                        allowsFocusTokenFallback: false
+                    )
+                },
+                shouldRetry: { true },
+                waitForRetry: {
+                    waitCount += 1
+                    return true
+                }
+            )
+        )
+
+        #expect(captureAttempts == 2)
+        #expect(waitCount == 1)
+        #expect(destination.bundleIdentifier == "com.openai.codex")
+        #expect(destination.insertionTier == .exactEditableElement)
+    }
+
+    @Test("destination retry never continues after the captured app changes")
+    @MainActor
+    func destinationCaptureStopsWhenAppChanges() async {
+        var captureAttempts = 0
+        var waitWasAttempted = false
+
+        let destination = await DictationDestination.captureFrontmostWithRetry(
+            candidateProvider: {
+                captureAttempts += 1
+                return nil
+            },
+            shouldRetry: { false },
+            waitForRetry: {
+                waitWasAttempted = true
+                return true
+            }
+        )
+
+        #expect(destination == nil)
+        #expect(captureAttempts == 1)
+        #expect(!waitWasAttempted)
     }
 
     @Test("secure roles and protected content are detected conservatively")
@@ -446,10 +566,12 @@ struct OutputSafetyRegressionTests {
     private func candidate(
         bundleIdentifier: String = "com.example.Editor",
         focusTokenAvailable: Bool = true,
+        focusedWindowTokenAvailable: Bool = false,
         focusedElementIsEditable: Bool,
         focusedElementIsSecure: Bool = false,
         focusedElementIsTerminal: Bool = false,
         allowsFocusTokenFallback: Bool = false,
+        allowsFocusedWindowFallback: Bool = false,
         validateForInsertion: @escaping @MainActor (Bool) async -> Bool = { _ in true },
         remainsValidForInsertion: @escaping @MainActor () -> Bool = { true }
     ) -> DictationDestination.CaptureCandidate {
@@ -460,10 +582,12 @@ struct OutputSafetyRegressionTests {
             role: "AXTextArea",
             subrole: nil,
             focusTokenAvailable: focusTokenAvailable,
+            focusedWindowTokenAvailable: focusedWindowTokenAvailable,
             focusedElementIsEditable: focusedElementIsEditable,
             focusedElementIsSecure: focusedElementIsSecure,
             focusedElementIsTerminal: focusedElementIsTerminal,
             allowsFocusTokenFallback: allowsFocusTokenFallback,
+            allowsFocusedWindowFallback: allowsFocusedWindowFallback,
             validateForInsertion: validateForInsertion,
             remainsValidForInsertion: remainsValidForInsertion
         )

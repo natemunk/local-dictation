@@ -23,6 +23,13 @@ struct DictationSession {
     var validationFailureKind: String?
     var refinementError: String?
     var stoppedAt: Date?
+    var metricTiming = DictationMetricTiming()
+    var metricDictationMode: HistoryDictationMode?
+    var metricSpeechEngine: String?
+    var metricSpeechModel: String?
+    var metricCleanupBackend: String?
+    var recognizedCommandCount: Int?
+    var metricEventRevision: Int64 = 0
     var pastedRaw = false
     var cleanupMode: CleanupMode = .clean
     var deliveryCommitted = false

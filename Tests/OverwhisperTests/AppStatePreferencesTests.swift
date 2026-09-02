@@ -16,6 +16,8 @@ struct AppStatePreferencesTests {
         first.selectedInputDeviceUID = "test-microphone"
         first.asrSelection = .whisperLargeV3Turbo
         first.privateClipboardMode = true
+        first.analyticsEnabled = false
+        first.destinationAnalyticsEnabled = false
         first.experimentalModelCleanupEnabled = true
 
         let restored = AppState(preferences: defaults)
@@ -23,6 +25,8 @@ struct AppStatePreferencesTests {
         #expect(restored.selectedInputDeviceUID == "test-microphone")
         #expect(restored.asrSelection == .whisperLargeV3Turbo)
         #expect(restored.privateClipboardMode)
+        #expect(!restored.analyticsEnabled)
+        #expect(!restored.destinationAnalyticsEnabled)
         #expect(restored.experimentalModelCleanupEnabled)
     }
 
@@ -39,6 +43,8 @@ struct AppStatePreferencesTests {
         let state = AppState(preferences: defaults)
         #expect(state.overlayPosition == .bottomCenter)
         #expect(state.asrSelection == .parakeetV2)
+        #expect(state.analyticsEnabled)
+        #expect(state.destinationAnalyticsEnabled)
         #expect(!state.experimentalModelCleanupEnabled)
     }
 

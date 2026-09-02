@@ -123,6 +123,22 @@ final class AppState: ObservableObject {
             )
         }
     }
+    @Published var analyticsEnabled: Bool {
+        didSet {
+            preferences.set(
+                analyticsEnabled,
+                forKey: LocalDictationPreferenceKey.analyticsEnabled
+            )
+        }
+    }
+    @Published var destinationAnalyticsEnabled: Bool {
+        didSet {
+            preferences.set(
+                destinationAnalyticsEnabled,
+                forKey: LocalDictationPreferenceKey.destinationAnalyticsEnabled
+            )
+        }
+    }
     @Published var experimentalModelCleanupEnabled: Bool {
         didSet {
             preferences.set(
@@ -175,12 +191,24 @@ final class AppState: ObservableObject {
         privateClipboardMode = preferences.bool(
             forKey: LocalDictationPreferenceKey.privateClipboardMode
         )
+        analyticsEnabled = Self.defaultOnPreference(
+            LocalDictationPreferenceKey.analyticsEnabled,
+            in: preferences
+        )
+        destinationAnalyticsEnabled = Self.defaultOnPreference(
+            LocalDictationPreferenceKey.destinationAnalyticsEnabled,
+            in: preferences
+        )
         experimentalModelCleanupEnabled = preferences.bool(
             forKey: LocalDictationPreferenceKey.experimentalModelCleanupEnabled
         )
         refinerAPIKey = KeychainStore.loadMigratingLegacyServices(
             account: LocalDictationKeychainAccount.openAICompatibleRefiner
         ) ?? ""
+    }
+
+    private static func defaultOnPreference(_ key: String, in preferences: UserDefaults) -> Bool {
+        preferences.object(forKey: key) == nil || preferences.bool(forKey: key)
     }
 
     private static func migratedASRSelection(from preferences: UserDefaults) -> ASRSelection {
@@ -271,6 +299,8 @@ enum LocalDictationPreferenceKey {
     static let whisperModel = "LocalDictation.whisperModel.v1"
     static let retainDebugAudio = "LocalDictation.retainDebugAudio.v1"
     static let privateClipboardMode = "LocalDictation.privateClipboardMode.v1"
+    static let analyticsEnabled = "LocalDictation.analyticsEnabled.v1"
+    static let destinationAnalyticsEnabled = "LocalDictation.destinationAnalyticsEnabled.v1"
     static let experimentalModelCleanupEnabled = "LocalDictation.experimentalModelCleanupEnabled.v1"
 }
 

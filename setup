@@ -173,6 +173,27 @@ restore_dependency_patch() {
   fi
 }
 
+stop_running_local_dictation() {
+  if ! /usr/bin/pgrep -x LocalDictation >/dev/null 2>&1; then
+    return 0
+  fi
+
+  print "Stopping the running Local Dictation instance…"
+  /usr/bin/pkill -TERM -x LocalDictation >/dev/null 2>&1 || true
+
+  local attempt
+  for attempt in {1..40}; do
+    if ! /usr/bin/pgrep -x LocalDictation >/dev/null 2>&1; then
+      return 0
+    fi
+    /bin/sleep 0.1
+  done
+
+  print -u2 "The running Local Dictation instance did not stop cleanly."
+  print -u2 "Quit it manually, then rerun ./setup. The installed app was not replaced."
+  return 1
+}
+
 # A killed prior setup must not leave the generated checkout dirty before
 # SwiftPM resolves the exact pinned dependency again.
 restore_dependency_patch
@@ -305,6 +326,10 @@ installed_verification_arguments=("$INSTALL_STAGING" --expected-requirement "$EX
 
 BACKUP_APP=""
 if [[ -e "$INSTALLED_APP" ]]; then
+  # Never move a bundle while macOS is still executing its binary. Otherwise
+  # `open` can reactivate that stale process from the backup location and make
+  # a successful rebuild appear not to have taken effect.
+  stop_running_local_dictation
   BACKUP_DIRECTORY="$HOME/Library/Application Support/Local Dictation/Installed App Backups"
   mkdir -p "$BACKUP_DIRECTORY"
   BACKUP_APP="$BACKUP_DIRECTORY/Local Dictation previous $(date +%Y%m%d-%H%M%S).app"
@@ -335,6 +360,19 @@ if (( SIGNING_WAS_STABLE )) && [[ "$STABLE_INSTALL_COMPLETED" != "true" ]]; then
   print "Subsequent builds signed by this identity should retain those permissions."
 fi
 if (( LAUNCH_APP )); then
-  open "$INSTALLED_APP"
+  /usr/bin/open -n "$INSTALLED_APP"
+  launched=false
+  for attempt in {1..20}; do
+    if /usr/bin/pgrep -x LocalDictation >/dev/null 2>&1; then
+      launched=true
+      break
+    fi
+    /bin/sleep 0.1
+  done
+  if [[ "$launched" != "true" ]]; then
+    print -u2 "Local Dictation was installed but did not launch."
+    print -u2 "Open it manually from: $INSTALLED_APP"
+    exit 1
+  fi
   print "Local Dictation launched. Complete the three documented permission prompts, then press Hyper+D."
 fi

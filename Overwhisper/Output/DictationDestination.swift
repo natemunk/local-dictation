@@ -3,6 +3,7 @@ import AppKit
 enum DestinationInsertionTier: String, Equatable, Sendable {
     case exactEditableElement
     case allowlistedFocusToken
+    case allowlistedFocusedWindow
 }
 
 @MainActor
@@ -14,10 +15,12 @@ final class DictationDestination {
         let role: String?
         let subrole: String?
         let focusTokenAvailable: Bool
+        let focusedWindowTokenAvailable: Bool
         let focusedElementIsEditable: Bool
         let focusedElementIsSecure: Bool
         let focusedElementIsTerminal: Bool
         let allowsFocusTokenFallback: Bool
+        let allowsFocusedWindowFallback: Bool
         let validateForInsertion: @MainActor (_ reactivateIfNeeded: Bool) async -> Bool
         let remainsValidForInsertion: @MainActor () -> Bool
 
@@ -28,10 +31,12 @@ final class DictationDestination {
             role: String?,
             subrole: String?,
             focusTokenAvailable: Bool,
+            focusedWindowTokenAvailable: Bool = false,
             focusedElementIsEditable: Bool,
             focusedElementIsSecure: Bool = false,
             focusedElementIsTerminal: Bool = false,
             allowsFocusTokenFallback: Bool = false,
+            allowsFocusedWindowFallback: Bool = false,
             validateForInsertion: @escaping @MainActor (_ reactivateIfNeeded: Bool) async -> Bool,
             remainsValidForInsertion: @escaping @MainActor () -> Bool
         ) {
@@ -41,16 +46,20 @@ final class DictationDestination {
             self.role = role
             self.subrole = subrole
             self.focusTokenAvailable = focusTokenAvailable
+            self.focusedWindowTokenAvailable = focusedWindowTokenAvailable
             self.focusedElementIsEditable = focusedElementIsEditable
             self.focusedElementIsSecure = focusedElementIsSecure
             self.focusedElementIsTerminal = focusedElementIsTerminal
             self.allowsFocusTokenFallback = allowsFocusTokenFallback
+            self.allowsFocusedWindowFallback = allowsFocusedWindowFallback
             self.validateForInsertion = validateForInsertion
             self.remainsValidForInsertion = remainsValidForInsertion
         }
     }
 
     private static let axMessagingTimeout: Float = 0.20
+    private static let captureObservationDeadline = Duration.milliseconds(250)
+    private static let captureObservationInterval = Duration.milliseconds(10)
     private static let focusObservationDeadline = Duration.milliseconds(250)
     private static let focusObservationInterval = Duration.milliseconds(10)
 
@@ -65,6 +74,12 @@ final class DictationDestination {
         "org.chromium.chromium",
         "notion.id",
         "com.notion.id",
+        "com.anthropic.claudefordesktop",
+        "com.mitchellh.ghostty",
+        "com.openai.codex",
+        "com.openai.chat",
+        "com.openai.atlas",
+        "com.todoist.mac.todoist",
     ]
 
     private static let terminalBundleIdentifiers: Set<String> = [
@@ -110,6 +125,51 @@ final class DictationDestination {
         captureFrontmost(candidateProvider: liveCaptureCandidate)
     }
 
+    /// Accessibility-backed editors can briefly report no focused element, or
+    /// an element whose editability metadata has not settled, immediately after
+    /// a global finishing shortcut. Keep the application captured at finish
+    /// fixed while observing its AX focus for a short bounded interval. Never
+    /// follow focus into a different application.
+    static func captureFrontmostWithRetry() async -> DictationDestination? {
+        guard let application = NSWorkspace.shared.frontmostApplication else { return nil }
+
+        let processIdentifier = application.processIdentifier
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: captureObservationDeadline)
+        return await captureFrontmostWithRetry(
+            candidateProvider: { liveCaptureCandidate(for: application) },
+            shouldRetry: {
+                !application.isTerminated
+                    && application.isActive
+                    && NSWorkspace.shared.frontmostApplication?.processIdentifier
+                        == processIdentifier
+                    && clock.now < deadline
+            },
+            waitForRetry: {
+                do {
+                    try await Task.sleep(for: captureObservationInterval)
+                    return true
+                } catch {
+                    return false
+                }
+            }
+        )
+    }
+
+    static func captureFrontmostWithRetry(
+        candidateProvider: @MainActor () -> CaptureCandidate?,
+        shouldRetry: @MainActor () -> Bool,
+        waitForRetry: @MainActor () async -> Bool
+    ) async -> DictationDestination? {
+        while !Task.isCancelled {
+            if let destination = captureFrontmost(candidateProvider: candidateProvider) {
+                return destination
+            }
+            guard shouldRetry(), await waitForRetry() else { return nil }
+        }
+        return nil
+    }
+
     static func captureFrontmost(
         candidateProvider: () -> CaptureCandidate?
     ) -> DictationDestination? {
@@ -120,13 +180,16 @@ final class DictationDestination {
             insertionTier = .exactEditableElement
         } else if candidate.focusTokenAvailable && candidate.allowsFocusTokenFallback {
             insertionTier = .allowlistedFocusToken
+        } else if candidate.focusedWindowTokenAvailable
+                    && candidate.allowsFocusedWindowFallback {
+            insertionTier = .allowlistedFocusedWindow
         } else {
             insertionTier = nil
         }
 
         // Secure fields must remain representable so finalization can discard
         // audio before batch ASR. Every nonsecure destination needs a concrete
-        // AX focus token and one of the two explicit insertion tiers.
+        // AX field/window token and one of the explicit insertion tiers.
         guard candidate.focusedElementIsSecure || insertionTier != nil else {
             return nil
         }
@@ -181,10 +244,17 @@ final class DictationDestination {
 
     private static func liveCaptureCandidate() -> CaptureCandidate? {
         guard let application = NSWorkspace.shared.frontmostApplication else { return nil }
+        return liveCaptureCandidate(for: application)
+    }
 
+    private static func liveCaptureCandidate(
+        for application: NSRunningApplication
+    ) -> CaptureCandidate? {
+        guard !application.isTerminated else { return nil }
         let processIdentifier = application.processIdentifier
         let bundleIdentifier = application.bundleIdentifier ?? "unknown"
         let focusedElement = focusedElement(for: processIdentifier)
+        let focusedWindow = focusedWindow(for: processIdentifier)
         let role = focusedElement.flatMap { attribute(kAXRoleAttribute, from: $0) }
         let subrole = focusedElement.flatMap { attribute(kAXSubroleAttribute, from: $0) }
         let protectedContent = focusedElement.map {
@@ -205,8 +275,13 @@ final class DictationDestination {
             identifier: identifier,
             description: description
         )
-        let allowsFallback = focusedElement != nil
-            && isApprovedFocusTokenFallback(bundleIdentifier: bundleIdentifier)
+        let isApprovedFallback = isApprovedFocusTokenFallback(
+            bundleIdentifier: bundleIdentifier
+        )
+        let allowsFocusFallback = focusedElement != nil && isApprovedFallback
+        let allowsWindowFallback = focusedElement == nil
+            && focusedWindow != nil
+            && isApprovedFallback
 
         return CaptureCandidate(
             processIdentifier: processIdentifier,
@@ -215,25 +290,40 @@ final class DictationDestination {
             role: role,
             subrole: subrole,
             focusTokenAvailable: focusedElement != nil,
+            focusedWindowTokenAvailable: focusedWindow != nil,
             focusedElementIsEditable: isEditable,
             focusedElementIsSecure: isSecure,
             focusedElementIsTerminal: isTerminal,
-            allowsFocusTokenFallback: allowsFallback,
+            allowsFocusTokenFallback: allowsFocusFallback,
+            allowsFocusedWindowFallback: allowsWindowFallback,
             validateForInsertion: { reactivateIfNeeded in
-                guard let focusedElement else { return false }
-                return await reactivateAndValidate(
+                if let focusedElement {
+                    return await reactivateAndValidate(
+                        processIdentifier: processIdentifier,
+                        focusedElement: focusedElement,
+                        requiresEditableElement: isEditable,
+                        reactivateIfNeeded: reactivateIfNeeded
+                    )
+                }
+                guard let focusedWindow else { return false }
+                return await reactivateAndValidateFocusedWindow(
                     processIdentifier: processIdentifier,
-                    focusedElement: focusedElement,
-                    requiresEditableElement: isEditable,
+                    focusedWindow: focusedWindow,
                     reactivateIfNeeded: reactivateIfNeeded
                 )
             },
             remainsValidForInsertion: {
-                guard let focusedElement else { return false }
-                return capturedElementRemainsValid(
+                if let focusedElement {
+                    return capturedElementRemainsValid(
+                        processIdentifier: processIdentifier,
+                        focusedElement: focusedElement,
+                        requiresEditableElement: isEditable
+                    )
+                }
+                guard let focusedWindow else { return false }
+                return capturedWindowRemainsValid(
                     processIdentifier: processIdentifier,
-                    focusedElement: focusedElement,
-                    requiresEditableElement: isEditable
+                    focusedWindow: focusedWindow
                 )
             }
         )
@@ -291,13 +381,122 @@ final class DictationDestination {
         return !requiresEditableElement || isEditable(currentElement)
     }
 
+    private static func reactivateAndValidateFocusedWindow(
+        processIdentifier: pid_t,
+        focusedWindow: AXUIElement,
+        reactivateIfNeeded: Bool
+    ) async -> Bool {
+        guard !Task.isCancelled,
+              let application = NSRunningApplication(processIdentifier: processIdentifier),
+              !application.isTerminated
+        else { return false }
+
+        if !application.isActive {
+            guard reactivateIfNeeded else { return false }
+            _ = application.activate()
+        }
+
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: focusObservationDeadline)
+        repeat {
+            if capturedWindowRemainsValid(
+                processIdentifier: processIdentifier,
+                focusedWindow: focusedWindow
+            ) {
+                return true
+            }
+            guard reactivateIfNeeded, clock.now < deadline else { return false }
+            do {
+                try await Task.sleep(for: focusObservationInterval)
+            } catch {
+                return false
+            }
+        } while !Task.isCancelled
+
+        return false
+    }
+
+    private static func capturedWindowRemainsValid(
+        processIdentifier: pid_t,
+        focusedWindow: AXUIElement
+    ) -> Bool {
+        guard let application = NSRunningApplication(processIdentifier: processIdentifier),
+              !application.isTerminated,
+              application.isActive,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == processIdentifier,
+              let currentWindow = Self.focusedWindow(for: processIdentifier)
+        else { return false }
+
+        return CFEqual(currentWindow, focusedWindow)
+    }
+
     private static func focusedElement(for processIdentifier: pid_t) -> AXUIElement? {
         let appElement = AXUIElementCreateApplication(processIdentifier)
         AXUIElementSetMessagingTimeout(appElement, axMessagingTimeout)
+        let applicationScoped = accessibilityElement(
+            kAXFocusedUIElementAttribute,
+            from: appElement
+        )
+
+        // Chromium/Electron applications can return no AXFocusedUIElement from
+        // their application root even though the system-wide Accessibility
+        // object has the correct focused field. Accept that fallback only when
+        // AX confirms that the element belongs to the frontmost process we
+        // captured; never follow global focus into another application.
+        let systemWideElement = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(systemWideElement, axMessagingTimeout)
+        let systemWide = accessibilityElement(
+            kAXFocusedUIElementAttribute,
+            from: systemWideElement
+        )
+        var systemWideProcessIdentifier: pid_t = 0
+        let systemWidePID = systemWide.flatMap { element -> pid_t? in
+            guard AXUIElementGetPid(element, &systemWideProcessIdentifier) == .success else {
+                return nil
+            }
+            return systemWideProcessIdentifier
+        }
+
+        guard let selected = selectFocusedElement(
+            applicationScoped: applicationScoped,
+            systemWide: systemWide,
+            systemWideProcessIdentifier: systemWidePID,
+            expectedProcessIdentifier: processIdentifier
+        ) else { return nil }
+        AXUIElementSetMessagingTimeout(selected, axMessagingTimeout)
+        return selected
+    }
+
+    private static func focusedWindow(for processIdentifier: pid_t) -> AXUIElement? {
+        let appElement = AXUIElementCreateApplication(processIdentifier)
+        AXUIElementSetMessagingTimeout(appElement, axMessagingTimeout)
+        guard let window = accessibilityElement(
+            kAXFocusedWindowAttribute,
+            from: appElement
+        ) else { return nil }
+        AXUIElementSetMessagingTimeout(window, axMessagingTimeout)
+        return window
+    }
+
+    static func selectFocusedElement<Element>(
+        applicationScoped: Element?,
+        systemWide: Element?,
+        systemWideProcessIdentifier: pid_t?,
+        expectedProcessIdentifier: pid_t
+    ) -> Element? {
+        if let applicationScoped { return applicationScoped }
+        guard systemWideProcessIdentifier == expectedProcessIdentifier else { return nil }
+        return systemWide
+    }
+
+    private static func accessibilityElement(
+        _ attribute: String,
+        from root: AXUIElement
+    ) -> AXUIElement? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(
-            appElement,
-            kAXFocusedUIElementAttribute as CFString,
+            root,
+            attribute as CFString,
             &value
         ) == .success,
               let value,
@@ -305,7 +504,6 @@ final class DictationDestination {
         else { return nil }
 
         let element = value as! AXUIElement
-        AXUIElementSetMessagingTimeout(element, axMessagingTimeout)
         return element
     }
 

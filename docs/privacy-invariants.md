@@ -9,7 +9,7 @@ Local Dictation may handle microphone audio, transcript text, focused-applicatio
 | ID | Invariant | Required failure behavior | Current evidence |
 |---|---|---|---|
 | PRV-001 | Speech audio never leaves the Mac. Cloud speech-to-text is absent, not merely disabled. | Refuse any ASR path that requires upload. | Cloud ASR source and dependency removal passes the static privacy audit; live network capture is pending. |
-| PRV-002 | Telemetry, Overseed service calls, and automatic update checks are absent. | Build/release fails if a prohibited dependency or endpoint returns. | `Package.swift` and the source tree pass the prohibited-integration audit; runtime network behavior is still unverified. |
+| PRV-002 | Outbound telemetry SDKs/services, Overseed service calls, and automatic update checks are absent. Local transcript-free SQLite metrics are not transmitted. | Build/release fails if a prohibited dependency or endpoint returns. | `Package.swift` and the source tree pass the prohibited-integration audit; runtime network behavior is still unverified. |
 | PRV-003 | One temporary session WAV may exist only for active local ASR. | Delete after ASR or cancellation; delete crash orphans on next launch. | Lifecycle and orphan cleanup are source-observed; cancellation/crash file-system exercise is pending. |
 | PRV-004 | Audio retention defaults off. Debug retention requires an explicit toggle and keeps at most the latest 10 recordings. | Refuse silent retention and provide a dedicated delete-retained-audio action. | Configuration default, explicit UI, cap, and delete action are source-observed; real file-system exercise is pending. |
 | PRV-005 | Existing Raycast recordings are never imported or inspected without recording-specific opt-in. | Exclude them from corpus and app workflows. | Repository benchmark fixtures are synthetic and contain no audio files. |
@@ -29,6 +29,7 @@ Local Dictation may handle microphone audio, transcript text, focused-applicatio
 | PRV-019 | ASR and optional EOU-preview models are downloaded only after an explicit user action from their documented model host into versioned Local Dictation-owned directories. Validation, quarantine, and repair never scan, mutate, or delete another application's model cache. | Keep an invalid owned installation quarantined, retry one clean owned download, and surface a durable error if repair fails. | Owned-manifest, path-containment, replacement, quarantine, repair, and stale-generation tests pass; live host/file-system observation remains pending. |
 | PRV-020 | A finish-time secure AX destination causes the temporary recording to be discarded before batch ASR, history, clipboard, or synthetic paste. History Paste Again also refuses secure destinations without changing the clipboard. | Delete the WAV, clear live preview state, create no history row, and show `Secure field · recording discarded`. | Secure-role classification and no-clipboard repaste contracts pass; real secure-field and streaming-memory observation remain pending. |
 | PRV-021 | Diagnostics and performance signposts contain operational state only: no transcript/clipboard text, audio, browser data, API key, destination/focused-field identity, raw path, or dynamic error body. | Keep diagnostics to a closed allowlist and signposts to fixed names with opaque correlation. | Sentinel non-leak, read-only history-health, fixed-catalog, and unrelated-copy tests pass; runtime Instruments/unified-log inspection remains pending. |
+| PRV-022 | Local analytics store only integer counts, monotonic durations, wall-clock completion, bounded mode/engine/backend/outcome labels, and optional destination app identity. They contain no transcript, audio, URL, window/title/content, focused-field data, clipboard data, or dynamic error text. Secure-field sessions produce no metric. | Skip the event without affecting dictation if the schema/write fails; disabling analytics stops future events, and disabling destination analytics writes both destination fields as `NULL`. | Fresh/existing migration, forbidden-column, opt-out/redaction, revision-upsert, independent deletion/retention, and concurrent read-only access tests pass. The installed schema, legacy backfill, real measured rows, and Home Base's read-only no-content selection were verified; real secure-field and outbound-network observation remain pending. |
 
 ## Permitted local data flow
 
@@ -42,7 +43,10 @@ microphone
   → optional text-only refiner
   → validated local text
   → clipboard/paste or preview
+  → in-process word counting and transcript-free local metrics
 ```
+
+Only integer counts—not transcript text—cross from the transcript-bearing pipeline into local analytics. Analytics and transcript history have independent deletion/retention controls and no foreign-key cascade. Home Base may open the database read-only but is not a runtime dependency.
 
 The optional refiner is the only approved transcript-bearing network-capable runtime stage. It receives no ambient app context. On a fresh install the app does not initialize or download a speech model until the user chooses **Finish Setup & Download Local Model**; later model changes, verification, and repair are also explicit settings actions. First-time ASR and optional EOU-preview downloads contact the documented model host without sending user content. Model downloads must not be confused with transcription or cleanup traffic.
 

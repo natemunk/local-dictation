@@ -91,6 +91,7 @@ Normal updates must not require another permission reset. Only an intentional si
 - Speech recognition uses local FluidAudio or WhisperKit models only.
 - First-time ASR and optional EOU-preview model downloads contact the documented model host, then models run from versioned Local Dictation-owned storage. Download requests contain no audio or transcript data.
 - The app contains no telemetry SDK, cloud speech engine, Overseed service, or automatic updater.
+- Optional local analytics are transcript-free SQLite aggregates for the Home Base dashboard. They contain counts, timings, modes, engine/cleanup labels, delivery outcomes, and—unless separately disabled—the destination app name and bundle ID. They never contain transcript text, audio, URLs, window titles, field contents, or error messages, and nothing is sent to Home Base or any network service.
 - Deterministic cleanup is the default. An Advanced, off-by-default experiment may use Apple Foundation Models or an explicitly configured OpenAI-compatible `/v1/chat/completions` endpoint. A refiner receives transcript text, static rules, and transcript-derived allowed-deletion ranges only—never audio, destination app, browser data, field contents, or surrounding text.
 - Non-loopback refinement endpoints require explicit `allow_remote = true` and show a persistent **Remote** badge.
 - Temporary WAV files are deleted after ASR or cancellation. Debug audio retention is off by default.
@@ -111,7 +112,7 @@ The global shortcut is Hyper+D (`Command+Control+Option+Shift+D`):
 
 If you type any other key while recording, Enter immediately and permanently returns to the foreground app for that session. The overlay says `Typing detected · Hyper+D to finish`; Hyper+D remains the finisher. Local Dictation never synthesizes Return and cannot auto-submit a form or terminal command.
 
-Insertion is deliberately conservative. Local Dictation posts Command+V only to the exact captured editable AX element or a reviewed same-focus-token app; otherwise it leaves verified text on the clipboard. It never uses a PID-only fallback or claims that posting a paste event proves an editor accepted it. Normal attempts leave ordinary text on the clipboard for clipboard-manager recovery. Optional **Private Clipboard Mode** adds best-effort concealed/transient markers. Secure fields discard the recording before batch transcription, history, or clipboard use. Terminal destinations are forced to Literal mode and automatic insertion removes every line break.
+Insertion is deliberately conservative. At finish, Local Dictation briefly retries transient Accessibility focus misses while keeping the captured frontmost app fixed. It posts Command+V to the exact captured editable AX element, a reviewed same-focus-token app, or—when an app exposes no focused field—a reviewed destination whose app PID and focused AX window both remain unchanged. Otherwise it leaves verified text on the clipboard. It never follows focus into another app/window or claims that posting a paste event proves an editor accepted it. Normal attempts leave ordinary text on the clipboard for clipboard-manager recovery. Optional **Private Clipboard Mode** adds best-effort concealed/transient markers. Secure fields discard the recording before batch transcription, history, or clipboard use. Terminal destinations are forced to Literal mode and automatic insertion removes every line break.
 
 The overlay warns at 10 minutes. Recording stops at the hard 15-minute cap and opens preview instead of inserting automatically; configuration may shorten this cap but cannot extend it.
 
@@ -196,6 +197,8 @@ Runtime behavior is intentionally small: terminals use Literal mode, ordinary ap
 
 History is actor-isolated GRDB/SQLite with WAL and FTS5. Raw text is saved before cleanup/delivery for every nonsecure session; successful, failed, pending, and cancelled rows share the configurable 90-day default retention. Search falls back to escaped literal matching when an FTS query cannot represent punctuation.
 
+The same local database also has a separate `dictation_metrics` table for transcript-free analytics. Analytics are enabled by default and can be disabled under Settings → Privacy without affecting dictation. Destination-app analytics have their own switch. **Delete Transcript History**, **Reset Analytics**, and **Delete Everything** have intentionally separate scopes; transcript retention never cascades into metrics. Home Base is only an optional read-only viewer and Local Dictation does not require it to be installed or running. Local Dictation preserves honest outcomes such as `paste_event_sent`, `pasted_raw`, and `previewed`; Home Base must recognize those values before treating them as successful deliveries for time-saved calculations.
+
 ## Troubleshooting
 
 | Symptom | What to check |
@@ -208,7 +211,7 @@ History is actor-isolated GRDB/SQLite with WAL and FTS5. Raw text is saved befor
 | A rebuild asks for permissions again | Use plain `./setup`; do not recreate or rotate the signing identity. Settings → General shows the current permission state. Rotation is intentionally the only workflow that requires another one-time reset. |
 | You need support evidence | Use Settings → Diagnostics → **Copy Diagnostics**. The report contains only allowlisted states and counts—never transcript text, clipboard contents, audio, API keys, browser data, or focused-field content. |
 
-User-editable configuration lives at `~/.config/local-dictation/`. Local model data lives at `~/Library/Application Support/LocalDictation/Models/v1/`. History and temporary-audio lifecycle are managed by the app; normal audio is deleted after transcription or cancellation.
+User-editable configuration lives at `~/.config/local-dictation/`. Local model data lives at `~/Library/Application Support/LocalDictation/Models/v1/`. Transcript history and transcript-free analytics live in `~/Library/Application Support/com.natemunk.LocalDictation/history.sqlite`; their deletion controls are under Settings → Privacy. History and temporary-audio lifecycle are managed by the app; normal audio is deleted after transcription or cancellation.
 
 ## Diagnostics
 
@@ -265,7 +268,7 @@ Core dependencies are pinned in `Package.resolved`: FluidAudio, WhisperKit, GRDB
 
 ## Status and acceptance
 
-The current automated snapshot is 169 tests across 27 suites. On the current development Mac, two consecutive same-identity source installs retained Microphone, Input Monitoring, Accessibility, and Hyper+D readiness, and the menu-bar agent remained alive after Settings closed. The full product requirements, corpus contracts, and acceptance matrix are checked in under [docs](docs). Source compilation and contract tests are not evidence that latency, accuracy, sleep/wake recovery, the full cross-app insertion matrix, or the one-week Raycast cutover gates have passed.
+The current automated snapshot is 182 tests across 28 suites. On the current development Mac, two consecutive same-identity source installs retained Microphone, Input Monitoring, Accessibility, and Hyper+D readiness, and the menu-bar agent remained alive after Settings closed. The additive metrics migration, honest legacy backfill, real measured-event write, and Home Base's read-only schema/event parsing have also been exercised against the installed app; Home Base outcome classification still needs the consumer-side alignment described above. The full product requirements, corpus contracts, and acceptance matrix are checked in under [docs](docs). Source compilation and contract tests are not evidence that latency, accuracy, sleep/wake recovery, the full cross-app insertion matrix, or the one-week Raycast cutover gates have passed.
 
 ## Origin and license
 
