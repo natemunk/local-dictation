@@ -171,7 +171,7 @@ On first launch, macOS asks for:
 - Input Monitoring for Hyper+D and the Enter/Escape safety interlock.
 - Accessibility for clipboard plus synthetic Command+V insertion.
 
-After the first stable-signed install, setup guides one final removal and re-add of the old Microphone, Input Monitoring, and Accessibility rows. Later builds use the exact same certificate-backed designated requirement, and setup aborts if that identity drifts. Intentional replacement requires `./setup --rotate-signing-identity` and another one-time permission reset. Settings → General refreshes permission and Hyper+D listener health while it is visible.
+After the first stable-signed install, setup guides one final removal and re-add of the old Microphone, Input Monitoring, and Accessibility rows. Later builds use the exact same certificate-backed designated requirement, and setup aborts if that identity drifts. Intentional replacement requires `./setup --rotate-signing-identity` and another one-time permission reset. Settings → General refreshes permission and Hyper+D listener health when it opens, whenever Local Dictation becomes active again, and when you choose **Refresh**. Closing Settings releases its view hierarchy so it cannot consume CPU in the background.
 
 No speech model is downloaded before you choose **Prepare & Finish Setup** in onboarding. Onboarding completes only after Microphone, Input Monitoring, Accessibility, the Hyper+D event tap, and the selected local model are all ready. That explicit action downloads the selected model from `huggingface.co` into `~/Library/Application Support/LocalDictation/Models/v1/`; the default model is roughly 600 MB, and later transcription remains local. Verify and Repair operate only on that owned model tree.
 

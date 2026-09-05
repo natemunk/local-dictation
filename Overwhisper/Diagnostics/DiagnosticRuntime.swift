@@ -1,5 +1,15 @@
 import Foundation
 
+struct PermissionDiagnosticReading: Equatable, Sendable {
+    let microphoneGranted: Bool
+    let inputMonitoringGranted: Bool
+    let accessibilityGranted: Bool
+    let hotkeyMonitoringActive: Bool
+    let tapDisableCount: Int
+    let tapRebuildCount: Int
+    let tapLastReason: String?
+}
+
 private actor HistoryDiagnosticsReader {
     static let shared = HistoryDiagnosticsReader()
 
@@ -11,6 +21,40 @@ private actor HistoryDiagnosticsReader {
 
 @MainActor
 extension AppState {
+    /// Applies one permission/tap sample without publishing values that have
+    /// not changed. This keeps activation and Settings refreshes effectively
+    /// free when the system state is stable.
+    @discardableResult
+    func applyPermissionDiagnostics(_ reading: PermissionDiagnosticReading) -> Bool {
+        var changed = false
+
+        if microphonePermissionGranted != reading.microphoneGranted {
+            microphonePermissionGranted = reading.microphoneGranted
+            changed = true
+        }
+        if inputMonitoringGranted != reading.inputMonitoringGranted {
+            inputMonitoringGranted = reading.inputMonitoringGranted
+            changed = true
+        }
+        if accessibilityGranted != reading.accessibilityGranted {
+            accessibilityGranted = reading.accessibilityGranted
+            changed = true
+        }
+        if hotkeyMonitoringActive != reading.hotkeyMonitoringActive {
+            hotkeyMonitoringActive = reading.hotkeyMonitoringActive
+            changed = true
+        }
+        if recordTapDiagnostic(
+            disableCount: reading.tapDisableCount,
+            rebuildCount: reading.tapRebuildCount,
+            lastReason: reading.tapLastReason
+        ) {
+            changed = true
+        }
+
+        return changed
+    }
+
     /// Refreshes only schema/runtime metadata from history. The read-only path
     /// never fetches transcript, destination, error, or search-index content.
     func refreshPrivacySafeDiagnostics() async {
@@ -41,16 +85,26 @@ extension AppState {
         }
     }
 
+    @discardableResult
     func recordTapDiagnostic(
         disableCount: Int,
         rebuildCount: Int,
         lastReason: String?
-    ) {
+    ) -> Bool {
+        let disableCount = max(0, disableCount)
+        let rebuildCount = max(0, rebuildCount)
+        let reason = TapDiagnosticReason(lastReason)
+        guard diagnosticRuntimeState.tapDisableCount != disableCount
+                || diagnosticRuntimeState.tapRebuildCount != rebuildCount
+                || diagnosticRuntimeState.tapLastReason != reason
+        else { return false }
+
         mutateDiagnosticRuntime {
-            $0.tapDisableCount = max(0, disableCount)
-            $0.tapRebuildCount = max(0, rebuildCount)
-            $0.tapLastReason = TapDiagnosticReason(lastReason)
+            $0.tapDisableCount = disableCount
+            $0.tapRebuildCount = rebuildCount
+            $0.tapLastReason = reason
         }
+        return true
     }
 
     func recordModelDiagnostic(_ status: EngineStatus) {

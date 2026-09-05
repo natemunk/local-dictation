@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import Testing
 @testable import LocalDictation
@@ -146,5 +147,46 @@ struct AppStatePreferencesTests {
 
         state.hotkeyMonitoringActive = false
         #expect(!state.onboardingReady)
+    }
+
+    @Test("unchanged permission diagnostics do not republish AppState")
+    @MainActor
+    func unchangedPermissionDiagnosticsAreSilent() throws {
+        let suiteName = "AppStatePreferencesTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let state = AppState(preferences: defaults)
+        let reading = PermissionDiagnosticReading(
+            microphoneGranted: true,
+            inputMonitoringGranted: true,
+            accessibilityGranted: true,
+            hotkeyMonitoringActive: true,
+            tapDisableCount: 0,
+            tapRebuildCount: 0,
+            tapLastReason: nil
+        )
+        #expect(state.applyPermissionDiagnostics(reading))
+
+        var publicationCount = 0
+        let observation = state.objectWillChange.sink {
+            publicationCount += 1
+        }
+
+        #expect(!state.applyPermissionDiagnostics(reading))
+        #expect(publicationCount == 0)
+
+        let changedReading = PermissionDiagnosticReading(
+            microphoneGranted: true,
+            inputMonitoringGranted: true,
+            accessibilityGranted: true,
+            hotkeyMonitoringActive: true,
+            tapDisableCount: 1,
+            tapRebuildCount: 0,
+            tapLastReason: "system timeout"
+        )
+        #expect(state.applyPermissionDiagnostics(changedReading))
+        #expect(publicationCount == 1)
+        withExtendedLifetime(observation) {}
     }
 }

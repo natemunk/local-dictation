@@ -519,6 +519,28 @@ struct CleanupPipelineTests {
         }
         #expect(failure == .explicitBulletFormattingRemoved)
     }
+
+    @Test("cleanup executor does not block MainActor while deterministic work runs")
+    @MainActor
+    func cleanupExecutorLeavesMainActorResponsive() async throws {
+        let probe = BlockingCleanupProbe()
+        let executor = CleanupExecutor()
+        let pipeline = CleanupPipeline(refiner: BlockingCleanupRefiner(probe: probe))
+
+        let cleanup = Task { @MainActor in
+            try await executor.process(
+                pipeline,
+                transcript: FinalTranscript(text: "we should ship"),
+                mode: .clean
+            )
+        }
+        await Task.yield()
+        probe.release()
+
+        let result = try await cleanup.value
+        #expect(!probe.didTimeOut)
+        #expect(result.text == "we should ship")
+    }
 }
 
 private struct FixedCleanupRefiner: TextRefiner {
@@ -534,6 +556,38 @@ private struct ExplodingCleanupRefiner: TextRefiner {
 
     func refine(_ input: TextRefinementInput) async throws -> String {
         throw UnexpectedCall()
+    }
+}
+
+private final class BlockingCleanupProbe: @unchecked Sendable {
+    private let semaphore = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var timedOut = false
+
+    var didTimeOut: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return timedOut
+    }
+
+    func wait() {
+        guard semaphore.wait(timeout: .now() + 1) == .timedOut else { return }
+        lock.lock()
+        timedOut = true
+        lock.unlock()
+    }
+
+    func release() {
+        semaphore.signal()
+    }
+}
+
+private struct BlockingCleanupRefiner: TextRefiner {
+    let probe: BlockingCleanupProbe
+
+    func refine(_ input: TextRefinementInput) async throws -> String {
+        probe.wait()
+        return input.transcript
     }
 }
 

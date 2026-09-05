@@ -15,6 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let sessionController = DictationSessionController()
     private let configurationStore = ConfigurationStore()
     private let pasteAgainQueue = SerializedPasteAgainQueue()
+    private let cleanupExecutor = CleanupExecutor()
     private let modelStore = OwnedModelStore()
     private var configuration = ConfigurationSnapshot.typedDefaults
     private var profileResolver = ProfileResolver(catalog: .nativeDefaults)
@@ -30,7 +31,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var transcriptionEngine: (any TranscriptionEngine)?
     private var streamingTranscriber: (any StreamingTranscriber)?
 
-    private var settingsWindow: NSWindow?
+    private var settingsWindowController: SettingsWindowController?
     private var onboardingWindow: NSWindow?
     private var historyWindow: HistoryWindowController?
     private var recordingMenuItem: NSMenuItem?
@@ -1023,8 +1024,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     $0.metricTiming.markCleanupStarted(at: cleanupStartedAtUptime)
                 }
             }
-            let result = try await cleanupPipeline.process(
-                raw,
+            let result = try await cleanupExecutor.process(
+                cleanupPipeline,
+                transcript: raw,
                 mode: cleanupMode
             )
             try Task.checkCancellation()
@@ -2300,14 +2302,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refreshPermissionDiagnostics() {
-        appState.microphonePermissionGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
-        appState.inputMonitoringGranted = CGPreflightListenEventAccess()
-        appState.accessibilityGranted = AXIsProcessTrusted()
-        appState.hotkeyMonitoringActive = hotkeyManager?.isMonitoring ?? false
-        appState.recordTapDiagnostic(
-            disableCount: hotkeyManager?.tapDisableCount ?? 0,
-            rebuildCount: hotkeyManager?.tapRebuildCount ?? 0,
-            lastReason: hotkeyManager?.lastTapDisableReason
+        appState.applyPermissionDiagnostics(
+            PermissionDiagnosticReading(
+                microphoneGranted: AVCaptureDevice.authorizationStatus(for: .audio) == .authorized,
+                inputMonitoringGranted: CGPreflightListenEventAccess(),
+                accessibilityGranted: AXIsProcessTrusted(),
+                hotkeyMonitoringActive: hotkeyManager?.isMonitoring ?? false,
+                tapDisableCount: hotkeyManager?.tapDisableCount ?? 0,
+                tapRebuildCount: hotkeyManager?.tapRebuildCount ?? 0,
+                tapLastReason: hotkeyManager?.lastTapDisableReason
+            )
         )
     }
 
@@ -2466,12 +2470,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openSettings() {
-        if let settingsWindow {
-            settingsWindow.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            return
+        if settingsWindowController == nil {
+            settingsWindowController = SettingsWindowController { [weak self] in
+                guard let self else { return NSView() }
+                return NSHostingView(rootView: self.makeSettingsView())
+            }
         }
-        let view = SettingsView(
+        settingsWindowController?.show()
+    }
+
+    private func makeSettingsView() -> SettingsView {
+        SettingsView(
             appState: appState,
             audioDeviceManager: audioDeviceManager,
             configurationDirectory: configurationStore.paths.rootDirectory,
@@ -2491,19 +2500,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onResetAnalytics: { [weak self] in self?.resetAnalytics() },
             onDeleteEverything: { [weak self] in self?.deleteEverything() }
         )
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 646, height: 580),
-            styleMask: [.titled, .closable],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "Local Dictation Settings"
-        window.contentView = NSHostingView(rootView: view)
-        window.center()
-        window.isReleasedWhenClosed = false
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-        settingsWindow = window
     }
 
     private func importRaycastVocabulary(_ input: String) {

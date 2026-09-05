@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 import SwiftUI
 
 struct SettingsView: View {
@@ -22,12 +21,6 @@ struct SettingsView: View {
 
     @State private var pendingDataDeletion: PrivacyDataDeletion?
 
-    private let permissionRefreshTimer = Timer.publish(
-        every: 1,
-        on: .main,
-        in: .common
-    ).autoconnect()
-
     var body: some View {
         TabView {
             general
@@ -42,7 +35,6 @@ struct SettingsView: View {
         .frame(width: 610, height: 540)
         .padding(18)
         .onAppear(perform: onRefreshPermissions)
-        .onReceive(permissionRefreshTimer) { _ in onRefreshPermissions() }
     }
 
     private var general: some View {

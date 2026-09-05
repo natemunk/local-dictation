@@ -1,6 +1,5 @@
 import AVFoundation
 import AppKit
-import Combine
 import SwiftUI
 
 struct OnboardingView: View {
@@ -10,12 +9,6 @@ struct OnboardingView: View {
     let onRequestInputMonitoring: () -> Void
     let onRequestAccessibility: () -> Void
     let onPrepareAndFinish: () -> Void
-
-    private let permissionRefreshTimer = Timer.publish(
-        every: 1,
-        on: .main,
-        in: .common
-    ).autoconnect()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -119,7 +112,6 @@ struct OnboardingView: View {
         .padding(28)
         .frame(width: 620, height: 590)
         .onAppear(perform: onRefreshPermissions)
-        .onReceive(permissionRefreshTimer) { _ in onRefreshPermissions() }
     }
 
     @ViewBuilder
