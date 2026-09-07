@@ -19,7 +19,16 @@ let package = Package(
         .package(url: "https://github.com/argmaxinc/WhisperKit.git", exact: "0.15.0"),
         .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.14.3"),
         .package(url: "https://github.com/groue/GRDB.swift.git", exact: "7.10.0"),
-        .package(url: "https://github.com/LebJe/TOMLKit.git", exact: "0.6.0")
+        .package(url: "https://github.com/LebJe/TOMLKit.git", exact: "0.6.0"),
+        .package(url: "https://github.com/hummingbird-project/hummingbird.git", exact: "2.26.0"),
+        .package(
+            url: "https://github.com/hummingbird-project/hummingbird-websocket.git",
+            exact: "2.7.0"
+        ),
+        .package(
+            url: "https://github.com/swift-server/swift-service-lifecycle.git",
+            exact: "2.12.0"
+        )
     ],
     targets: [
         .target(
@@ -37,7 +46,10 @@ let package = Package(
                 "WhisperKit",
                 .product(name: "FluidAudio", package: "FluidAudio"),
                 .product(name: "GRDB", package: "GRDB.swift"),
-                .product(name: "TOMLKit", package: "TOMLKit")
+                .product(name: "TOMLKit", package: "TOMLKit"),
+                .product(name: "Hummingbird", package: "hummingbird"),
+                .product(name: "HummingbirdWebSocket", package: "hummingbird-websocket"),
+                .product(name: "ServiceLifecycle", package: "swift-service-lifecycle")
             ],
             path: "Overwhisper",
             exclude: [
@@ -61,7 +73,11 @@ let package = Package(
         ),
         .testTarget(
             name: "LocalDictationTests",
-            dependencies: ["LocalDictation"],
+            dependencies: [
+                "LocalDictation",
+                .product(name: "HummingbirdTesting", package: "hummingbird"),
+                .product(name: "HummingbirdWSTesting", package: "hummingbird-websocket")
+            ],
             path: "Tests/OverwhisperTests"
         ),
         .testTarget(

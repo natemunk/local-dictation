@@ -147,6 +147,26 @@ final class AppState: ObservableObject {
             )
         }
     }
+    @Published var iphoneEndpointEnabled: Bool {
+        didSet {
+            preferences.set(
+                iphoneEndpointEnabled,
+                forKey: LocalDictationPreferenceKey.iphoneEndpointEnabled
+            )
+        }
+    }
+    @Published var unifiedHistoryEnabled: Bool {
+        didSet {
+            preferences.set(
+                unifiedHistoryEnabled,
+                forKey: LocalDictationPreferenceKey.unifiedHistoryEnabled
+            )
+        }
+    }
+    @Published var iphoneEndpointRuntime = IPhoneEndpointRuntimeSnapshot()
+    /// Wall-clock of the last unified-history request served to a device.
+    /// Purely informational; it never gates serving.
+    @Published var iphoneHistoryServedAt: Date?
     @Published var refinerAPIKey: String
 
     let debugSessionStore = DebugSessionStore()
@@ -201,6 +221,12 @@ final class AppState: ObservableObject {
         )
         experimentalModelCleanupEnabled = preferences.bool(
             forKey: LocalDictationPreferenceKey.experimentalModelCleanupEnabled
+        )
+        iphoneEndpointEnabled = preferences.bool(
+            forKey: LocalDictationPreferenceKey.iphoneEndpointEnabled
+        )
+        unifiedHistoryEnabled = preferences.bool(
+            forKey: LocalDictationPreferenceKey.unifiedHistoryEnabled
         )
         refinerAPIKey = KeychainStore.loadMigratingLegacyServices(
             account: LocalDictationKeychainAccount.openAICompatibleRefiner
@@ -302,6 +328,8 @@ enum LocalDictationPreferenceKey {
     static let analyticsEnabled = "LocalDictation.analyticsEnabled.v1"
     static let destinationAnalyticsEnabled = "LocalDictation.destinationAnalyticsEnabled.v1"
     static let experimentalModelCleanupEnabled = "LocalDictation.experimentalModelCleanupEnabled.v1"
+    static let iphoneEndpointEnabled = "LocalDictation.iPhoneEndpointEnabled.v1"
+    static let unifiedHistoryEnabled = "LocalDictation.unifiedHistoryEnabled.v1"
 }
 
 enum LocalDictationKeychainAccount {

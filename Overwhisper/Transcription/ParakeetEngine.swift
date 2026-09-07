@@ -19,11 +19,21 @@ actor ParakeetEngine: TranscriptionEngine {
     }
 
     func transcribe(audioURL: URL) async throws -> FinalTranscript {
-        AppLogger.transcription.debug("Transcribing a local temporary recording")
         let language = await appState.language
-        let result = try await productionEngine.transcribe(
+        return try await transcribe(
             audioURL: audioURL,
             configuration: SpeechEngineConfiguration(language: language)
+        )
+    }
+
+    func transcribe(
+        audioURL: URL,
+        configuration: SpeechEngineConfiguration
+    ) async throws -> FinalTranscript {
+        AppLogger.transcription.debug("Transcribing a local temporary recording")
+        let result = try await productionEngine.transcribe(
+            audioURL: audioURL,
+            configuration: configuration
         )
         AppLogger.transcription.debug("Local Parakeet transcription completed")
         return result

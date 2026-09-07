@@ -168,6 +168,64 @@ enum HistoryTextVersion: Sendable {
     case raw
     case polished
     case delivered
+    case display
+}
+
+/// A finished remote (iPhone) transcription saved on the Mac. Raw and polished
+/// text are stored once and never mutated afterwards.
+struct HistoryRemoteCapture: Equatable, Sendable {
+    var id: UUID
+    var timestamp: Date
+    var rawText: String
+    var polishedText: String?
+    var mode: HistoryDictationMode
+    var sourceKind: HistorySourceKind
+    var remoteRoute: String
+    var cleanupBackend: String
+    var refinementStatus: HistoryRefinementStatus
+    var asrLatency: TimeInterval?
+    var refinementLatency: TimeInterval?
+    var totalLatency: TimeInterval?
+    var asrSelection: String?
+    var asrOutcome: String?
+    var refinerBackend: String?
+    var refinementOutcome: String?
+
+    init(
+        id: UUID,
+        timestamp: Date = Date(),
+        rawText: String,
+        polishedText: String?,
+        mode: HistoryDictationMode,
+        sourceKind: HistorySourceKind,
+        remoteRoute: String,
+        cleanupBackend: String,
+        refinementStatus: HistoryRefinementStatus,
+        asrLatency: TimeInterval? = nil,
+        refinementLatency: TimeInterval? = nil,
+        totalLatency: TimeInterval? = nil,
+        asrSelection: String? = nil,
+        asrOutcome: String? = nil,
+        refinerBackend: String? = nil,
+        refinementOutcome: String? = nil
+    ) {
+        self.id = id
+        self.timestamp = timestamp
+        self.rawText = rawText
+        self.polishedText = polishedText
+        self.mode = mode
+        self.sourceKind = sourceKind
+        self.remoteRoute = remoteRoute
+        self.cleanupBackend = cleanupBackend
+        self.refinementStatus = refinementStatus
+        self.asrLatency = asrLatency
+        self.refinementLatency = refinementLatency
+        self.totalLatency = totalLatency
+        self.asrSelection = asrSelection
+        self.asrOutcome = asrOutcome
+        self.refinerBackend = refinerBackend
+        self.refinementOutcome = refinementOutcome
+    }
 }
 
 struct HistoryPolishRetry: Equatable, Sendable {
@@ -268,6 +326,13 @@ struct HistoryEntry: Equatable, Identifiable, Sendable {
     let refinementOutcome: String?
     let validationFailureKind: String?
     let stopToPasteLatency: TimeInterval?
+    let sourceKind: HistorySourceKind
+    let remoteRoute: String?
+    let cleanupBackend: String?
+    let userEditedText: String?
+    let isPinned: Bool
+    let entryRevision: Int64
+    let updatedAt: Date
 
     var destination: HistoryDestination {
         HistoryDestination(
@@ -282,6 +347,16 @@ struct HistoryEntry: Equatable, Identifiable, Sendable {
         polishedText ?? rawText
     }
 
+    /// What every UI shows and copies: the user's edit when one exists,
+    /// otherwise the delivered text. Raw and polished text stay immutable.
+    var displayText: String {
+        userEditedText ?? polishedText ?? rawText
+    }
+
+    var isRemote: Bool {
+        remoteRoute != nil
+    }
+
     func text(for version: HistoryTextVersion) -> String? {
         switch version {
         case .raw:
@@ -290,6 +365,8 @@ struct HistoryEntry: Equatable, Identifiable, Sendable {
             polishedText
         case .delivered:
             deliveredText
+        case .display:
+            displayText
         }
     }
 }
@@ -299,6 +376,8 @@ enum HistoryStoreError: Error, Equatable, LocalizedError, Sendable {
     case invalidStoredValue(column: String, value: String)
     case polishRetryRequiresFailedEntry(UUID)
     case invalidRetentionDays(Int)
+    case revisionConflict(UUID, currentRevision: Int64)
+    case textTooLong(Int)
 
     var errorDescription: String? {
         switch self {
@@ -310,6 +389,10 @@ enum HistoryStoreError: Error, Equatable, LocalizedError, Sendable {
             "Dictation history entry \(id.uuidString) does not have failed polish metadata."
         case let .invalidRetentionDays(days):
             "History retention days must be nonnegative; received \(days)."
+        case let .revisionConflict(id, currentRevision):
+            "Dictation history entry \(id.uuidString) changed (revision \(currentRevision)); reload and try again."
+        case let .textTooLong(limit):
+            "Edited text must be \(limit) characters or fewer."
         }
     }
 }

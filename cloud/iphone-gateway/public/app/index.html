@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Dictation</title>
+<meta name="description" content="Dictate on your iPhone and read your Mac dictation history.">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Dictation">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#3a3fc4" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#12141c" media="(prefers-color-scheme: dark)">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<link rel="manifest" href="/app/manifest.webmanifest">
+<link rel="apple-touch-icon" sizes="180x180" href="/app/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/app/icon-192.png">
+<link rel="stylesheet" href="/app/app.css">
+<script type="module" src="/app/app.js"></script>
+</head>
+<body>
+
+<header class="bar">
+  <h1 class="bar-title">Dictation</h1>
+  <button id="settings-button" class="gear" type="button" aria-label="Settings">
+    <span class="gear-glyph" aria-hidden="true">&#9881;</span>
+  </button>
+</header>
+
+<main id="main-view">
+
+  <section id="setup-region" aria-label="Set up"></section>
+
+  <section id="record-region" class="record" aria-label="Record" hidden>
+    <button id="record-button" class="record-button" type="button">Record</button>
+    <p id="record-timer" class="timer" hidden>0:00</p>
+    <p id="record-status" class="status" aria-live="polite">Ready</p>
+    <p id="live-transcript" class="live-transcript" aria-live="polite" hidden></p>
+    <div id="record-action" class="status-action"></div>
+  </section>
+
+  <section id="result-region" aria-live="polite"></section>
+
+  <section id="history-region" aria-label="History">
+    <input id="search-input" class="search" type="search" placeholder="Search"
+           aria-label="Search" autocomplete="off" autocapitalize="none"
+           spellcheck="false" enterkeyhint="search" hidden>
+    <ul id="entry-list" class="rows"></ul>
+    <p id="list-empty" class="empty" hidden>Nothing here yet.</p>
+  </section>
+
+</main>
+
+<section id="detail-view" class="sheet" aria-label="Transcript" hidden></section>
+<section id="settings-view" class="sheet" aria-label="Settings" hidden></section>
+
+<p id="toast" class="toast" role="status" hidden></p>
+
+</body>
+</html>

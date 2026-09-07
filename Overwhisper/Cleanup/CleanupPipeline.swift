@@ -56,10 +56,14 @@ struct CleanupPipeline: Sendable {
     }
 
     func process(_ transcript: String, mode: CleanupMode) async throws -> CleanupResult {
-        try await process(FinalTranscript(text: transcript), mode: mode)
+        try await process(FinalTranscript(text: transcript), mode: mode, commandsAllowed: true)
     }
 
-    func process(_ transcript: FinalTranscript, mode: CleanupMode) async throws -> CleanupResult {
+    func process(
+        _ transcript: FinalTranscript,
+        mode: CleanupMode,
+        commandsAllowed: Bool = true
+    ) async throws -> CleanupResult {
         switch mode {
         case .literal:
             let commandAnalysis = commandProcessor.analyze(transcript.text)
@@ -77,7 +81,13 @@ struct CleanupPipeline: Sendable {
             )
 
         case .clean:
-            let commands = commandProcessor.process(transcript)
+            let commands = commandsAllowed
+                ? commandProcessor.process(transcript)
+                : CleanupCommandResult(
+                    text: transcript.text,
+                    recognizedCommands: [],
+                    unrecognizedCommandCandidates: []
+                )
             let vocabulary = try vocabularyProcessor.process(commands.text)
             let candidates = disfluencyDetector.candidates(
                 in: vocabulary.text,

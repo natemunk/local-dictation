@@ -7,10 +7,24 @@ typealias TranscriptBoundary = LocalDictationSpeech.TranscriptBoundary
 typealias FinalTranscript = LocalDictationSpeech.FinalTranscript
 typealias TimedTranscriptFragment = LocalDictationSpeech.TimedTranscriptFragment
 typealias TranscriptBoundaryMapper = LocalDictationSpeech.TranscriptBoundaryMapper
+typealias SpeechEngineConfiguration = LocalDictationSpeech.SpeechEngineConfiguration
 #endif
 
 protocol TranscriptionEngine: Sendable {
     func transcribe(audioURL: URL) async throws -> FinalTranscript
+    func transcribe(
+        audioURL: URL,
+        configuration: SpeechEngineConfiguration
+    ) async throws -> FinalTranscript
+}
+
+extension TranscriptionEngine {
+    func transcribe(
+        audioURL: URL,
+        configuration: SpeechEngineConfiguration
+    ) async throws -> FinalTranscript {
+        try await transcribe(audioURL: audioURL)
+    }
 }
 
 /// An owned slice of the recorder's canonical 16 kHz mono stream.

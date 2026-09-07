@@ -5,6 +5,7 @@ PROJECT_ROOT=${0:A:h}
 LAUNCH_APP=1
 RUN_TESTS=1
 CONFIGURE_SIGNING=0
+CONFIGURE_IPHONE_ENDPOINT=0
 ROTATE_SIGNING_IDENTITY=0
 CI_ADHOC_SIGNING=0
 
@@ -13,11 +14,16 @@ for argument in "$@"; do
     --no-launch) LAUNCH_APP=0 ;;
     --skip-tests) RUN_TESTS=0 ;;
     --configure-signing) CONFIGURE_SIGNING=1 ;;
+    --configure-iphone-endpoint) CONFIGURE_IPHONE_ENDPOINT=1 ;;
     --rotate-signing-identity) CONFIGURE_SIGNING=1; ROTATE_SIGNING_IDENTITY=1 ;;
     --ci-adhoc-signing) CI_ADHOC_SIGNING=1 ;;
     *) print -u2 "Unknown option: $argument"; exit 64 ;;
   esac
 done
+
+if (( CONFIGURE_IPHONE_ENDPOINT )); then
+  exec "$PROJECT_ROOT/scripts/configure-iphone-endpoint.sh"
+fi
 
 if [[ "$(uname -m)" != "arm64" ]]; then
   print -u2 "Local Dictation v1 requires an Apple Silicon Mac."

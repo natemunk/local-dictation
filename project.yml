@@ -34,6 +34,15 @@ packages:
   TOMLKit:
     url: https://github.com/LebJe/TOMLKit.git
     exactVersion: "0.6.0"
+  Hummingbird:
+    url: https://github.com/hummingbird-project/hummingbird.git
+    exactVersion: "2.26.0"
+  HummingbirdWebSocket:
+    url: https://github.com/hummingbird-project/hummingbird-websocket.git
+    exactVersion: "2.7.0"
+  ServiceLifecycle:
+    url: https://github.com/swift-server/swift-service-lifecycle.git
+    exactVersion: "2.12.0"
 
 targets:
   LocalDictation:
@@ -56,6 +65,9 @@ targets:
       - package: FluidAudio
       - package: GRDB
       - package: TOMLKit
+      - package: Hummingbird
+      - package: HummingbirdWebSocket
+      - package: ServiceLifecycle
 
 schemes:
   LocalDictation:

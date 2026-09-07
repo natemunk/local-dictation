@@ -2,6 +2,7 @@ import Foundation
 
 enum DictationMetricSourceKind: String, Codable, Sendable {
     case measured
+    case remoteIPhone = "remote_iphone"
     case legacyHistory = "legacy_history"
 }
 

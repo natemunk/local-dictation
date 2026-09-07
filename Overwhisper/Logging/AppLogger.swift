@@ -8,5 +8,6 @@ enum AppLogger {
     static let audio = Logger(subsystem: subsystem, category: "audio")
     static let hotkey = Logger(subsystem: subsystem, category: "hotkey")
     static let transcription = Logger(subsystem: subsystem, category: "transcription")
+    static let remote = Logger(subsystem: subsystem, category: "iphone_endpoint")
     static let system = Logger(subsystem: subsystem, category: "system")
 }

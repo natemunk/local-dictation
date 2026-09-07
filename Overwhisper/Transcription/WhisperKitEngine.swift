@@ -21,14 +21,24 @@ actor WhisperKitEngine: TranscriptionEngine {
     }
 
     func transcribe(audioURL: URL) async throws -> FinalTranscript {
-        AppLogger.transcription.debug("Transcribing a local temporary recording")
         let vocabulary = await appState.customVocabulary
-        let result = try await productionEngine.transcribe(
+        return try await transcribe(
             audioURL: audioURL,
             configuration: SpeechEngineConfiguration(
                 language: "en",
                 customVocabulary: vocabulary
             )
+        )
+    }
+
+    func transcribe(
+        audioURL: URL,
+        configuration: SpeechEngineConfiguration
+    ) async throws -> FinalTranscript {
+        AppLogger.transcription.debug("Transcribing a local temporary recording")
+        let result = try await productionEngine.transcribe(
+            audioURL: audioURL,
+            configuration: configuration
         )
         AppLogger.transcription.debug("Local WhisperKit transcription completed")
         return result

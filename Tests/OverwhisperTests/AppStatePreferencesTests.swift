@@ -20,6 +20,8 @@ struct AppStatePreferencesTests {
         first.analyticsEnabled = false
         first.destinationAnalyticsEnabled = false
         first.experimentalModelCleanupEnabled = true
+        first.iphoneEndpointEnabled = true
+        first.unifiedHistoryEnabled = true
 
         let restored = AppState(preferences: defaults)
         #expect(restored.overlayPosition == .topRight)
@@ -29,6 +31,8 @@ struct AppStatePreferencesTests {
         #expect(!restored.analyticsEnabled)
         #expect(!restored.destinationAnalyticsEnabled)
         #expect(restored.experimentalModelCleanupEnabled)
+        #expect(restored.iphoneEndpointEnabled)
+        #expect(restored.unifiedHistoryEnabled)
     }
 
     @Test("unknown persisted values fall back to safe defaults")
@@ -47,6 +51,8 @@ struct AppStatePreferencesTests {
         #expect(state.analyticsEnabled)
         #expect(state.destinationAnalyticsEnabled)
         #expect(!state.experimentalModelCleanupEnabled)
+        #expect(!state.iphoneEndpointEnabled)
+        #expect(!state.unifiedHistoryEnabled)
     }
 
     @Test("Keychain identity is constant and legacy migration writes before deleting")

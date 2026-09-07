@@ -39,6 +39,7 @@ For the documented end-to-end source install, run:
 ./setup                     # subsequent rebuilds
 # or, after signing is configured, when launch is not wanted:
 ./setup --no-launch
+./setup --configure-iphone-endpoint # optional Cloudflare/Shortcuts path
 ```
 
 `setup` resolves pinned dependencies, runs tests unless explicitly skipped,
@@ -48,8 +49,17 @@ installation as a user-visible side effect.
 
 ## Privacy boundary
 
-- Speech audio stays on the Mac and ASR uses the local FluidAudio or WhisperKit
-  paths. There is no cloud speech engine.
+- Desktop speech audio stays on the Mac and desktop ASR uses the local
+  FluidAudio or WhisperKit paths.
+- The opt-in iPhone endpoint is a separately disclosed boundary: iPhone audio
+  and returned text transit Cloudflare, and visible fallback may use Workers AI.
+  It stores no remote audio anywhere and nothing at all in Worker storage.
+- Settings → iPhone → **Unified iPhone History** is a second, independently
+  opt-in boundary and is off by default. While it is off, no remote transcript
+  is persisted and the history routes return `history_disabled`. While it is on,
+  iPhone transcripts are saved in local history and desktop history entries
+  transit Cloudflare during iPhone web-app synchronization without being
+  persisted there. Disabling it deletes nothing.
 - The app has no telemetry SDK, Overseed service integration, Sparkle updater,
   or automatic update check.
 - Optional cleanup may call Apple Foundation Models locally or an explicitly
@@ -60,7 +70,11 @@ installation as a user-visible side effect.
 - `scripts/privacy-audit.sh` is a source audit, not proof of runtime network
   behavior.
 
-The normative privacy contract is `docs/privacy-invariants.md`.
+The normative privacy contract is `docs/privacy-invariants.md`. The unified
+iPhone history slice — history schema, history API, synchronization
+algorithm, PWA constraints, and the three-service-token model — is
+normatively specified in `docs/unified-history.md`; the user-facing guides
+are `docs/iphone-shortcut.md` and `docs/iphone-pwa.md`.
 
 ## Architecture
 

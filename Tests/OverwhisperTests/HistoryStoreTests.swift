@@ -26,6 +26,7 @@ struct HistoryStoreTests {
             HistoryStore.searchBundleMigrationIdentifier,
             HistoryStore.metadataMigrationIdentifier,
             HistoryStore.metricsMigrationIdentifier,
+            HistoryStore.unifiedMigrationIdentifier,
         ])
         #expect(health.retentionPolicy == HistoryRetentionPolicy(retentionDays: 30))
         #expect(health.retentionDays == 30)
@@ -94,6 +95,7 @@ struct HistoryStoreTests {
             HistoryStore.searchBundleMigrationIdentifier,
             HistoryStore.metadataMigrationIdentifier,
             HistoryStore.metricsMigrationIdentifier,
+            HistoryStore.unifiedMigrationIdentifier,
         ])
 
         let reopened = try HistoryStore(databaseURL: databaseURL)
@@ -104,6 +106,7 @@ struct HistoryStoreTests {
             HistoryStore.searchBundleMigrationIdentifier,
             HistoryStore.metadataMigrationIdentifier,
             HistoryStore.metricsMigrationIdentifier,
+            HistoryStore.unifiedMigrationIdentifier,
         ])
         #expect(try await reopened.health().entryCount == 1)
     }

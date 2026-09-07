@@ -63,7 +63,7 @@ struct OnboardingView: View {
             Text("Finishing setup downloads the selected speech model directly to this Mac. No model is downloaded until you choose the button below; transcription then runs locally.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Text("First-time ASR and optional live-preview model downloads contact huggingface.co. Microphone audio and transcripts remain on this Mac.")
+            Text("First-time ASR and optional live-preview model downloads contact huggingface.co. Desktop microphone audio and transcripts remain on this Mac.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 

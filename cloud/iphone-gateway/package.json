@@ -1,0 +1,24 @@
+{
+  "name": "local-dictation-iphone-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "cf-typegen": "wrangler types --env-file .dev.vars.example --strict-vars=false",
+    "cf-typegen:check": "wrangler types --env-file .dev.vars.example --strict-vars=false --check",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p test/tsconfig.json && tsc --noEmit -p test/pwa/tsconfig.json",
+    "deploy:dry-run": "wrangler deploy --dry-run",
+    "check:startup": "wrangler check startup",
+    "test:gateway": "vitest run --project gateway",
+    "test:pwa": "vitest run --project pwa"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.1.2",
+    "@types/node": "^26.4.1",
+    "fake-indexeddb": "6.2.5",
+    "typescript": "~6.0.2",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.127.1"
+  }
+}

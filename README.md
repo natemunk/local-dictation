@@ -87,14 +87,16 @@ Normal updates must not require another permission reset. Only an intentional si
 
 ## Privacy boundary
 
-- Microphone audio always stays on the Mac.
-- Speech recognition uses local FluidAudio or WhisperKit models only.
+- Desktop microphone audio always stays on the Mac.
+- Desktop speech recognition uses local FluidAudio or WhisperKit models only.
 - First-time ASR and optional EOU-preview model downloads contact the documented model host, then models run from versioned Local Dictation-owned storage. Download requests contain no audio or transcript data.
 - The app contains no telemetry SDK, cloud speech engine, Overseed service, or automatic updater.
 - Optional local analytics are transcript-free SQLite aggregates for the Home Base dashboard. They contain counts, timings, modes, engine/cleanup labels, delivery outcomes, and—unless separately disabled—the destination app name and bundle ID. They never contain transcript text, audio, URLs, window titles, field contents, or error messages, and nothing is sent to Home Base or any network service.
 - Deterministic cleanup is the default. An Advanced, off-by-default experiment may use Apple Foundation Models or an explicitly configured OpenAI-compatible `/v1/chat/completions` endpoint. A refiner receives transcript text, static rules, and transcript-derived allowed-deletion ranges only—never audio, destination app, browser data, field contents, or surrounding text.
 - Non-loopback refinement endpoints require explicit `allow_remote = true` and show a persistent **Remote** badge.
 - Temporary WAV files are deleted after ASR or cancellation. Debug audio retention is off by default.
+- The optional iPhone endpoint is disabled by default. Dictation Inbox prefers a live 16 kHz audio stream so transfer and partial transcription happen while you speak, while simultaneously retaining the ordinary recording in memory as an automatic file-upload fallback. iPhone audio and returned text pass through Cloudflare even when this Mac performs ASR; visible cloud fallback additionally invokes Workers AI. Remote audio is never retained, and Cloudflare has no application storage or cache.
+- Settings → iPhone → **Unified iPhone History** is a second opt-in, also off by default. While it is off, no remote transcript is persisted and the history routes refuse. While it is on, iPhone transcripts join local history and desktop history entries transit Cloudflare during iPhone web-app synchronization without being persisted there. Turning it back off stops remote persistence and deletes nothing.
 
 Run `scripts/privacy-audit.sh` to check the source-level network boundary. The normative invariants are in [docs/privacy-invariants.md](docs/privacy-invariants.md).
 
@@ -177,6 +179,26 @@ No speech model is downloaded before you choose **Prepare & Finish Setup** in on
 
 Browser Automation is not used or requested. Browser behavior is selected only by bundle ID, with no page URL or hostname access.
 
+## Optional iPhone endpoint
+
+Settings → iPhone can enable a loopback-only service on `127.0.0.1:43129`. The Access-protected Cloudflare gateway automatically prefers this Mac and can visibly fall back to `@cf/openai/whisper-large-v3-turbo` when the Mac is unavailable. Desktop dictation keeps priority over remote work, and enabling the idle listener does not activate microphone capture or inference.
+
+Dictation Inbox uses live transport when iOS supports AudioWorklet and WebSocket. It sends signed 16-bit, 16 kHz mono PCM frames to the Mac while the phone continues its normal `MediaRecorder` capture. The Mac can return live preview text and writes those same frames to a temporary WAV; after Stop, the selected high-accuracy batch engine and normal cleanup pipeline remain authoritative. If live setup fails, the socket drops, the Mac is preempted, or the device lacks the required browser APIs, the completed M4A is submitted through the existing `/v1/transcriptions` route automatically. Apple Shortcuts continues to use that file route directly.
+
+Infrastructure setup is guided and idempotent:
+
+```sh
+./setup --configure-iphone-endpoint
+```
+
+Cloudflare Access must already protect both approved hostnames, with the gateway application path-scoped to `/v1` and three distinct Service Auth tokens: one for the Shortcut, one for the iPhone web app, and one for the Worker-to-Mac path. The public `/stream` transport accepts only a 30-second HMAC-signed ticket minted through the protected PWA API; the long-lived PWA token never enters a WebSocket URL. Enable the localhost endpoint and keep Local Dictation running before invoking setup; the live health response lets setup conclusively reject an anonymously reachable origin. Setup verifies all three token policies plus anonymous stream refusal with ten probes, persists only the origin pair and a random stream-signing secret as Worker secrets, and never stores either gateway pair.
+
+The same gateway serves an optional web app, **Dictation Inbox**, at `https://dictate.natemunk.com/app/`. It records from the iPhone and shows one searchable history that merges desktop and iPhone entries, with edit, pin, delete, copy, and export. Its shell is public and credential-free; it holds its own Access token in IndexedDB on the phone. Merging desktop history into it requires Unified iPhone History above. Settings → Diagnostics keeps at most 100 transcript-free request events locally and can copy a report whose request UUID correlates the PWA, Worker, and Mac logs.
+
+- Apple Shortcuts recipe, route indicators, privacy boundary, triggers, testing matrix, and token rotation: [docs/iphone-shortcut.md](docs/iphone-shortcut.md).
+- Installing and using Dictation Inbox on the iPhone: [docs/iphone-pwa.md](docs/iphone-pwa.md).
+- Normative history schema, API, synchronization algorithm, and token model: [docs/unified-history.md](docs/unified-history.md).
+
 ## Configuration
 
 Editable TOML configuration is bootstrapped on first launch:
@@ -208,6 +230,7 @@ The same local database also has a separate `dictation_metrics` table for transc
 | Configuration says Degraded | Current builds automatically remove the obsolete `browser_profiles_enabled`/`hostname_matching_enabled` app flags and rename `history_success_retention_days` to `history_retention_days` without changing its value. Remaining notices identify an exact file and usually mean an old profile still contains a now-ignored `hostnames` match; remove that entry and choose Settings → General → **Reload**. |
 | Dictation reaches the clipboard but not the field | This is the safe fallback when focus changed, the destination could not be revalidated, or the app is not on the reviewed insertion allowlist. Return to the field and press Command+V, or use History → Paste Again. |
 | The `LD` menu item is missing | Open `~/Applications/Local Dictation.app` from Finder or Spotlight. If Settings opens and Diagnostics says Hyper+D is Ready, the agent is running and macOS is only hiding the crowded menu-bar item. |
+| The iPhone app says a request failed | Open Dictation Inbox → Settings → Diagnostics → **Copy diagnostics**. Use the request UUID to correlate the PWA report with Cloudflare Worker Observability and the Mac `iphone_endpoint` unified-log category; see [docs/iphone-pwa.md](docs/iphone-pwa.md). |
 | A rebuild asks for permissions again | Use plain `./setup`; do not recreate or rotate the signing identity. Settings → General shows the current permission state. Rotation is intentionally the only workflow that requires another one-time reset. |
 | You need support evidence | Use Settings → Diagnostics → **Copy Diagnostics**. The report contains only allowlisted states and counts—never transcript text, clipboard contents, audio, API keys, browser data, or focused-field content. |
 
@@ -255,6 +278,7 @@ Overwhisper/
 ├── Logging/         # static logging and privacy-safe signposts
 ├── Output/          # destination capture and safe clipboard insertion
 ├── Profiles/        # bundle ID and AX role/subrole matching
+├── Remote/          # opt-in loopback iPhone endpoint and inference lease
 ├── SpeechLayer/     # reusable production final-ASR/model ownership
 ├── Streaming/       # live finalized/volatile ASR adapters
 ├── Transcription/   # app adapters and engine coordination
@@ -262,13 +286,14 @@ Overwhisper/
 
 CorpusRunner/        # production-engine corpus execution and checkpoints
 Benchmark/           # dependency-free WER/RTF/latency scorer and fixtures
+cloud/iphone-gateway/# Access-protected Mac-first Worker and Workers AI fallback
 ```
 
-Core dependencies are pinned in `Package.resolved`: FluidAudio, WhisperKit, GRDB, and TOMLKit.
+Core dependencies are pinned in `Package.resolved`: FluidAudio, WhisperKit, GRDB, TOMLKit, and Hummingbird. The Cloudflare gateway has its own pinned npm lockfile.
 
 ## Status and acceptance
 
-The current automated snapshot is 191 tests across 30 suites. On the current development Mac, two consecutive same-identity source installs retained Microphone, Input Monitoring, Accessibility, and Hyper+D readiness, and the menu-bar agent remained alive after Settings closed. The additive metrics migration, honest legacy backfill, real measured-event write, and Home Base's read-only schema/event parsing have also been exercised against the installed app; Home Base outcome classification still needs the consumer-side alignment described above. The full product requirements, corpus contracts, and acceptance matrix are checked in under [docs](docs). Source compilation and contract tests are not evidence that latency, accuracy, sleep/wake recovery, the full cross-app insertion matrix, or the one-week Raycast cutover gates have passed.
+The current automated snapshot is 219 Swift tests across 34 suites plus 289 Worker/PWA tests across 15 files. On the current development Mac, two consecutive same-identity source installs retained Microphone, Input Monitoring, Accessibility, and Hyper+D readiness, and the menu-bar agent remained alive after Settings closed. The additive metrics migration, honest legacy backfill, real measured-event write, and Home Base's read-only schema/event parsing have also been exercised against the installed app; Home Base outcome classification still needs the consumer-side alignment described above. The existing Access-protected gateway, PWA file-upload flow, visible cloud fallback, and unified history have been exercised from an iPhone. This live-streaming revision still requires a Worker redeploy, Mac app reinstall, and real-device Safari comparison; the staged 20-dictation rollout also remains pending. The full product requirements, corpus contracts, and acceptance matrix are checked in under [docs](docs). Source compilation and contract tests are not evidence that latency, accuracy, sleep/wake recovery, the full cross-app insertion matrix, or the one-week Raycast cutover gates have passed.
 
 ## Origin and license
 

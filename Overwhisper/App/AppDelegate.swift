@@ -17,6 +17,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let pasteAgainQueue = SerializedPasteAgainQueue()
     private let cleanupExecutor = CleanupExecutor()
     private let modelStore = OwnedModelStore()
+    private let iphoneEndpointServer = IPhoneEndpointServer()
+    private let remoteAudioNormalizer = RemoteAudioNormalizer()
+    private let inferenceLease = InferenceLeaseCoordinator()
     private var configuration = ConfigurationSnapshot.typedDefaults
     private var profileResolver = ProfileResolver(catalog: .nativeDefaults)
     private var historyStore: HistoryStore?
@@ -30,6 +33,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var engineCoordinator: EngineCoordinator!
     private var transcriptionEngine: (any TranscriptionEngine)?
     private var streamingTranscriber: (any StreamingTranscriber)?
+    private var remoteStreamingTranscriber: (any StreamingTranscriber)?
 
     private var settingsWindowController: SettingsWindowController?
     private var onboardingWindow: NSWindow?
@@ -45,6 +49,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var engineTask: Task<Void, Never>?
     private var modelMaintenanceTask: Task<Void, Never>?
     private var historyMaintenanceTask: Task<Void, Never>?
+    private var iphoneEndpointTask: Task<Void, Never>?
+    private var iphoneEndpointGeneration: UInt64 = 0
     private var engineReloadPending = false
     private var historyRepasteDestination: DictationDestination?
     private var activeSession: DictationSession? { sessionController.active }
@@ -79,6 +85,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupSleepWakeHandling()
         cleanupStaleModelStaging()
         refreshPermissionDiagnostics()
+        synchronizeIPhoneEndpoint(enabled: appState.iphoneEndpointEnabled)
 
         if appState.hasCompletedOnboarding, appState.basePermissionsReady {
             requestHotkeyMonitoringIfPossible()
@@ -98,6 +105,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         engineTask?.cancel()
         modelMaintenanceTask?.cancel()
         historyMaintenanceTask?.cancel()
+        iphoneEndpointTask?.cancel()
+        inferenceLease.endDesktop()
+        Task { [iphoneEndpointServer] in
+            await iphoneEndpointServer.stop { _ in }
+        }
         pasteAgainQueue.cancelPending()
         if let session = activeSession {
             session.captureFinishTask?.cancel()
@@ -256,6 +268,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .removeDuplicates()
             .sink { [weak self] _ in
                 self?.updateRefinerPrivacyState()
+            }
+            .store(in: &cancellables)
+
+        appState.$iphoneEndpointEnabled
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] enabled in
+                self?.synchronizeIPhoneEndpoint(enabled: enabled)
             }
             .store(in: &cancellables)
 
@@ -494,6 +514,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func beginCapture(token: DictationSessionToken) {
         guard coordinator.owns(token) else { return }
+        inferenceLease.beginDesktop()
 
         if let prior = activeSession, prior.token != token {
             retireRuntime(prior)
@@ -786,6 +807,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let engine = self.activeSession?.engine else {
                     throw LocalDictationError.engineUnavailable
                 }
+                try await self.inferenceLease.waitForRemoteRelease()
+                try Task.checkCancellation()
+                guard self.isCurrent(request.token) else { return }
                 if let selection = self.activeSession?.asrSelection {
                     self.updateSession(request.token) {
                         $0.metricSpeechEngine = Self.metricsSpeechEngine(for: selection)
@@ -1309,6 +1333,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if audioRecorder.isRecording { audioRecorder.cancelRecording() }
         guard let session = activeSession, session.token == token else { return }
         retireRuntime(session)
+        inferenceLease.endDesktop()
         _ = sessionController.clear(token)
         DictationPerformanceSignposts.emit(
             .completion,
@@ -1372,6 +1397,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appState.overlayMessage = "Error"
         overlayWindow.show(position: appState.overlayPosition, token: token)
         retireRuntime(session, hideOverlay: false)
+        inferenceLease.endDesktop()
         _ = coordinator.complete(token: token)
         _ = sessionController.clear(token)
         DictationPerformanceSignposts.emit(
@@ -1397,6 +1423,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let session = activeSession, session.token == token else { return }
         let toastMessage = appState.overlayMessage
         retireRuntime(session, hideOverlay: toastDuration == nil)
+        inferenceLease.endDesktop()
         _ = coordinator.complete(token: token)
         _ = sessionController.clear(token)
         DictationPerformanceSignposts.emit(
@@ -1546,6 +1573,610 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem?.button?.toolTip = appState.isRemoteRefiner
             ? "Local Dictation · REMOTE text refiner active"
             : "Local Dictation"
+    }
+
+    // MARK: - iPhone endpoint
+
+    private func synchronizeIPhoneEndpoint(enabled: Bool) {
+        iphoneEndpointTask?.cancel()
+        iphoneEndpointGeneration &+= 1
+        let generation = iphoneEndpointGeneration
+        iphoneEndpointTask = Task { @MainActor [weak self] in
+            guard let self, !Task.isCancelled, generation == self.iphoneEndpointGeneration else {
+                return
+            }
+            if enabled {
+                await self.iphoneEndpointServer.start(
+                    health: { [weak self] in
+                        await self?.iphoneEndpointHealth()
+                            ?? IPhoneEndpointHealthResponse(
+                                ready: false,
+                                busy: true,
+                                selectedEngine: nil
+                            )
+                    },
+                    transcribe: { [weak self] request in
+                        guard let self else {
+                            throw IPhoneEndpointFailure(.engineUnavailable)
+                        }
+                        return try await self.transcribeIPhoneAudio(request)
+                    },
+                    stream: { [weak self] request in
+                        guard let self else {
+                            throw IPhoneEndpointFailure(.engineUnavailable)
+                        }
+                        return try await self.startIPhoneAudioStream(request)
+                    },
+                    history: { [weak self] in
+                        // Read on MainActor so the live toggle applies without
+                        // restarting the listener. The returned provider then
+                        // serves entirely on the history actor.
+                        await self?.unifiedHistoryProvider()
+                    },
+                    stateChanged: { [weak self] state in
+                        await self?.recordIPhoneEndpointLifecycle(
+                            state,
+                            generation: generation
+                        )
+                    }
+                )
+            } else {
+                await self.iphoneEndpointServer.stop { [weak self] state in
+                    await self?.recordIPhoneEndpointLifecycle(
+                        state,
+                        generation: generation
+                    )
+                }
+            }
+        }
+    }
+
+    private func iphoneEndpointHealth() -> IPhoneEndpointHealthResponse {
+        IPhoneEndpointHealthResponse(
+            ready: appState.iphoneEndpointEnabled
+                && appState.engineReady
+                && transcriptionEngine != nil
+                && !inferenceLease.isBusy,
+            busy: inferenceLease.isBusy,
+            selectedEngine: appState.engineReady ? appState.asrSelection.rawValue : nil
+        )
+    }
+
+    /// `nil` disables the unified-history routes. Disabling the toggle never
+    /// deletes anything; it only stops answering device requests.
+    private func unifiedHistoryProvider() -> (any HistorySyncProviding)? {
+        guard appState.unifiedHistoryEnabled,
+              appState.iphoneEndpointEnabled,
+              let historyStore
+        else { return nil }
+        appState.iphoneHistoryServedAt = Date()
+        return HistoryStoreSyncProvider(
+            store: historyStore,
+            retentionPolicy: historyRetentionPolicy
+        )
+    }
+
+    private var historyRetentionPolicy: HistoryRetentionPolicy {
+        HistoryRetentionPolicy(
+            retentionDays: configuration.app.historySuccessRetentionDays
+        )
+    }
+
+    private func recordIPhoneEndpointLifecycle(
+        _ lifecycle: IPhoneEndpointLifecycleState,
+        generation: UInt64
+    ) {
+        guard generation == iphoneEndpointGeneration else { return }
+        appState.iphoneEndpointRuntime.lifecycle = lifecycle
+        appState.iphoneEndpointRuntime.listenerReady = lifecycle == .ready
+        if lifecycle == .failed {
+            appState.iphoneEndpointRuntime.lastFailure = .transcriptionFailed
+        }
+    }
+
+    private func transcribeIPhoneAudio(
+        _ request: IPhoneTranscriptionRequest
+    ) async throws -> IPhoneTranscriptionResponse {
+        guard appState.iphoneEndpointEnabled,
+              appState.engineReady,
+              let engine = transcriptionEngine
+        else { throw IPhoneEndpointFailure(.engineUnavailable) }
+        guard activeSession == nil else { throw IPhoneEndpointFailure(.desktopBusy) }
+        guard let lease = inferenceLease.tryBeginRemote() else {
+            throw IPhoneEndpointFailure(.remoteBusy)
+        }
+
+        appState.iphoneEndpointRuntime.activeRequest = true
+        appState.iphoneEndpointRuntime.lastFailure = nil
+        let selection = appState.asrSelection
+        let configuration = SpeechEngineConfiguration(
+            language: "en",
+            customVocabulary: iPhoneASRVocabularyBias()
+        )
+        let cleanup = makeIPhoneCleanupPipeline(mode: request.mode)
+        let normalizer = remoteAudioNormalizer
+        let executor = CleanupExecutor()
+        let deadline = Self.iPhoneASRDeadline(
+            selection: selection,
+            duration: request.claimedDurationSeconds
+        )
+        let started = ContinuousClock.now
+        // Resolved on MainActor before the detached work starts; the save then
+        // happens on the history actor, never here.
+        let unifiedHistoryStore = appState.unifiedHistoryEnabled ? historyStore : nil
+
+        let work = Task.detached(priority: .utility) {
+            try await Self.runIPhoneTranscription(
+                request: request,
+                engine: engine,
+                selection: selection,
+                speechConfiguration: configuration,
+                cleanupPipeline: cleanup.pipeline,
+                requestedCleanupBackend: cleanup.backend,
+                normalizer: normalizer,
+                cleanupExecutor: executor,
+                deadline: deadline,
+                started: started,
+                unifiedHistoryStore: unifiedHistoryStore
+            )
+        }
+        lease.installCancellation { work.cancel() }
+
+        defer {
+            inferenceLease.endRemote(lease)
+            appState.iphoneEndpointRuntime.activeRequest = false
+        }
+
+        do {
+            let result = try await withTaskCancellationHandler {
+                try await work.value
+            } onCancel: {
+                work.cancel()
+            }
+            appState.iphoneEndpointRuntime.lastRoute = .macLocal
+            appState.iphoneEndpointRuntime.lastFailure = nil
+            queueIPhoneMetric(result, request: request, selection: selection)
+            return result.response
+        } catch is CancellationError {
+            appState.iphoneEndpointRuntime.lastFailure = .remotePreempted
+            throw IPhoneEndpointFailure(.remotePreempted)
+        } catch let failure as IPhoneEndpointFailure {
+            appState.iphoneEndpointRuntime.lastFailure = failure.kind
+            throw failure
+        } catch let error as RemoteAudioNormalizerError {
+            let failure: IPhoneEndpointErrorKind = switch error {
+            case .durationTooLong: .durationTooLong
+            case .emptyAudio: .invalidRequest
+            case .unsupportedInput: .unsupportedMedia
+            case .outputFileCreationFailed, .conversionFailed: .transcriptionFailed
+            }
+            appState.iphoneEndpointRuntime.lastFailure = failure
+            throw IPhoneEndpointFailure(failure)
+        } catch {
+            appState.iphoneEndpointRuntime.lastFailure = .transcriptionFailed
+            throw IPhoneEndpointFailure(.transcriptionFailed)
+        }
+    }
+
+    private func startIPhoneAudioStream(
+        _ request: IPhoneAudioStreamRequest
+    ) async throws -> IPhoneAudioStreamSession {
+        guard appState.iphoneEndpointEnabled,
+              appState.engineReady,
+              let engine = transcriptionEngine
+        else { throw IPhoneEndpointFailure(.engineUnavailable) }
+        guard activeSession == nil else { throw IPhoneEndpointFailure(.desktopBusy) }
+        guard let lease = inferenceLease.tryBeginRemote() else {
+            throw IPhoneEndpointFailure(.remoteBusy)
+        }
+
+        let writer: IPhoneStreamWAVWriter
+        do {
+            writer = try IPhoneStreamWAVWriter(requestID: request.requestID)
+        } catch {
+            inferenceLease.endRemote(lease)
+            throw IPhoneEndpointFailure(.transcriptionFailed)
+        }
+
+        let preview: any StreamingTranscriber
+        if let remoteStreamingTranscriber {
+            preview = remoteStreamingTranscriber
+        } else {
+            let created = FluidAudioParakeetStreamingTranscriber()
+            remoteStreamingTranscriber = created
+            preview = created
+        }
+
+        appState.iphoneEndpointRuntime.activeRequest = true
+        appState.iphoneEndpointRuntime.lastFailure = nil
+        let selection = appState.asrSelection
+        let configuration = SpeechEngineConfiguration(
+            language: "en",
+            customVocabulary: iPhoneASRVocabularyBias()
+        )
+        let cleanup = makeIPhoneCleanupPipeline(mode: request.mode)
+        let executor = CleanupExecutor()
+        let started = ContinuousClock.now
+        let unifiedHistoryStore = appState.unifiedHistoryEnabled ? historyStore : nil
+        let leaseCoordinator = inferenceLease
+        let metricRequest = IPhoneTranscriptionRequest(
+            requestID: request.requestID,
+            mode: request.mode,
+            allowsCloudFallback: request.allowsCloudFallback,
+            claimedDurationSeconds: 1,
+            mediaType: "audio/wav",
+            audio: Data(),
+            client: request.client
+        )
+
+        let session = IPhoneRemoteStreamingSession(
+            request: request,
+            writer: writer,
+            transcriber: preview,
+            finalizer: { audio, duration in
+                try await Self.runIPhoneStreamTranscription(
+                    request: request,
+                    audio: audio,
+                    engine: engine,
+                    selection: selection,
+                    speechConfiguration: configuration,
+                    cleanupPipeline: cleanup.pipeline,
+                    requestedCleanupBackend: cleanup.backend,
+                    cleanupExecutor: executor,
+                    deadline: Self.iPhoneASRDeadline(
+                        selection: selection,
+                        duration: duration
+                    ),
+                    started: started,
+                    unifiedHistoryStore: unifiedHistoryStore
+                )
+            },
+            completion: { [weak self] result in
+                leaseCoordinator.endRemote(lease)
+                await self?.completeIPhoneAudioStream(
+                    result,
+                    metricRequest: metricRequest,
+                    selection: selection
+                )
+            }
+        )
+        lease.installCancellation {
+            Task { await session.cancel() }
+        }
+        return await session.start()
+    }
+
+    private func completeIPhoneAudioStream(
+        _ result: Result<IPhoneLocalProcessingResult, IPhoneEndpointFailure>,
+        metricRequest: IPhoneTranscriptionRequest,
+        selection: ASRSelection
+    ) {
+        appState.iphoneEndpointRuntime.activeRequest = false
+        switch result {
+        case .success(let processed):
+            appState.iphoneEndpointRuntime.lastRoute = .macLocal
+            appState.iphoneEndpointRuntime.lastFailure = nil
+            queueIPhoneMetric(
+                processed,
+                request: metricRequest,
+                selection: selection
+            )
+        case .failure(let failure):
+            appState.iphoneEndpointRuntime.lastFailure = failure.kind
+        }
+    }
+
+    private static func runIPhoneTranscription(
+        request: IPhoneTranscriptionRequest,
+        engine: any TranscriptionEngine,
+        selection: ASRSelection,
+        speechConfiguration: SpeechEngineConfiguration,
+        cleanupPipeline: CleanupPipeline,
+        requestedCleanupBackend: IPhoneCleanupBackend,
+        normalizer: RemoteAudioNormalizer,
+        cleanupExecutor: CleanupExecutor,
+        deadline: Duration,
+        started: ContinuousClock.Instant,
+        unifiedHistoryStore: HistoryStore?
+    ) async throws -> IPhoneLocalProcessingResult {
+        try await withThrowingTaskGroup(of: IPhoneLocalProcessingResult.self) { group in
+            group.addTask {
+                let normalized = try await normalizer.normalize(request)
+                defer { normalized.removeFiles() }
+                try Task.checkCancellation()
+                return try await Self.processIPhoneNormalizedAudio(
+                    request: request,
+                    wavURL: normalized.wavURL,
+                    audioDurationSeconds: normalized.durationSeconds,
+                    engine: engine,
+                    selection: selection,
+                    speechConfiguration: speechConfiguration,
+                    cleanupPipeline: cleanupPipeline,
+                    requestedCleanupBackend: requestedCleanupBackend,
+                    cleanupExecutor: cleanupExecutor,
+                    started: started,
+                    unifiedHistoryStore: unifiedHistoryStore
+                )
+            }
+            group.addTask {
+                try await Task.sleep(for: deadline)
+                throw IPhoneEndpointFailure(.transcriptionTimedOut)
+            }
+            guard let first = try await group.next() else {
+                throw IPhoneEndpointFailure(.transcriptionFailed)
+            }
+            group.cancelAll()
+            return first
+        }
+    }
+
+    private static func runIPhoneStreamTranscription(
+        request: IPhoneAudioStreamRequest,
+        audio: IPhoneStreamedAudio,
+        engine: any TranscriptionEngine,
+        selection: ASRSelection,
+        speechConfiguration: SpeechEngineConfiguration,
+        cleanupPipeline: CleanupPipeline,
+        requestedCleanupBackend: IPhoneCleanupBackend,
+        cleanupExecutor: CleanupExecutor,
+        deadline: Duration,
+        started: ContinuousClock.Instant,
+        unifiedHistoryStore: HistoryStore?
+    ) async throws -> IPhoneLocalProcessingResult {
+        let processingRequest = IPhoneTranscriptionRequest(
+            requestID: request.requestID,
+            mode: request.mode,
+            allowsCloudFallback: request.allowsCloudFallback,
+            claimedDurationSeconds: audio.durationSeconds,
+            mediaType: "audio/wav",
+            audio: Data(),
+            client: request.client
+        )
+        return try await withThrowingTaskGroup(of: IPhoneLocalProcessingResult.self) { group in
+            group.addTask {
+                try await Self.processIPhoneNormalizedAudio(
+                    request: processingRequest,
+                    wavURL: audio.wavURL,
+                    audioDurationSeconds: audio.durationSeconds,
+                    engine: engine,
+                    selection: selection,
+                    speechConfiguration: speechConfiguration,
+                    cleanupPipeline: cleanupPipeline,
+                    requestedCleanupBackend: requestedCleanupBackend,
+                    cleanupExecutor: cleanupExecutor,
+                    started: started,
+                    unifiedHistoryStore: unifiedHistoryStore
+                )
+            }
+            group.addTask {
+                try await Task.sleep(for: deadline)
+                throw IPhoneEndpointFailure(.transcriptionTimedOut)
+            }
+            guard let first = try await group.next() else {
+                throw IPhoneEndpointFailure(.transcriptionFailed)
+            }
+            group.cancelAll()
+            return first
+        }
+    }
+
+    private static func processIPhoneNormalizedAudio(
+        request: IPhoneTranscriptionRequest,
+        wavURL: URL,
+        audioDurationSeconds: TimeInterval,
+        engine: any TranscriptionEngine,
+        selection: ASRSelection,
+        speechConfiguration: SpeechEngineConfiguration,
+        cleanupPipeline: CleanupPipeline,
+        requestedCleanupBackend: IPhoneCleanupBackend,
+        cleanupExecutor: CleanupExecutor,
+        started: ContinuousClock.Instant,
+        unifiedHistoryStore: HistoryStore?
+    ) async throws -> IPhoneLocalProcessingResult {
+        try Task.checkCancellation()
+        let asrStarted = ContinuousClock.now
+        let raw = try await engine.transcribe(
+            audioURL: wavURL,
+            configuration: speechConfiguration
+        )
+        let asrLatency = asrStarted.duration(to: .now).seconds
+        guard !raw.text.isEmpty else {
+            throw IPhoneEndpointFailure(.emptyTranscript)
+        }
+        try Task.checkCancellation()
+
+        let cleanupStarted = ContinuousClock.now
+        let cleaned = try await cleanupExecutor.process(
+            cleanupPipeline,
+            transcript: raw,
+            mode: request.mode,
+            commandsAllowed: !raw.boundaries.isEmpty
+        )
+        let cleanupLatency = request.mode == .clean
+            ? cleanupStarted.duration(to: .now).seconds
+            : nil
+        let actualBackend: IPhoneCleanupBackend = switch cleaned.outcome {
+        case .skippedLiteralMode: .none
+        case .accepted: requestedCleanupBackend
+        case .deterministicFallback: .deterministic
+        }
+        let cleanupOutcome: String = switch cleaned.outcome {
+        case .skippedLiteralMode: "not_requested"
+        case .accepted: actualBackend.rawValue
+        case .deterministicFallback: "deterministic_fallback"
+        }
+        let elapsed = max(0, started.duration(to: .now).seconds)
+        let historyState = await Self.saveIPhoneHistory(
+            store: unifiedHistoryStore,
+            request: request,
+            rawText: raw.text,
+            cleanedText: cleaned.text,
+            cleanupBackend: actualBackend,
+            cleanupOutcome: cleanupOutcome,
+            selection: selection,
+            asrLatency: asrLatency,
+            cleanupLatency: cleanupLatency,
+            totalLatency: elapsed
+        )
+        let response = IPhoneTranscriptionResponse(
+            requestID: request.requestID,
+            text: cleaned.text,
+            route: .macLocal,
+            cleanup: actualBackend,
+            latencyMilliseconds: Int((elapsed * 1_000).rounded()),
+            fallbackReason: nil,
+            historyState: historyState
+        )
+        return IPhoneLocalProcessingResult(
+            response: response,
+            rawWordCount: DictationWordCounter.count(raw.text),
+            deliveredWordCount: DictationWordCounter.count(cleaned.text),
+            audioDurationSeconds: audioDurationSeconds,
+            asrLatencySeconds: asrLatency,
+            cleanupLatencySeconds: cleanupLatency,
+            recognizedCommandCount: cleaned.metadata.recognizedCommands.count,
+            cleanupOutcome: cleanupOutcome
+        )
+    }
+
+    /// Persists a Mac-local iPhone transcription under its request ID. A replay
+    /// of the same ID is idempotent. Never logs transcript text.
+    private static func saveIPhoneHistory(
+        store: HistoryStore?,
+        request: IPhoneTranscriptionRequest,
+        rawText: String,
+        cleanedText: String,
+        cleanupBackend: IPhoneCleanupBackend,
+        cleanupOutcome: String,
+        selection: ASRSelection,
+        asrLatency: TimeInterval,
+        cleanupLatency: TimeInterval?,
+        totalLatency: TimeInterval
+    ) async -> IPhoneHistoryState {
+        guard let store else { return .disabled }
+        let isClean = request.mode == .clean
+        do {
+            _ = try await store.saveRemote(
+                HistoryRemoteCapture(
+                    id: request.requestID,
+                    rawText: rawText,
+                    polishedText: isClean ? cleanedText : nil,
+                    mode: isClean ? .clean : .literal,
+                    sourceKind: request.client.sourceKind,
+                    remoteRoute: IPhoneTranscriptionRoute.macLocal.rawValue,
+                    cleanupBackend: cleanupBackend.rawValue,
+                    refinementStatus: isClean ? .succeeded : .notRequested,
+                    asrLatency: asrLatency,
+                    refinementLatency: cleanupLatency,
+                    totalLatency: totalLatency,
+                    asrSelection: selection.rawValue,
+                    refinerBackend: isClean ? cleanupBackend.rawValue : "none",
+                    refinementOutcome: cleanupOutcome
+                )
+            )
+            return .savedOnMac
+        } catch {
+            // The device keeps the text and imports it later.
+            AppLogger.app.error("Unified history could not store an iPhone transcription")
+            return .pendingDeviceSync
+        }
+    }
+
+    private func makeIPhoneCleanupPipeline(
+        mode: CleanupMode
+    ) -> (pipeline: CleanupPipeline, backend: IPhoneCleanupBackend) {
+        let compiled = configurationStore.compiledVocabulary(
+            forProfileID: configuration.app.defaultProfileID
+        ) ?? Self.fallbackCompiledVocabulary
+        guard mode == .clean,
+              appState.experimentalModelCleanupEnabled
+        else {
+            return (
+                CleanupPipeline(compiledVocabulary: compiled, refiner: DeterministicRefiner()),
+                mode == .literal ? .none : .deterministic
+            )
+        }
+
+        let adapter = SystemAppleFoundationModelAdapter()
+        guard adapter.availability() == .available else {
+            return (
+                CleanupPipeline(compiledVocabulary: compiled, refiner: DeterministicRefiner()),
+                .deterministic
+            )
+        }
+        let milliseconds = Int64(max(
+            1,
+            (configuration.app.refinementDeadlineSeconds * 1_000).rounded()
+        ))
+        return (
+            CleanupPipeline(
+                compiledVocabulary: compiled,
+                refiner: AppleFoundationRefiner(
+                    adapter: adapter,
+                    deadline: .milliseconds(milliseconds)
+                )
+            ),
+            .appleFoundation
+        )
+    }
+
+    private func iPhoneASRVocabularyBias() -> String {
+        let profile = configuration.profiles[configuration.app.defaultProfileID]
+            ?? ProfileCatalog.nativeDefaults["default"]!
+        return asrVocabularyBias(for: profile)
+    }
+
+    private static func iPhoneASRDeadline(
+        selection: ASRSelection,
+        duration: TimeInterval
+    ) -> Duration {
+        let seconds: TimeInterval
+        switch selection {
+        case .whisperSmallEn, .whisperLargeV3Turbo:
+            seconds = ASRDeadlinePolicy.whisperTimeoutSeconds(audioDuration: duration) + 5
+        case .parakeetV2, .parakeetV3:
+            seconds = min(145, max(20, duration * 0.22 + 10))
+        }
+        return .milliseconds(Int64((seconds * 1_000).rounded()))
+    }
+
+    private func queueIPhoneMetric(
+        _ result: IPhoneLocalProcessingResult,
+        request: IPhoneTranscriptionRequest,
+        selection: ASRSelection
+    ) {
+        guard appState.analyticsEnabled, let historyStore else { return }
+        let event = DictationMetricEvent(
+            eventID: UUID(),
+            completedAt: Date(),
+            recordingDurationSeconds: result.audioDurationSeconds,
+            rawWordCount: result.rawWordCount,
+            deliveredWordCount: result.deliveredWordCount,
+            dictationMode: request.mode.rawValue,
+            speechEngine: Self.metricsSpeechEngine(for: selection),
+            speechModel: selection.modelVariant,
+            cleanupBackend: result.response.cleanup.rawValue,
+            cleanupOutcome: result.cleanupOutcome,
+            asrLatencySeconds: result.asrLatencySeconds,
+            cleanupLatencySeconds: result.cleanupLatencySeconds,
+            stopToDeliveryLatencySeconds: nil,
+            deliveryOutcome: "remote_returned",
+            recognizedCommandCount: result.recognizedCommandCount,
+            wordsRemoved: max(0, result.rawWordCount - result.deliveredWordCount),
+            destinationBundleIdentifier: nil,
+            destinationDisplayName: nil,
+            sourceKind: .remoteIPhone,
+            timingComplete: false,
+            eventRevision: 1,
+            schemaVersion: DictationMetricEvent.currentSchemaVersion
+        )
+        Task {
+            do {
+                _ = try await historyStore.upsertMetric(event)
+            } catch {
+                AppLogger.app.error("Transcript-free iPhone metric persistence failed")
+            }
+        }
     }
 
     private func setupHistoryStore() {
@@ -2497,9 +3128,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             onVerifyModel: { [weak self] in self?.verifySelectedModel() },
             onRepairModel: { [weak self] in self?.confirmRepairSelectedModel() },
+            onTestIPhoneEndpoint: { [weak self] in self?.testIPhoneEndpoint() },
             onResetAnalytics: { [weak self] in self?.resetAnalytics() },
             onDeleteEverything: { [weak self] in self?.deleteEverything() }
         )
+    }
+
+    private func testIPhoneEndpoint() {
+        guard appState.iphoneEndpointEnabled else { return }
+        guard let url = URL(string: "http://127.0.0.1:43129/healthz") else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                var request = URLRequest(url: url)
+                request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+                request.timeoutInterval = 2
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let http = response as? HTTPURLResponse,
+                      http.statusCode == 200
+                else { throw IPhoneEndpointFailure(.transcriptionFailed) }
+                _ = try JSONDecoder().decode(IPhoneEndpointHealthResponse.self, from: data)
+                self.appState.iphoneEndpointRuntime.lifecycle = .ready
+                self.appState.iphoneEndpointRuntime.listenerReady = true
+                self.appState.iphoneEndpointRuntime.lastFailure = nil
+                self.appState.lastError = nil
+            } catch {
+                self.appState.iphoneEndpointRuntime.lifecycle = .failed
+                self.appState.iphoneEndpointRuntime.listenerReady = false
+                self.appState.iphoneEndpointRuntime.lastFailure = .transcriptionFailed
+                self.appState.lastError = "The local iPhone listener did not answer on 127.0.0.1:43129."
+            }
+            guard let tunnelURL = URL(string: "http://127.0.0.1:43130/ready") else { return }
+            do {
+                var request = URLRequest(url: tunnelURL)
+                request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+                request.timeoutInterval = 2
+                let (_, response) = try await URLSession.shared.data(for: request)
+                self.appState.iphoneEndpointRuntime.tunnelReady =
+                    (response as? HTTPURLResponse)?.statusCode == 200
+            } catch {
+                self.appState.iphoneEndpointRuntime.tunnelReady = false
+            }
+        }
     }
 
     private func importRaycastVocabulary(_ input: String) {
@@ -2626,7 +3296,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             at: directory,
             includingPropertiesForKeys: nil
         ) else { return }
-        for file in files where file.lastPathComponent.hasPrefix("local_dictation_recording_") {
+        let orphanPrefixes = ["local_dictation_recording_", "local-dictation-iphone-"]
+        let cutoff = Date().addingTimeInterval(-60 * 60)
+        for file in files where orphanPrefixes.contains(where: file.lastPathComponent.hasPrefix) {
+            let values = try? file.resourceValues(forKeys: [.contentModificationDateKey])
+            guard let modified = values?.contentModificationDate, modified < cutoff else { continue }
             try? FileManager.default.removeItem(at: file)
         }
     }

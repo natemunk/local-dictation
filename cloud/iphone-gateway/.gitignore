@@ -1,0 +1,9 @@
+node_modules/
+.wrangler/
+dist/
+coverage/
+*.cpuprofile
+.dev.vars
+.env
+.env.*
+!.dev.vars.example

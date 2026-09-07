@@ -16,6 +16,7 @@ struct SettingsView: View {
     let onImportRaycastVocabulary: (String) -> Void
     let onVerifyModel: () -> Void
     let onRepairModel: () -> Void
+    let onTestIPhoneEndpoint: () -> Void
     let onResetAnalytics: () -> Void
     let onDeleteEverything: () -> Void
 
@@ -27,12 +28,14 @@ struct SettingsView: View {
                 .tabItem { Label("General", systemImage: "gear") }
             speech
                 .tabItem { Label("Speech", systemImage: "waveform") }
+            iphone
+                .tabItem { Label("iPhone", systemImage: "iphone") }
             privacy
                 .tabItem { Label("Privacy", systemImage: "lock.shield") }
             DiagnosticsSettingsView(appState: appState)
                 .tabItem { Label("Diagnostics", systemImage: "stethoscope") }
         }
-        .frame(width: 610, height: 540)
+        .frame(width: 630, height: 570)
         .padding(18)
         .onAppear(perform: onRefreshPermissions)
     }
@@ -196,7 +199,7 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                Text("First-time ASR and optional FluidAudio EOU live-preview downloads contact \(appState.asrSelection.sourceHost). Audio and transcripts remain on this Mac.")
+                Text("First-time ASR and optional FluidAudio EOU live-preview downloads contact \(appState.asrSelection.sourceHost). Desktop microphone audio and transcripts remain on this Mac.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -216,12 +219,15 @@ struct SettingsView: View {
     private var privacy: some View {
         Form {
             Section("Invariant") {
-                Label("Microphone audio never leaves this Mac", systemImage: "checkmark.shield.fill")
+                Label("Desktop microphone audio never leaves this Mac", systemImage: "checkmark.shield.fill")
                     .foregroundStyle(.green)
-                Text("There is no outbound telemetry SDK, cloud speech engine, automatic updater, or Overseed service in this build.")
+                Text("There is no outbound telemetry SDK, desktop cloud speech engine, automatic updater, or Overseed service in this build.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Text("Network access is limited to first-time model downloads from the documented model host and any text-only refiner you explicitly configure.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("The separately enabled iPhone endpoint sends iPhone audio and returned text through Cloudflare and may visibly fall back to Workers AI. It never changes the desktop dictation boundary.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -303,6 +309,131 @@ struct SettingsView: View {
                 secondaryButton: .cancel()
             )
         }
+    }
+
+    private var iphone: some View {
+        Form {
+            Section("iPhone transcription") {
+                Toggle("Enable the localhost endpoint", isOn: $appState.iphoneEndpointEnabled)
+                Text("Off by default. When enabled, Local Dictation listens only on 127.0.0.1:43129. It does not open a router port and remains unreachable from the internet without the separately configured Cloudflare Tunnel.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                LabeledContent("Local listener") {
+                    Text(appState.iphoneEndpointRuntime.lifecycle.rawValue.capitalized)
+                        .foregroundStyle(iphoneEndpointStatusColor)
+                }
+                LabeledContent("Cloudflare Tunnel") {
+                    Text(iphoneTunnelStatus)
+                        .foregroundStyle(appState.iphoneEndpointRuntime.tunnelReady == true ? Color.green : Color.secondary)
+                }
+                LabeledContent("Selected model") {
+                    Text(appState.engineReady ? appState.asrSelection.displayName : "Unavailable")
+                        .foregroundStyle(appState.engineReady ? Color.green : Color.orange)
+                }
+                if appState.iphoneEndpointRuntime.activeRequest {
+                    Label("Transcribing an iPhone recording", systemImage: "waveform.circle.fill")
+                        .foregroundStyle(.purple)
+                }
+                if let route = appState.iphoneEndpointRuntime.lastRoute {
+                    LabeledContent("Last Mac response") {
+                        Text(route == .macLocal ? "This Mac" : "Cloud fallback")
+                    }
+                }
+                if let failure = appState.iphoneEndpointRuntime.lastFailure {
+                    LabeledContent("Last failure") {
+                        Text(failure.rawValue.replacingOccurrences(of: "_", with: " ").capitalized)
+                            .foregroundStyle(.orange)
+                    }
+                }
+
+                HStack {
+                    Button("Test Local Listener", action: onTestIPhoneEndpoint)
+                        .disabled(!appState.iphoneEndpointEnabled)
+                    Button("Copy Public URL") {
+                        copyToPasteboard("https://dictate.natemunk.com/v1/transcriptions")
+                    }
+                    Spacer()
+                    Button("Copy Setup Command") {
+                        copyToPasteboard("./setup --configure-iphone-endpoint")
+                    }
+                }
+            }
+
+            Section("Unified iPhone History") {
+                Toggle(
+                    "Save iPhone transcripts and sync with the web app",
+                    isOn: $appState.unifiedHistoryEnabled
+                )
+                .disabled(!appState.iphoneEndpointEnabled)
+                Text("When on, iPhone transcripts are saved to this Mac's history and the Dictation Inbox web app can download your desktop history through Cloudflare. Cloudflare transports but never stores it. Turning this off keeps existing history and stops sync.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if !appState.iphoneEndpointEnabled {
+                    Text("Enable the localhost endpoint first.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if let servedAt = appState.iphoneHistoryServedAt {
+                    LabeledContent("Last history request") {
+                        Text(servedAt.formatted(date: .abbreviated, time: .shortened))
+                    }
+                }
+                HStack {
+                    Button("Copy Dictation Inbox URL") {
+                        copyToPasteboard("https://dictate.natemunk.com/app/")
+                    }
+                    Spacer()
+                }
+            }
+
+            Section("Routing") {
+                Label("Mac first · automatic visible cloud fallback", systemImage: "arrow.triangle.branch")
+                Text("Dictation Inbox first streams audio to this Mac while you speak and keeps a complete phone recording as an automatic upload fallback. The Shortcut always uses the completed-file route. Both clients identify whether this Mac or Workers AI handled the final result; invalid or oversized audio never falls back.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Privacy boundary") {
+                Label("Desktop microphone dictation stays local", systemImage: "checkmark.shield.fill")
+                    .foregroundStyle(.green)
+                Text("The optional iPhone feature is different: iPhone audio and returned text pass through Cloudflare even when this Mac performs ASR. If this Mac is unavailable, Cloudflare Workers AI transcribes the audio. Remote audio is never stored. With Unified iPhone History off, no remote transcript is stored either; only transcript-free route and timing metrics may be stored locally. With it on, iPhone transcripts are saved to this Mac's local history and desktop history transits Cloudflare while the web app synchronizes.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Cloudflare Access service tokens are stored in the Shortcut and Worker secrets, never in Local Dictation configuration or logs.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Shortcut result") {
+                Text("V1 copies the returned text to the iPhone clipboard, shows which route was used, and returns the text to the calling Shortcut. Inserting into an arbitrary focused iOS field would require a separate keyboard extension.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var iphoneEndpointStatusColor: Color {
+        switch appState.iphoneEndpointRuntime.lifecycle {
+        case .ready: .green
+        case .starting: .orange
+        case .disabled: .secondary
+        case .failed: .red
+        }
+    }
+
+    private var iphoneTunnelStatus: String {
+        switch appState.iphoneEndpointRuntime.tunnelReady {
+        case true: "Ready"
+        case false: "Unavailable"
+        case nil: "Not checked"
+        }
+    }
+
+    private func copyToPasteboard(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
     }
 }
 

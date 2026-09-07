@@ -8,10 +8,15 @@ actor CleanupExecutor {
     func process(
         _ pipeline: CleanupPipeline,
         transcript: FinalTranscript,
-        mode: CleanupMode
+        mode: CleanupMode,
+        commandsAllowed: Bool = true
     ) async throws -> CleanupResult {
         try Task.checkCancellation()
-        let result = try await pipeline.process(transcript, mode: mode)
+        let result = try await pipeline.process(
+            transcript,
+            mode: mode,
+            commandsAllowed: commandsAllowed
+        )
         try Task.checkCancellation()
         return result
     }

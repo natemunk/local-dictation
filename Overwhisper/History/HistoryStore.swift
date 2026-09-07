@@ -13,17 +13,21 @@ actor HistoryStore {
     static let searchBundleMigrationIdentifier = "history_fts_v2"
     static let metadataMigrationIdentifier = "history_metadata_v2"
     static let metricsMigrationIdentifier = "dictation_metrics_v1"
+    static let unifiedMigrationIdentifier = "history_unified_v3"
     static let expectedMigrationIdentifiers = [
         schemaMigrationIdentifier,
         searchMigrationIdentifier,
         searchBundleMigrationIdentifier,
         metadataMigrationIdentifier,
         metricsMigrationIdentifier,
+        unifiedMigrationIdentifier,
     ]
 
     private static let tableName = "dictation_history"
     private static let searchTableName = "dictation_history_fts"
     private static let metricsTableName = "dictation_metrics"
+    private static let syncStateTableName = "history_sync_state"
+    private static let syncOperationsTableName = "history_sync_operations"
 
     private enum Column {
         static let rowID = "row_id"
@@ -49,6 +53,22 @@ actor HistoryStore {
         static let refinementOutcome = "refinement_outcome"
         static let validationFailureKind = "validation_failure_kind"
         static let stopToPasteLatency = "stop_to_paste_latency"
+        static let sourceKind = "source_kind"
+        static let remoteRoute = "remote_route"
+        static let cleanupBackend = "cleanup_backend"
+        static let userEditedText = "user_edited_text"
+        static let isPinned = "is_pinned"
+        static let entryRevision = "entry_revision"
+        static let updatedAt = "updated_at"
+    }
+
+    private enum SyncColumn {
+        static let id = "id"
+        static let globalRevision = "global_revision"
+        static let opID = "op_id"
+        static let entryID = "entry_id"
+        static let status = "status"
+        static let appliedAt = "applied_at"
     }
 
     private enum MetricsColumn {
@@ -164,8 +184,10 @@ actor HistoryStore {
                         \(Column.asrLatency),
                         \(Column.unrecognizedCommandCandidatesJSON),
                         \(Column.asrSelection),
-                        \(Column.asrOutcome)
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        \(Column.asrOutcome),
+                        \(Column.sourceKind),
+                        \(Column.updatedAt)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                 arguments: [
                     capture.id.uuidString.lowercased(),
@@ -180,10 +202,128 @@ actor HistoryStore {
                     candidatesJSON,
                     capture.asrSelection,
                     capture.asrOutcome,
+                    HistorySourceKind.desktop.rawValue,
+                    capture.timestamp,
                 ]
             )
+            try Self.bumpGlobalRevision(in: db)
 
             return try Self.requireEntry(capture.id, in: db)
+        }
+    }
+
+    /// Persists a finished remote (iPhone) transcription under its request ID.
+    /// Replays of the same ID are idempotent and never rewrite stored text.
+    @discardableResult
+    func saveRemote(_ capture: HistoryRemoteCapture) throws -> (entry: HistoryEntry, inserted: Bool) {
+        try database.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO \(Self.tableName) (
+                        \(Column.id),
+                        \(Column.timestamp),
+                        \(Column.rawText),
+                        \(Column.polishedText),
+                        \(Column.mode),
+                        \(Column.deliveryStatus),
+                        \(Column.refinementStatus),
+                        \(Column.asrLatency),
+                        \(Column.refinementLatency),
+                        \(Column.totalLatency),
+                        \(Column.unrecognizedCommandCandidatesJSON),
+                        \(Column.asrSelection),
+                        \(Column.asrOutcome),
+                        \(Column.refinerBackend),
+                        \(Column.refinementOutcome),
+                        \(Column.sourceKind),
+                        \(Column.remoteRoute),
+                        \(Column.cleanupBackend),
+                        \(Column.updatedAt)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(\(Column.id)) DO NOTHING
+                    """,
+                arguments: [
+                    capture.id.uuidString.lowercased(),
+                    capture.timestamp,
+                    capture.rawText,
+                    capture.polishedText,
+                    capture.mode.rawValue,
+                    HistoryDeliveryStatus.delivered.rawValue,
+                    capture.refinementStatus.rawValue,
+                    capture.asrLatency,
+                    capture.refinementLatency,
+                    capture.totalLatency,
+                    capture.asrSelection,
+                    capture.asrOutcome,
+                    capture.refinerBackend,
+                    capture.refinementOutcome,
+                    capture.sourceKind.rawValue,
+                    capture.remoteRoute,
+                    capture.cleanupBackend,
+                    capture.timestamp,
+                ]
+            )
+            let inserted = db.changesCount > 0
+            if inserted {
+                try Self.bumpGlobalRevision(in: db)
+            }
+            return (try Self.requireEntry(capture.id, in: db), inserted)
+        }
+    }
+
+    /// Stores or clears the user's edit. Raw and polished text are untouched.
+    /// A `baseRevision` guards against edits made from stale state.
+    @discardableResult
+    func setUserEditedText(
+        id: UUID,
+        text: String?,
+        baseRevision: Int64? = nil
+    ) throws -> HistoryEntry {
+        let normalized = text?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let stored = (normalized?.isEmpty ?? true) ? nil : text
+        if let stored, stored.count > HistorySyncManifest.maximumTextCharacters {
+            throw HistoryStoreError.textTooLong(HistorySyncManifest.maximumTextCharacters)
+        }
+        return try database.write { db in
+            let entry = try Self.requireEntry(id, in: db)
+            try Self.requireRevision(entry, base: baseRevision)
+            try db.execute(
+                sql: """
+                    UPDATE \(Self.tableName)
+                    SET \(Column.userEditedText) = ?,
+                        \(Column.entryRevision) = \(Column.entryRevision) + 1,
+                        \(Column.updatedAt) = ?
+                    WHERE \(Column.id) = ?
+                    """,
+                arguments: [stored, Date(), id.uuidString.lowercased()]
+            )
+            try Self.bumpGlobalRevision(in: db)
+            return try Self.requireEntry(id, in: db)
+        }
+    }
+
+    /// Pinned entries are exempt from retention pruning until unpinned.
+    @discardableResult
+    func setPinned(
+        id: UUID,
+        _ isPinned: Bool,
+        baseRevision: Int64? = nil
+    ) throws -> HistoryEntry {
+        try database.write { db in
+            let entry = try Self.requireEntry(id, in: db)
+            try Self.requireRevision(entry, base: baseRevision)
+            try db.execute(
+                sql: """
+                    UPDATE \(Self.tableName)
+                    SET \(Column.isPinned) = ?,
+                        \(Column.entryRevision) = \(Column.entryRevision) + 1,
+                        \(Column.updatedAt) = ?
+                    WHERE \(Column.id) = ?
+                    """,
+                arguments: [isPinned, Date(), id.uuidString.lowercased()]
+            )
+            try Self.bumpGlobalRevision(in: db)
+            return try Self.requireEntry(id, in: db)
         }
     }
 
@@ -196,7 +336,9 @@ actor HistoryStore {
             try db.execute(
                 sql: """
                     UPDATE \(Self.tableName)
-                    SET \(Column.polishedText) = ?,
+                    SET \(Column.entryRevision) = \(Column.entryRevision) + 1,
+                        \(Column.updatedAt) = ?,
+                        \(Column.polishedText) = ?,
                         \(Column.refinementStatus) = ?,
                         \(Column.deliveryStatus) = ?,
                         \(Column.refinementLatency) = ?,
@@ -211,6 +353,7 @@ actor HistoryStore {
                     WHERE \(Column.id) = ?
                     """,
                 arguments: [
+                    Date(),
                     finalization.polishedText,
                     finalization.refinementStatus.rawValue,
                     finalization.deliveryStatus.rawValue,
@@ -226,6 +369,7 @@ actor HistoryStore {
                     id.uuidString.lowercased(),
                 ]
             )
+            try Self.bumpGlobalRevision(in: db)
             return try Self.requireEntry(id, in: db)
         }
     }
@@ -239,7 +383,9 @@ actor HistoryStore {
             try db.execute(
                 sql: """
                     UPDATE \(Self.tableName)
-                    SET \(Column.polishedText) = COALESCE(?, \(Column.polishedText)),
+                    SET \(Column.entryRevision) = \(Column.entryRevision) + 1,
+                        \(Column.updatedAt) = ?,
+                        \(Column.polishedText) = COALESCE(?, \(Column.polishedText)),
                         \(Column.deliveryStatus) = ?,
                         \(Column.totalLatency) = COALESCE(?, \(Column.totalLatency)),
                         \(Column.error) = ?,
@@ -252,6 +398,7 @@ actor HistoryStore {
                     WHERE \(Column.id) = ?
                     """,
                 arguments: [
+                    Date(),
                     update.deliveredText,
                     update.status.rawValue,
                     update.totalLatency,
@@ -265,6 +412,7 @@ actor HistoryStore {
                     id.uuidString.lowercased(),
                 ]
             )
+            try Self.bumpGlobalRevision(in: db)
             return try Self.requireEntry(id, in: db)
         }
     }
@@ -290,7 +438,9 @@ actor HistoryStore {
             try db.execute(
                 sql: """
                     UPDATE \(Self.tableName)
-                    SET \(Column.refinementStatus) = ?,
+                    SET \(Column.entryRevision) = \(Column.entryRevision) + 1,
+                        \(Column.updatedAt) = ?,
+                        \(Column.refinementStatus) = ?,
                         \(Column.deliveryStatus) = ?,
                         \(Column.refinementLatency) = ?,
                         \(Column.totalLatency) = COALESCE(?, \(Column.totalLatency)),
@@ -305,6 +455,7 @@ actor HistoryStore {
                     WHERE \(Column.id) = ?
                     """,
                 arguments: [
+                    attemptedAt,
                     HistoryRefinementStatus.failed.rawValue,
                     deliveryStatus.rawValue,
                     refinementLatency,
@@ -320,6 +471,7 @@ actor HistoryStore {
                     id.uuidString.lowercased(),
                 ]
             )
+            try Self.bumpGlobalRevision(in: db)
             return try Self.requireEntry(id, in: db)
         }
     }
@@ -338,7 +490,9 @@ actor HistoryStore {
             try db.execute(
                 sql: """
                     UPDATE \(Self.tableName)
-                    SET \(Column.refinementStatus) = ?,
+                    SET \(Column.entryRevision) = \(Column.entryRevision) + 1,
+                        \(Column.updatedAt) = ?,
+                        \(Column.refinementStatus) = ?,
                         \(Column.deliveryStatus) = CASE
                             WHEN \(Column.deliveryStatus) = ? THEN ?
                             ELSE \(Column.deliveryStatus)
@@ -355,6 +509,7 @@ actor HistoryStore {
                     WHERE \(Column.id) = ?
                     """,
                 arguments: [
+                    startedAt,
                     HistoryRefinementStatus.retrying.rawValue,
                     HistoryDeliveryStatus.failed.rawValue,
                     HistoryDeliveryStatus.pending.rawValue,
@@ -363,6 +518,7 @@ actor HistoryStore {
                     id.uuidString.lowercased(),
                 ]
             )
+            try Self.bumpGlobalRevision(in: db)
 
             return HistoryPolishRetry(
                 entryID: id,
@@ -422,12 +578,14 @@ actor HistoryStore {
                     FROM \(Self.tableName)
                     WHERE LOWER(COALESCE(\(Column.rawText), '')) LIKE LOWER(?) ESCAPE '\\'
                        OR LOWER(COALESCE(\(Column.polishedText), '')) LIKE LOWER(?) ESCAPE '\\'
+                       OR LOWER(COALESCE(\(Column.userEditedText), '')) LIKE LOWER(?) ESCAPE '\\'
                        OR LOWER(COALESCE(\(Column.destinationDisplayName), '')) LIKE LOWER(?) ESCAPE '\\'
                        OR LOWER(COALESCE(\(Column.destinationBundleIdentifier), '')) LIKE LOWER(?) ESCAPE '\\'
                     ORDER BY \(Column.timestamp) DESC, \(Column.rowID) DESC
                     LIMIT ?
                     """,
                 arguments: [
+                    likePattern,
                     likePattern,
                     likePattern,
                     likePattern,
@@ -460,6 +618,7 @@ actor HistoryStore {
                 sql: "DELETE FROM \(Self.tableName) WHERE \(Column.id) = ?",
                 arguments: [id.uuidString.lowercased()]
             )
+            try Self.bumpGlobalRevision(in: db)
             return true
         }
     }
@@ -472,6 +631,8 @@ actor HistoryStore {
                 sql: "SELECT COUNT(*) FROM \(Self.tableName)"
             ) ?? 0
             try db.execute(sql: "DELETE FROM \(Self.tableName)")
+            try db.execute(sql: "DELETE FROM \(Self.syncOperationsTableName)")
+            try Self.bumpGlobalRevision(in: db)
             return count
         }
     }
@@ -651,6 +812,8 @@ actor HistoryStore {
             ) ?? 0
             try db.execute(sql: "DELETE FROM \(Self.tableName)")
             try db.execute(sql: "DELETE FROM \(Self.metricsTableName)")
+            try db.execute(sql: "DELETE FROM \(Self.syncOperationsTableName)")
+            try Self.bumpGlobalRevision(in: db)
             return (history, metrics)
         }
         // A logical DELETE alone can leave prior values in free pages or the
@@ -684,13 +847,21 @@ actor HistoryStore {
         return try database.write { db in
             let count = try Int.fetchOne(
                 db,
-                sql: "SELECT COUNT(*) FROM \(Self.tableName) WHERE \(Column.timestamp) < ?",
+                sql: """
+                    SELECT COUNT(*) FROM \(Self.tableName)
+                    WHERE \(Column.timestamp) < ? AND \(Column.isPinned) = 0
+                    """,
                 arguments: [cutoff]
             ) ?? 0
+            guard count > 0 else { return 0 }
             try db.execute(
-                sql: "DELETE FROM \(Self.tableName) WHERE \(Column.timestamp) < ?",
+                sql: """
+                    DELETE FROM \(Self.tableName)
+                    WHERE \(Column.timestamp) < ? AND \(Column.isPinned) = 0
+                    """,
                 arguments: [cutoff]
             )
+            try Self.bumpGlobalRevision(in: db)
             return count
         }
     }
@@ -703,6 +874,264 @@ actor HistoryStore {
         relativeTo now: Date = Date()
     ) throws -> Int {
         try pruneEntries(policy: policy, relativeTo: now)
+    }
+
+    // MARK: - Unified history synchronization
+
+    private static func bumpGlobalRevision(in db: Database) throws {
+        try db.execute(
+            sql: """
+                UPDATE \(syncStateTableName)
+                SET \(SyncColumn.globalRevision) = \(SyncColumn.globalRevision) + 1
+                WHERE \(SyncColumn.id) = 1
+                """
+        )
+    }
+
+    private static func currentGlobalRevision(in db: Database) throws -> Int64 {
+        try Int64.fetchOne(
+            db,
+            sql: "SELECT \(SyncColumn.globalRevision) FROM \(syncStateTableName) WHERE \(SyncColumn.id) = 1"
+        ) ?? 0
+    }
+
+    private static func requireRevision(_ entry: HistoryEntry, base: Int64?) throws {
+        if let base, base != entry.entryRevision {
+            throw HistoryStoreError.revisionConflict(entry.id, currentRevision: entry.entryRevision)
+        }
+    }
+
+    func globalRevision() throws -> Int64 {
+        try database.read { db in try Self.currentGlobalRevision(in: db) }
+    }
+
+    func syncManifest(policy: HistoryRetentionPolicy = .default) throws -> HistorySyncManifest {
+        try database.read { db in
+            let revision = try Self.currentGlobalRevision(in: db)
+            let entryCount = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM \(Self.tableName)") ?? 0
+            let pinnedCount = try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM \(Self.tableName) WHERE \(Column.isPinned) = 1"
+            ) ?? 0
+            return HistorySyncManifest(
+                revision: revision,
+                entryCount: entryCount,
+                pinnedCount: pinnedCount,
+                retention: .standard(unpinnedDays: policy.retentionDays),
+                maxOperationsPerRequest: HistorySyncManifest.maximumOperationsPerRequest,
+                maxTextCharacters: HistorySyncManifest.maximumTextCharacters
+            )
+        }
+    }
+
+    /// One page of a consistent snapshot. The caller pins `revision`; any
+    /// intervening mutation makes the page request fail with the new revision
+    /// so the client restarts instead of merging two different states.
+    func syncPage(revision: Int64, cursor: String?, limit: Int) throws -> HistorySyncPage {
+        guard limit >= 1, limit <= HistorySyncManifest.maximumPageSize else {
+            throw HistorySyncError.invalidRequest
+        }
+        var cursorRowID: Int64?
+        if let cursor {
+            guard cursor.count <= 64, let parsed = Int64(cursor), parsed >= 0 else {
+                throw HistorySyncError.invalidRequest
+            }
+            cursorRowID = parsed
+        }
+
+        return try database.read { db in
+            let current = try Self.currentGlobalRevision(in: db)
+            guard current == revision else {
+                throw HistorySyncError.historyChanged(currentRevision: current)
+            }
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT * FROM \(Self.tableName)
+                    WHERE (? IS NULL OR \(Column.rowID) < ?)
+                    ORDER BY \(Column.rowID) DESC
+                    LIMIT ?
+                    """,
+                arguments: [cursorRowID, cursorRowID, limit + 1]
+            )
+            let page = Array(rows.prefix(limit))
+            let nextCursor: String? = rows.count > limit
+                ? String(page.last.map { $0[Column.rowID] as Int64 } ?? 0)
+                : nil
+            let entries = try page.map(Self.decodeEntry).map(HistorySyncEntry.init)
+            return HistorySyncPage(revision: current, entries: entries, nextCursor: nextCursor)
+        }
+    }
+
+    /// Applies client operations idempotently inside one transaction. Each
+    /// operation is judged on its own; neighbours are never rolled back.
+    func applySyncOperations(_ batch: HistorySyncOperationBatch) throws -> HistorySyncOperationBatchResult {
+        guard !batch.operations.isEmpty,
+              batch.operations.count <= HistorySyncManifest.maximumOperationsPerRequest
+        else { throw HistorySyncError.invalidRequest }
+
+        return try database.write { db in
+            var results: [HistorySyncOperationResult] = []
+            var appliedAny = false
+            let now = Date()
+
+            for operation in batch.operations {
+                let result = try Self.apply(operation, at: now, in: db)
+                if result.status == .applied {
+                    appliedAny = true
+                    try db.execute(
+                        sql: """
+                            INSERT OR IGNORE INTO \(Self.syncOperationsTableName) (
+                                \(SyncColumn.opID), \(SyncColumn.entryID), \(SyncColumn.status), \(SyncColumn.appliedAt)
+                            ) VALUES (?, ?, ?, ?)
+                            """,
+                        arguments: [
+                            operation.opID.uuidString.lowercased(),
+                            operation.entryID.uuidString.lowercased(),
+                            result.status.rawValue,
+                            now,
+                        ]
+                    )
+                }
+                results.append(result)
+            }
+            if appliedAny {
+                try Self.bumpGlobalRevision(in: db)
+            }
+            return HistorySyncOperationBatchResult(
+                revision: try Self.currentGlobalRevision(in: db),
+                results: results
+            )
+        }
+    }
+
+    private static let acceptedRemoteRoutes: Set<String> = ["mac_local", "cloud_fallback"]
+    private static let acceptedCleanupBackends: Set<String> = ["apple_foundation", "deterministic", "none"]
+
+    private static func apply(
+        _ operation: HistorySyncOperation,
+        at now: Date,
+        in db: Database
+    ) throws -> HistorySyncOperationResult {
+        let opID = operation.opID.uuidString.lowercased()
+        let alreadyApplied = try Int.fetchOne(
+            db,
+            sql: "SELECT COUNT(*) FROM \(syncOperationsTableName) WHERE \(SyncColumn.opID) = ?",
+            arguments: [opID]
+        ) ?? 0
+        let existing = try fetchEntry(operation.entryID, in: db)
+        if alreadyApplied > 0 {
+            return HistorySyncOperationResult(
+                opID: operation.opID,
+                status: .alreadyApplied,
+                entry: existing.map(HistorySyncEntry.init)
+            )
+        }
+
+        switch operation.type {
+        case .import:
+            guard let sourceKind = operation.sourceKind, sourceKind != .desktop,
+                  let mode = operation.mode,
+                  let text = operation.text,
+                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  text.count <= HistorySyncManifest.maximumTextCharacters,
+                  let route = operation.route, acceptedRemoteRoutes.contains(route)
+            else {
+                return HistorySyncOperationResult(opID: operation.opID, status: .invalid, entry: nil)
+            }
+            let cleanup = operation.cleanup ?? "none"
+            guard acceptedCleanupBackends.contains(cleanup) else {
+                return HistorySyncOperationResult(opID: operation.opID, status: .invalid, entry: nil)
+            }
+            if let existing {
+                return HistorySyncOperationResult(
+                    opID: operation.opID,
+                    status: .alreadyApplied,
+                    entry: HistorySyncEntry(existing)
+                )
+            }
+            let timestamp = operation.createdAt ?? now
+            try db.execute(
+                sql: """
+                    INSERT INTO \(tableName) (
+                        \(Column.id), \(Column.timestamp), \(Column.rawText), \(Column.polishedText),
+                        \(Column.mode), \(Column.deliveryStatus), \(Column.refinementStatus),
+                        \(Column.unrecognizedCommandCandidatesJSON), \(Column.sourceKind),
+                        \(Column.remoteRoute), \(Column.cleanupBackend), \(Column.updatedAt)
+                    ) VALUES (?, ?, ?, NULL, ?, ?, ?, '[]', ?, ?, ?, ?)
+                    """,
+                arguments: [
+                    operation.entryID.uuidString.lowercased(),
+                    timestamp,
+                    text,
+                    mode.rawValue,
+                    HistoryDeliveryStatus.delivered.rawValue,
+                    HistoryRefinementStatus.notRequested.rawValue,
+                    sourceKind.rawValue,
+                    route,
+                    cleanup,
+                    now,
+                ]
+            )
+            let inserted = try requireEntry(operation.entryID, in: db)
+            return HistorySyncOperationResult(opID: operation.opID, status: .applied, entry: HistorySyncEntry(inserted))
+
+        case .edit, .pin, .unpin:
+            guard let entry = existing else {
+                return HistorySyncOperationResult(opID: operation.opID, status: .missing, entry: nil)
+            }
+            guard let base = operation.baseRevision else {
+                return HistorySyncOperationResult(opID: operation.opID, status: .invalid, entry: HistorySyncEntry(entry))
+            }
+            guard base == entry.entryRevision else {
+                return HistorySyncOperationResult(opID: operation.opID, status: .conflict, entry: HistorySyncEntry(entry))
+            }
+            if operation.type == .edit {
+                let trimmed = operation.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if trimmed.count > HistorySyncManifest.maximumTextCharacters {
+                    return HistorySyncOperationResult(opID: operation.opID, status: .invalid, entry: HistorySyncEntry(entry))
+                }
+                try db.execute(
+                    sql: """
+                        UPDATE \(tableName)
+                        SET \(Column.userEditedText) = ?,
+                            \(Column.entryRevision) = \(Column.entryRevision) + 1,
+                            \(Column.updatedAt) = ?
+                        WHERE \(Column.id) = ?
+                        """,
+                    arguments: [trimmed.isEmpty ? nil : operation.text, now, operation.entryID.uuidString.lowercased()]
+                )
+            } else {
+                try db.execute(
+                    sql: """
+                        UPDATE \(tableName)
+                        SET \(Column.isPinned) = ?,
+                            \(Column.entryRevision) = \(Column.entryRevision) + 1,
+                            \(Column.updatedAt) = ?
+                        WHERE \(Column.id) = ?
+                        """,
+                    arguments: [operation.type == .pin, now, operation.entryID.uuidString.lowercased()]
+                )
+            }
+            let updated = try requireEntry(operation.entryID, in: db)
+            return HistorySyncOperationResult(opID: operation.opID, status: .applied, entry: HistorySyncEntry(updated))
+
+        case .delete:
+            guard let entry = existing else {
+                return HistorySyncOperationResult(opID: operation.opID, status: .alreadyApplied, entry: nil)
+            }
+            guard let base = operation.baseRevision else {
+                return HistorySyncOperationResult(opID: operation.opID, status: .invalid, entry: HistorySyncEntry(entry))
+            }
+            guard base == entry.entryRevision else {
+                return HistorySyncOperationResult(opID: operation.opID, status: .conflict, entry: HistorySyncEntry(entry))
+            }
+            try db.execute(
+                sql: "DELETE FROM \(tableName) WHERE \(Column.id) = ?",
+                arguments: [operation.entryID.uuidString.lowercased()]
+            )
+            return HistorySyncOperationResult(opID: operation.opID, status: .applied, entry: nil)
+        }
     }
 
     // MARK: - Migration and schema diagnostics
@@ -808,6 +1237,53 @@ actor HistoryStore {
                     .defaults(to: DictationMetricEvent.currentSchemaVersion)
             }
             _ = try backfillLegacyMetrics(in: db)
+        }
+
+        migrator.registerMigration(unifiedMigrationIdentifier) { db in
+            try db.alter(table: tableName) { table in
+                table.add(column: Column.sourceKind, .text)
+                    .notNull()
+                    .defaults(to: HistorySourceKind.desktop.rawValue)
+                table.add(column: Column.remoteRoute, .text)
+                table.add(column: Column.cleanupBackend, .text)
+                table.add(column: Column.userEditedText, .text)
+                table.add(column: Column.isPinned, .boolean).notNull().defaults(to: false)
+                table.add(column: Column.entryRevision, .integer).notNull().defaults(to: 1)
+                table.add(column: Column.updatedAt, .datetime)
+            }
+            try db.execute(
+                sql: """
+                    UPDATE \(tableName)
+                    SET \(Column.updatedAt) = \(Column.timestamp)
+                    WHERE \(Column.updatedAt) IS NULL
+                    """
+            )
+            try db.create(index: "\(tableName)_pinned_timestamp", on: tableName, columns: [Column.isPinned, Column.timestamp])
+
+            try db.create(table: syncStateTableName) { table in
+                table.column(SyncColumn.id, .integer).primaryKey().check { $0 == 1 }
+                table.column(SyncColumn.globalRevision, .integer).notNull().defaults(to: 1)
+            }
+            try db.execute(
+                sql: "INSERT INTO \(syncStateTableName) (\(SyncColumn.id), \(SyncColumn.globalRevision)) VALUES (1, 1)"
+            )
+            try db.create(table: syncOperationsTableName) { table in
+                table.column(SyncColumn.opID, .text).primaryKey()
+                table.column(SyncColumn.entryID, .text).notNull()
+                table.column(SyncColumn.status, .text).notNull()
+                table.column(SyncColumn.appliedAt, .datetime).notNull()
+            }
+
+            try db.drop(table: searchTableName)
+            try db.dropFTS5SynchronizationTriggers(forTable: searchTableName)
+            try db.create(virtualTable: searchTableName, using: FTS5()) { table in
+                table.synchronize(withTable: tableName)
+                table.column(Column.rawText)
+                table.column(Column.polishedText)
+                table.column(Column.userEditedText)
+                table.column(Column.destinationDisplayName)
+                table.column(Column.destinationBundleIdentifier)
+            }
         }
 
         return migrator
@@ -1122,6 +1598,14 @@ actor HistoryStore {
         let candidatesJSON: String = row[Column.unrecognizedCommandCandidatesJSON]
         let candidates = try decodeCandidates(candidatesJSON)
 
+        let storedSourceKind: String = row[Column.sourceKind]
+        guard let sourceKind = HistorySourceKind(rawValue: storedSourceKind) else {
+            throw HistoryStoreError.invalidStoredValue(
+                column: Column.sourceKind,
+                value: storedSourceKind
+            )
+        }
+
         return HistoryEntry(
             id: id,
             timestamp: row[Column.timestamp],
@@ -1144,7 +1628,14 @@ actor HistoryStore {
             refinerBackend: row[Column.refinerBackend],
             refinementOutcome: row[Column.refinementOutcome],
             validationFailureKind: row[Column.validationFailureKind],
-            stopToPasteLatency: row[Column.stopToPasteLatency]
+            stopToPasteLatency: row[Column.stopToPasteLatency],
+            sourceKind: sourceKind,
+            remoteRoute: row[Column.remoteRoute],
+            cleanupBackend: row[Column.cleanupBackend],
+            userEditedText: row[Column.userEditedText],
+            isPinned: row[Column.isPinned],
+            entryRevision: row[Column.entryRevision],
+            updatedAt: (row[Column.updatedAt] as Date?) ?? row[Column.timestamp]
         )
     }
 

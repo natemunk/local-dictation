@@ -1,0 +1,4 @@
+MAC_ORIGIN_URL=https://mac-origin.example.com
+MAC_ACCESS_CLIENT_ID=replace-with-origin-service-token-id
+MAC_ACCESS_CLIENT_SECRET=replace-with-origin-service-token-secret
+STREAM_TICKET_SECRET=replace-with-at-least-32-random-characters

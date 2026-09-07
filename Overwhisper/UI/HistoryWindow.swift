@@ -55,6 +55,8 @@ private final class HistoryViewModel: ObservableObject {
     @Published var selection: UUID?
     @Published var query = ""
     @Published var errorMessage: String?
+    @Published var editDraft = ""
+    @Published var isEditing = false
 
     let store: HistoryStore
     let onCopy: (String) -> Void
@@ -73,6 +75,70 @@ private final class HistoryViewModel: ObservableObject {
         self.onCopy = onCopy
         self.onRepaste = onRepaste
         self.onAddVocabularyCorrection = onAddVocabularyCorrection
+    }
+
+    func beginEditing() {
+        guard let entry = selectedEntry else { return }
+        editDraft = entry.userEditedText ?? entry.displayText
+        isEditing = true
+    }
+
+    func cancelEditing() {
+        isEditing = false
+        editDraft = ""
+    }
+
+    func saveEdit() {
+        guard let selection else { return }
+        let text = editDraft
+        Task { @MainActor [weak self, store] in
+            do {
+                _ = try await store.setUserEditedText(id: selection, text: text)
+                guard let self else { return }
+                self.cancelEditing()
+                self.reload()
+            } catch {
+                self?.handle(error)
+            }
+        }
+    }
+
+    func revertEdit() {
+        guard let selection else { return }
+        Task { @MainActor [weak self, store] in
+            do {
+                _ = try await store.setUserEditedText(id: selection, text: nil)
+                guard let self else { return }
+                self.cancelEditing()
+                self.reload()
+            } catch {
+                self?.handle(error)
+            }
+        }
+    }
+
+    func togglePin(_ entry: HistoryEntry) {
+        let pinned = !entry.isPinned
+        Task { @MainActor [weak self, store] in
+            do {
+                _ = try await store.setPinned(id: entry.id, pinned)
+                self?.reload()
+            } catch {
+                self?.handle(error)
+            }
+        }
+    }
+
+    /// A concurrent Mac or device change is recoverable: reload and let the
+    /// user retry rather than reporting a revision number they never saw.
+    private func handle(_ error: Error) {
+        if let storeError = error as? HistoryStoreError,
+           case .revisionConflict = storeError {
+            errorMessage = "This entry changed; please try again."
+            reload()
+            return
+        }
+        errorMessage = error.localizedDescription
     }
 
     var selectedEntry: HistoryEntry? {
@@ -145,27 +211,16 @@ private struct HistoryView: View {
     var body: some View {
         NavigationSplitView {
             VStack(spacing: 0) {
-                TextField("Search raw and polished text", text: $viewModel.query)
+                TextField("Search raw, polished, and edited text", text: $viewModel.query)
                     .textFieldStyle(.roundedBorder)
                     .padding(10)
                     .onSubmit { viewModel.reload() }
                     .onChange(of: viewModel.query) { _, _ in viewModel.reload() }
 
                 List(viewModel.entries, selection: $viewModel.selection) { entry in
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(Self.preview(entry.deliveredText))
-                            .lineLimit(2)
-                        HStack {
-                            Text(entry.timestamp, style: .relative)
-                            Text(entry.destinationDisplayName ?? "Unknown app")
-                            Spacer()
-                            Text(entry.deliveryStatus.rawValue.replacingOccurrences(of: "_", with: " "))
-                        }
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    }
-                    .tag(entry.id)
-                    .padding(.vertical, 3)
+                    row(entry)
+                        .tag(entry.id)
+                        .padding(.vertical, 3)
                 }
             }
             .navigationSplitViewColumnWidth(min: 260, ideal: 330)
@@ -176,6 +231,7 @@ private struct HistoryView: View {
                 ContentUnavailableView("No Dictation Selected", systemImage: "waveform")
             }
         }
+        .onChange(of: viewModel.selection) { _, _ in viewModel.cancelEditing() }
         .toolbar {
             ToolbarItemGroup {
                 Button("Delete Entry", systemImage: "trash", action: viewModel.deleteSelected)
@@ -209,22 +265,83 @@ private struct HistoryView: View {
         }
     }
 
+    private func row(_ entry: HistoryEntry) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                if entry.isPinned {
+                    Image(systemName: "pin.fill")
+                        .font(.caption2)
+                        .foregroundStyle(Color.orange)
+                }
+                Text(Self.preview(entry.displayText))
+                    .lineLimit(2)
+            }
+            HStack(spacing: 6) {
+                Text(entry.timestamp, style: .relative)
+                Text(Self.sourceLabel(entry.sourceKind))
+                if let route = Self.routeLabel(entry.remoteRoute) {
+                    Text(route)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(.quaternary, in: Capsule())
+                }
+                if entry.sourceKind == .desktop {
+                    Text(entry.destinationDisplayName ?? "Unknown app")
+                        .lineLimit(1)
+                }
+                Spacer()
+                Text(Self.statusLabel(entry.deliveryStatus))
+            }
+            .font(.caption2)
+            .foregroundStyle(Color.secondary)
+        }
+    }
+
+    private static func statusLabel(_ status: HistoryDeliveryStatus) -> String {
+        status.rawValue.replacingOccurrences(of: "_", with: " ")
+    }
+
     private func entryDetail(_ entry: HistoryEntry) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(entry.timestamp.formatted(date: .abbreviated, time: .standard))
                         .font(.headline)
-                    Text("\(entry.destinationDisplayName ?? "Unknown app") · \(entry.mode.rawValue.capitalized)")
+                    Text(Self.detailSubtitle(entry))
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    if entry.userEditedText != nil {
+                        Text("Edited by you")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 Spacer()
-                Button("Copy") { viewModel.onCopy(entry.deliveredText) }
-                Button("Repaste Here") { viewModel.onRepaste(entry.deliveredText) }
+                Button("Copy") { viewModel.onCopy(entry.displayText) }
+                Button("Repaste Here") { viewModel.onRepaste(entry.displayText) }
                     .buttonStyle(.borderedProminent)
                 Button("Add Vocabulary Correction…") {
                     viewModel.onAddVocabularyCorrection(entry)
+                }
+            }
+
+            HStack(spacing: 10) {
+                Button(entry.isPinned ? "Unpin" : "Pin", systemImage: "pin") {
+                    viewModel.togglePin(entry)
+                }
+                Text("Pinned entries are kept until you unpin or delete them.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if viewModel.isEditing {
+                    Button("Cancel", action: viewModel.cancelEditing)
+                    Button("Save", action: viewModel.saveEdit)
+                        .keyboardShortcut(.defaultAction)
+                } else {
+                    Button("Edit", systemImage: "pencil", action: viewModel.beginEditing)
+                    if entry.userEditedText != nil {
+                        Button("Revert to Original", action: viewModel.revertEdit)
+                    }
                 }
             }
 
@@ -234,9 +351,28 @@ private struct HistoryView: View {
                     .foregroundStyle(.orange)
             }
 
-            HSplitView {
-                transcriptPane(title: "Raw", text: entry.rawText)
-                transcriptPane(title: "Polished / delivered", text: entry.polishedText ?? entry.rawText)
+            if viewModel.isEditing {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Your edit")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    TextEditor(text: $viewModel.editDraft)
+                        .font(.body)
+                        .frame(minHeight: 180)
+                        .padding(4)
+                        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+                    Text("Saving keeps the raw and polished transcripts unchanged. Clearing the field restores the original text.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                HSplitView {
+                    transcriptPane(title: "Raw", text: entry.rawText)
+                    transcriptPane(title: "Polished / delivered", text: entry.deliveredText)
+                    if let edited = entry.userEditedText {
+                        transcriptPane(title: "Edited", text: edited)
+                    }
+                }
             }
 
             HStack(spacing: 16) {
@@ -252,6 +388,34 @@ private struct HistoryView: View {
             .foregroundStyle(.secondary)
         }
         .padding(18)
+    }
+
+    private static func detailSubtitle(_ entry: HistoryEntry) -> String {
+        var parts = [sourceLabel(entry.sourceKind)]
+        if let route = routeLabel(entry.remoteRoute) {
+            parts.append(route)
+        }
+        if entry.sourceKind == .desktop {
+            parts.append(entry.destinationDisplayName ?? "Unknown app")
+        }
+        parts.append(entry.mode.rawValue.capitalized)
+        return parts.joined(separator: " · ")
+    }
+
+    private static func sourceLabel(_ kind: HistorySourceKind) -> String {
+        switch kind {
+        case .desktop: "Desktop"
+        case .iphoneShortcut: "Shortcut"
+        case .iphonePWA: "PWA"
+        }
+    }
+
+    private static func routeLabel(_ route: String?) -> String? {
+        switch route {
+        case "mac_local": "Mac"
+        case "cloud_fallback": "Cloud"
+        default: nil
+        }
     }
 
     private func transcriptPane(title: String, text: String) -> some View {
