@@ -301,16 +301,18 @@ Three distinct service tokens:
 2. PWA → gateway (`dictate.natemunk.com/v1`, Service Auth policy B)
 3. Worker → Mac origin (`dictate-origin.natemunk.com`, Service Auth policy C, Worker secrets)
 
-The gateway Access application is path-scoped to `dictate.natemunk.com/v1` so `/app/*` is
-public. `/stream` is also publicly reachable because browser WebSockets cannot attach the Access
-service-token headers; it accepts only the short-lived HMAC ticket minted under protected `/v1`.
+The gateway Access application is path-scoped to `dictate.natemunk.com/v1`. A separate PWA Shell
+Bypass application has the two explicit destinations `dictate.natemunk.com/app` and
+`dictate.natemunk.com/stream`, which keeps broader wildcard Access applications from intercepting
+those browser routes. `/stream` must be publicly reachable because browser WebSockets cannot attach
+the Access service-token headers; it accepts only the short-lived HMAC ticket minted under protected `/v1`.
 Setup verifies, in order: (a) anonymous `/app/` returns 200 with a
 `Content-Security-Policy` header; (b) anonymous `/v1/healthz` is not 200; (c) anonymous
 origin `/healthz` is not 200; (d) the Shortcut token reaches `/v1/healthz`; (e) the PWA token
 reaches `/v1/healthz`; (f) the origin token does NOT reach `/v1/healthz`; (g) the Shortcut
 token does NOT reach origin `/healthz`; (h) the PWA token does NOT reach origin `/healthz`;
-(i) the origin token reaches origin `/healthz`; (j) `/stream` refuses a request without a valid
-ticket. The signing secret exists only as a Worker secret and rotates independently of all three
+(i) the origin token reaches origin `/healthz`; (j) `/stream` reaches the Worker's own guard and
+refuses a request without a valid ticket. The signing secret exists only as a Worker secret and rotates independently of all three
 Access tokens.
 
 References: [self-hosted applications](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/self-hosted-public-app/),

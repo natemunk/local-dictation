@@ -64,6 +64,23 @@ response_headers() {
   print -r -- "$headers"
 }
 
+response_body() {
+  local target_url=$1
+  local body
+  local target_host
+  local target_ip
+  body=$(/usr/bin/curl --silent --show-error --max-time 8 "$target_url" 2>/dev/null || true)
+  if [[ -z "$body" && "$target_url" == https://* ]]; then
+    target_host=${${target_url#*://}%%/*}
+    target_ip=$(dig +short A "$target_host" | /usr/bin/head -n 1)
+    if [[ "$target_ip" == <->.<->.<->.<-> ]]; then
+      body=$(/usr/bin/curl --resolve "$target_host:443:$target_ip" \
+        --silent --show-error --max-time 8 "$target_url" 2>/dev/null || true)
+    fi
+  fi
+  print -r -- "$body"
+}
+
 access_http_status() {
   local target_url=$1
   local client_id=$2
@@ -124,7 +141,7 @@ print "This creates a named outbound-only Cloudflare Tunnel, deploys the gateway
 print "Worker, and installs a per-user launch agent. It never creates a Quick"
 print "Tunnel and never writes a service token to Git."
 print ""
-print "The Worker serves two different kinds of traffic:"
+print "The Worker serves three different kinds of traffic:"
 print "  • https://$GATEWAY_HOST/app/  — the Dictation Inbox PWA shell."
 print "    Public, credential-free static assets. It must load anonymously."
 print "  • https://$GATEWAY_HOST/v1/*  — transcription and history APIs."
@@ -146,12 +163,22 @@ print "     a DIFFERENT service token:"
 print "       • Policy A — Shortcut token (used by Apple Shortcuts)"
 print "       • Policy B — PWA token (pasted into the Dictation Inbox settings)"
 print ""
-print "  2. Local Dictation Mac Origin"
+print "  2. Local Dictation PWA Shell"
+print "     Application destinations:"
+print "       • $GATEWAY_HOST/app"
+print "       • $GATEWAY_HOST/stream"
+print "     Give this application one Bypass policy whose Include rule is Everyone."
+print "     These explicit path destinations are required when a broader or wildcard"
+print "     Access application also matches $GATEWAY_HOST. The Worker still rejects"
+print "     every unsigned, expired, malformed, or cross-origin stream request."
+print ""
+print "  3. Local Dictation Mac Origin"
 print "     Application domain: $ORIGIN_HOST (no path scope)."
 print "     One Service Auth policy backed by a THIRD service token, used only"
 print "     by the Worker to reach this Mac."
 print ""
-print "Policy action: Service Auth; Include rule: Service Token."
+print "Gateway/origin policy action: Service Auth; Include rule: Service Token."
+print "PWA shell policy action: Bypass; Include rule: Everyone."
 print "Docs: https://developers.cloudflare.com/cloudflare-one/applications/configure-apps/self-hosted-public-app/"
 print "      https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/"
 print ""
@@ -160,9 +187,9 @@ print "add the Shortcut token to Apple Shortcuts and the PWA token to the PWA."
 print "Only the origin token is persisted, as Worker secrets."
 print ""
 print "If your Cloudflare login cannot administer Zero Trust, stop here and ask an"
-print "account administrator to create those exact apps, paths, policies, and"
+print "account administrator to create those exact apps, destinations, policies, and"
 print "tokens. Authentication will not be weakened as a workaround."
-print -n "Type ACCESS READY after both applications and all three policies exist: "
+print -n "Type ACCESS READY after all three applications and four policies exist: "
 read -r ACCESS_CONFIRMATION
 [[ "$ACCESS_CONFIRMATION" == "ACCESS READY" ]] || fail "Cloudflare Access was not confirmed."
 
@@ -306,8 +333,8 @@ done
 print "Running Worker verification…"
 (cd "$WORKER_ROOT" && npm test && npm run typecheck && npm run cf-typegen:check)
 
-print "Deploying behind the Access application you confirmed above…"
-(cd "$WORKER_ROOT" && npx wrangler deploy)
+print "Deploying behind the Access applications you confirmed above…"
+(cd "$WORKER_ROOT" && npx wrangler deploy --keep-vars --strict)
 
 print "Storing the dedicated Worker-to-origin Access token."
 print -rn -- "$ORIGIN_ACCESS_CLIENT_ID" | \
@@ -325,7 +352,7 @@ print "Verifying the deployed Access posture (ten checks)…"
 # (a) The PWA shell is public and carries a Content-Security-Policy.
 APP_STATUS=$(http_status "https://$GATEWAY_HOST/app/")
 [[ "$APP_STATUS" == "200" ]] || fail \
-  "check (a) failed: anonymous GET https://$GATEWAY_HOST/app/ returned $APP_STATUS instead of 200. The gateway Access application must be path-scoped to $GATEWAY_HOST/v1 so the PWA shell stays public."
+  "check (a) failed: anonymous GET https://$GATEWAY_HOST/app/ returned $APP_STATUS instead of 200. Confirm the gateway app is scoped to /v1 and the PWA Shell Bypass app includes /app."
 APP_HEADERS=$(response_headers "https://$GATEWAY_HOST/app/")
 [[ "${APP_HEADERS:l}" == *content-security-policy:* ]] || fail \
   "check (a) failed: https://$GATEWAY_HOST/app/ returned 200 but no Content-Security-Policy header. The PWA must not be served without a strict CSP; redeploy the Worker before continuing."
@@ -388,10 +415,13 @@ ORIGIN_TO_ORIGIN=$(access_http_status \
 [[ "$ORIGIN_TO_ORIGIN" == "200" ]] || fail \
   "check (i) failed: the origin token returned $ORIGIN_TO_ORIGIN from https://$ORIGIN_HOST/healthz instead of 200. Confirm the origin Service Auth policy includes that token and that Local Dictation is still running."
 
-# (j) The public WebSocket route must reject requests without a signed ticket.
+# (j) The public WebSocket route must reach the Worker's own ticket guard. A
+# broad or wildcard Access application can otherwise return a 302/403 that looks
+# like refusal while preventing every real browser WebSocket from connecting.
 STREAM_WITHOUT_TICKET=$(http_status "https://$GATEWAY_HOST/stream")
-[[ "$STREAM_WITHOUT_TICKET" != "200" && "$STREAM_WITHOUT_TICKET" != "101" ]] || fail \
-  "check (j) failed: the public live-audio route accepted a request without a short-lived signed ticket. Disable the route and redeploy before use."
+STREAM_WITHOUT_TICKET_BODY=$(response_body "https://$GATEWAY_HOST/stream")
+[[ "$STREAM_WITHOUT_TICKET" == "403" && "$STREAM_WITHOUT_TICKET_BODY" == *STREAM_ORIGIN_REFUSED* ]] || fail \
+  "check (j) failed: the live-audio request did not reach the Worker's ticket guard (HTTP $STREAM_WITHOUT_TICKET). Add $GATEWAY_HOST/stream to the Local Dictation PWA Shell Bypass application; do not expose /v1."
 
 unset SHORTCUT_ACCESS_CLIENT_ID SHORTCUT_ACCESS_CLIENT_SECRET
 unset PWA_ACCESS_CLIENT_ID PWA_ACCESS_CLIENT_SECRET

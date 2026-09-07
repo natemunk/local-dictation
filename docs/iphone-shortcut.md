@@ -19,8 +19,9 @@ The Shortcut, the PWA, and the Worker use three different Cloudflare Access serv
 ## One-time Mac and Cloudflare setup
 
 1. Install `cloudflared` and Node.js 20 or newer.
-2. In Cloudflare Zero Trust, create two Self-hosted Access applications:
+2. In Cloudflare Zero Trust, create three Self-hosted Access applications:
    - `Local Dictation iPhone Gateway` for `dictate.natemunk.com` with the application **path set to `/v1`**. Path scoping is what keeps the public PWA shell at `/app/*` reachable without credentials while every API route stays protected. Give this one application two Service Auth policies, each backed by a different service token: policy A for the Shortcut, policy B for the PWA.
+   - `Local Dictation PWA Shell` with two public-hostname destinations: `dictate.natemunk.com/app` and `dictate.natemunk.com/stream`. Give it one Bypass policy with an Everyone include rule. The explicit destinations are required when a broader or wildcard Access application matches `dictate.natemunk.com`; `/stream` remains protected by its 30-second same-origin signed ticket inside the Worker.
    - `Local Dictation Mac Origin` for `dictate-origin.natemunk.com`, with one Service Auth policy backed by a third service token used only by the Worker.
 3. Keep the Shortcut token for this document and the PWA token for [iphone-pwa.md](iphone-pwa.md). Setup requests all three pairs with hidden secret input so it can verify every policy; it persists only the origin pair as encrypted Worker secrets and does not save either gateway pair.
 4. Open Local Dictation -> Settings -> iPhone, enable the localhost endpoint, and choose **Test Local Listener**. Keep Local Dictation running during setup. Requiring a live local `/healthz` response makes the final anonymous-origin probe conclusive instead of mistaking an offline origin for Access protection.
@@ -33,7 +34,7 @@ The Shortcut, the PWA, and the Worker use three different Cloudflare Access serv
 6. Confirm that Settings still reports a ready listener, tunnel, and model.
 7. If you want the iPhone and the Mac to share one history, enable Settings → iPhone → **Unified iPhone History** and read the disclosure it shows.
 
-The setup command creates or reuses the named `local-dictation-iphone` tunnel, installs a per-user launch agent, routes the protected origin hostname, verifies the pinned Worker package, stores the origin token and a random stream-ticket signing secret as Worker secrets, and deploys the custom gateway hostname. It then runs ten checks: the PWA shell must load anonymously with a Content-Security-Policy header, gateway `/v1/healthz` and origin `/healthz` must both reject anonymous requests, each gateway token alone must reach gateway `/v1/healthz`, the origin token must not authenticate to the gateway, neither gateway token may authenticate to the origin, the origin token must reach origin `/healthz`, and public `/stream` must refuse a ticketless request. Setup stops with the failing check named rather than completing a weak configuration.
+The setup command creates or reuses the named `local-dictation-iphone` tunnel, installs a per-user launch agent, routes the protected origin hostname, verifies the pinned Worker package, stores the origin token and a random stream-ticket signing secret as Worker secrets, and deploys the custom gateway hostname. It then runs ten checks: the PWA shell must load anonymously with a Content-Security-Policy header, gateway `/v1/healthz` and origin `/healthz` must both reject anonymous requests, each gateway token alone must reach gateway `/v1/healthz`, the origin token must not authenticate to the gateway, neither gateway token may authenticate to the origin, the origin token must reach origin `/healthz`, and public `/stream` must reach the Worker's own ticket guard and refuse the request. Setup stops with the failing check named rather than completing a weak configuration.
 
 ## Install the prebuilt Shortcut (recommended)
 

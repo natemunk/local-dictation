@@ -425,9 +425,9 @@ struct SettingsView: View {
 
     private var iphoneTunnelStatus: String {
         switch appState.iphoneEndpointRuntime.tunnelReady {
-        case true: "Ready"
-        case false: "Unavailable"
-        case nil: "Not checked"
+        case .some(true): "Ready"
+        case .some(false): "Unavailable"
+        case .none: "Not checked"
         }
     }
 
