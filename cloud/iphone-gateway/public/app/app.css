@@ -404,3 +404,11 @@ textarea {
   font-size: 16px;
   z-index: 20;
 }
+
+.global-controls { max-width: 680px; margin: 0 auto; padding: 0 20px; }
+.global-controls > section:not([hidden]) { margin: 12px 0; }
+
+.global-controls.active-sheet { position: fixed; top: 0; left: 0; right: 0; z-index: 30; padding-top: var(--top); background: var(--bg); }
+.sheet.with-recording { top: calc(var(--top) + 140px); }
+#copy-recovery { color: var(--text); background: var(--bg); border: 0; border-radius: 20px; padding: 20px; width: min(90vw, 600px); max-height: 85dvh; overflow: auto; }
+#copy-recovery::backdrop { background: rgb(0 0 0 / 40%); }

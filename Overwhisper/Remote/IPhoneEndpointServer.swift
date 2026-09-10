@@ -300,7 +300,7 @@ actor IPhoneEndpointServer {
                             failure: kind,
                             latencyMilliseconds: Self.elapsedMilliseconds(since: startedAt)
                         ))
-                    case .ready, .partial:
+                    case .ready, .partial, .audioReceived, .previewUnavailable:
                         break
                     }
                 }

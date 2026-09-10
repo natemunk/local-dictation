@@ -248,6 +248,77 @@ export async function enqueueOperation(db, operation) {
   }
 }
 
+/** Persist a successful result and its immutable import in one transaction. */
+export async function putPendingWithOperation(db, entry, operation) {
+  const transaction = db.transaction([STORE_PENDING, STORE_OPS], "readwrite");
+  const ops = transaction.objectStore(STORE_OPS);
+  const cursor = await promisify(ops.index("by_seq").openCursor(null, "prev"));
+  transaction.objectStore(STORE_PENDING).put(entry);
+  if (operation) ops.put({ ...operation, seq: cursor === null ? 1 : cursor.value.seq + 1 });
+  await transactionDone(transaction);
+}
+
+/** Queue intent atomically. Later actions wait for the preceding acknowledgement. */
+export async function queueEntryMutation(db, entry, operation) {
+  const transaction = db.transaction([STORE_PENDING, STORE_ENTRIES, STORE_OPS], "readwrite");
+  const ops = transaction.objectStore(STORE_OPS);
+  const all = await promisify(ops.getAll());
+  const previous = all.filter(row => row.entry_id === entry.id).sort((a, b) => b.seq - a.seq)[0];
+  const known = await promisify(transaction.objectStore(STORE_ENTRIES).get(entry.id));
+  const seq = all.reduce((max, row) => Math.max(max, row.seq), 0) + 1;
+  ops.put({ ...operation, seq, after_op_id: previous?.op_id ?? null,
+    base_revision: operation.base_revision ?? (previous ? null : known?.entry_revision ?? null) });
+  // Keep the base entry available for a pending delete/conflict; rendering
+  // overlays the operations instead of destroying original text or cache rows.
+  const pending = transaction.objectStore(STORE_PENDING);
+  const existing = await promisify(pending.get(entry.id));
+  if (existing === undefined && entry.entry_revision === 0) pending.put(entry);
+  await transactionDone(transaction);
+}
+
+/** Acknowledgement and dependent revision advancement must survive together. */
+export async function settleOperation(db, operation, result) {
+  const transaction = db.transaction([STORE_OPS, STORE_PENDING, STORE_ENTRIES], "readwrite");
+  const ops = transaction.objectStore(STORE_OPS);
+  const pending = transaction.objectStore(STORE_PENDING);
+  const entries = transaction.objectStore(STORE_ENTRIES);
+  if (result.status === "conflict" || result.status === "invalid") {
+    const current = await promisify(ops.get(operation.op_id));
+    if (current) ops.put({ ...current, conflict: 1, server_entry: result.entry ?? null,
+      failure: result.status === "invalid" ? "invalid" : null });
+  } else {
+    ops.delete(operation.op_id);
+    const all = await promisify(ops.getAll());
+    for (const row of all) {
+      if (row.after_op_id !== operation.op_id) continue;
+      ops.put({ ...row, after_op_id: null,
+        base_revision: result.entry?.entry_revision ?? row.base_revision });
+    }
+    if (result.status === "missing" || operation.type === "delete") {
+      pending.delete(operation.entry_id);
+      entries.delete(operation.entry_id);
+    } else if (result.entry) {
+      entries.put(result.entry);
+      pending.delete(operation.entry_id);
+    } else if (operation.type === "import") {
+      const local = await promisify(pending.get(operation.entry_id));
+      if (local) pending.put({ ...local, local_state: "awaiting_sync" });
+    }
+  }
+  await transactionDone(transaction);
+}
+
+export async function discardEntryOperations(db, entryId, serverEntry) {
+  const transaction = db.transaction([STORE_OPS, STORE_ENTRIES, STORE_PENDING], "readwrite");
+  const ops = transaction.objectStore(STORE_OPS);
+  const all = await promisify(ops.getAll());
+  for (const row of all) if (row.entry_id === entryId) ops.delete(row.op_id);
+  transaction.objectStore(STORE_PENDING).delete(entryId);
+  if (serverEntry) transaction.objectStore(STORE_ENTRIES).put(serverEntry);
+  else transaction.objectStore(STORE_ENTRIES).delete(entryId);
+  await transactionDone(transaction);
+}
+
 /** The whole queue in creation order. */
 export async function listOperations(db) {
   const rows = await readAll(db, STORE_OPS);
@@ -321,8 +392,8 @@ export async function getAllSettings(db) {
 }
 
 /**
- * Drop every cached transcript on this phone. The Mac is untouched and the
- * operation queue survives so unsynchronised imports are not lost.
+ * Refresh the synchronized snapshot. Pending results, credentials and
+ * operations survive; use clearAllDeviceData for an explicit device reset.
  */
 export async function clearLocalCache(db) {
   const transaction = db.transaction(
@@ -331,9 +402,17 @@ export async function clearLocalCache(db) {
   );
   transaction.objectStore(STORE_ENTRIES).clear();
   transaction.objectStore(STORE_STAGING).clear();
-  transaction.objectStore(STORE_PENDING).clear();
+  // Pending results may not yet exist on the Mac. A cache refresh preserves them.
   const settings = transaction.objectStore(STORE_SETTINGS);
   settings.delete(SETTING_SYNCED_REVISION);
   settings.delete(SETTING_LAST_SYNC_AT);
+  await transactionDone(transaction);
+}
+
+/** Explicit device reset; separate from a nondestructive cache refresh. */
+export async function clearAllDeviceData(db) {
+  const names = [STORE_ENTRIES, STORE_STAGING, STORE_PENDING, STORE_OPS, STORE_SETTINGS];
+  const transaction = db.transaction(names, "readwrite");
+  for (const name of names) transaction.objectStore(name).clear();
   await transactionDone(transaction);
 }

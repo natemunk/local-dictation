@@ -432,6 +432,7 @@ function joinChunks(chunks: readonly Uint8Array[], total: number): Uint8Array {
 async function readBoundedBytes(
   stream: ReadableStream<Uint8Array> | null,
   limit: number,
+  signal?: AbortSignal,
 ): Promise<Uint8Array | undefined> {
   if (stream === null) return new Uint8Array(0);
 
@@ -439,10 +440,14 @@ async function readBoundedBytes(
   const chunks: Uint8Array[] = [];
   let total = 0;
   let exceeded = false;
+  const cancel = () => { void reader.cancel("request_timeout").catch(() => {}); };
+  signal?.addEventListener("abort", cancel, { once: true });
 
   try {
     while (true) {
+      if (signal?.aborted) throw new DOMException("Request timed out", "AbortError");
       const { done, value } = await reader.read();
+      if (signal?.aborted) throw new DOMException("Request timed out", "AbortError");
       if (done) break;
       if (value === undefined) continue;
 
@@ -455,6 +460,7 @@ async function readBoundedBytes(
       chunks.push(value);
     }
   } finally {
+    signal?.removeEventListener("abort", cancel);
     reader.releaseLock();
   }
 
@@ -466,12 +472,13 @@ function declaredLengthExceeds(response: Response, limit: number): boolean {
   return declaredLength !== null && DIGITS_PATTERN.test(declaredLength) && Number(declaredLength) > limit;
 }
 
-async function parseBoundedJson(response: Response, limit: number): Promise<unknown> {
+async function parseBoundedJson(response: Response, limit: number, signal?: AbortSignal): Promise<unknown> {
   if (declaredLengthExceeds(response, limit)) {
     throw new Error("response_too_large");
   }
 
-  const bytes = await readStreamWithLimit(response.body, limit);
+  const bytes = await readBoundedBytes(response.body, limit, signal);
+  if (bytes === undefined) throw new Error("response_too_large");
   return JSON.parse(new TextDecoder().decode(bytes));
 }
 
@@ -555,17 +562,36 @@ function isConfiguredOrigin(config: MacOriginConfig): URL | undefined {
   return origin;
 }
 
-async function requestWithTimeout(
+async function requestWithTimeout<T>(
   request: Request,
   fetcher: RequestFetcher,
   timeoutMs: number,
-): Promise<Response> {
+  consume: (response: Response, signal: AbortSignal) => Promise<T>,
+): Promise<T> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      controller.abort();
+      reject(new DOMException("Request timed out", "AbortError"));
+    }, timeoutMs);
+  });
   const timedRequest = new Request(request, { signal: controller.signal });
-
+  // The same deadline owns headers AND bounded body consumption. The race also
+  // bounds adapters which ignore AbortSignal; late responses are never consumed.
+  const operation = (async () => {
+    const response = await fetcher(timedRequest);
+    try {
+      if (controller.signal.aborted) throw new DOMException("Request timed out", "AbortError");
+      return await consume(response, controller.signal);
+    } finally {
+      if (response.body !== null && !response.body.locked) {
+        void response.body.cancel().catch(() => {});
+      }
+    }
+  })();
   try {
-    return await fetcher(timedRequest);
+    return await Promise.race([operation, deadline]);
   } finally {
     clearTimeout(timeout);
   }
@@ -575,14 +601,14 @@ function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
 }
 
-async function rejectedOriginReason(response: Response): Promise<MacFallbackReason> {
+async function rejectedOriginReason(response: Response, signal: AbortSignal): Promise<MacFallbackReason> {
   if (response.status === 409) return "origin_busy";
   if (response.status === 504) return "origin_timeout";
   if (response.status === 401 || response.status === 403) return "origin_authentication_failed";
   if ([400, 413, 415, 422].includes(response.status)) return "origin_invalid_request";
   if (response.status === 503) {
     try {
-      const body = await parseBoundedJson(response, MAX_HEALTH_JSON_BYTES);
+      const body = await parseBoundedJson(response, MAX_HEALTH_JSON_BYTES, signal);
       if (isRecord(body) && body.error === "remote_preempted") return "origin_preempted";
     } catch {
       // A rejected origin body is diagnostic only; the fixed fallback category is sufficient.
@@ -600,35 +626,31 @@ export function createMacTranscriber(config: MacOriginConfig, fetcher: RequestFe
     const healthUrl = new URL(ORIGIN_HEALTH_PATH, origin);
     const healthHeaders = accessHeaders(config);
     healthHeaders.set("X-Request-ID", input.requestId);
-    let healthResponse: Response;
     try {
-      healthResponse = await requestWithTimeout(
+      const reason = await requestWithTimeout<MacFallbackReason | undefined>(
         new Request(healthUrl, {
           method: "GET",
           headers: healthHeaders,
         }),
         fetcher,
         config.healthTimeoutMs ?? MAC_HEALTH_TIMEOUT_MS,
+        async (response, signal) => {
+          if (response.status === 401 || response.status === 403) return "health_authentication_failed";
+          if (!response.ok) return "health_rejected";
+          try {
+            const health = await parseBoundedJson(response, MAX_HEALTH_JSON_BYTES, signal);
+            if (isRecord(health) && health.busy === true) return "health_busy";
+            if (!isRecord(health) || health.ready !== true) return "health_not_ready";
+            return undefined;
+          } catch (error) {
+            if (isAbortError(error)) throw error;
+            return "health_not_ready";
+          }
+        },
       );
+      if (reason !== undefined) return { ok: false, reason };
     } catch (error) {
       return { ok: false, reason: isAbortError(error) ? "health_timeout" : "health_unreachable" };
-    }
-
-    if (healthResponse.status === 401 || healthResponse.status === 403) {
-      return { ok: false, reason: "health_authentication_failed" };
-    }
-    if (!healthResponse.ok) return { ok: false, reason: "health_rejected" };
-
-    try {
-      const health = await parseBoundedJson(healthResponse, MAX_HEALTH_JSON_BYTES);
-      if (isRecord(health) && health.busy === true) {
-        return { ok: false, reason: "health_busy" };
-      }
-      if (!isRecord(health) || health.ready !== true) {
-        return { ok: false, reason: "health_not_ready" };
-      }
-    } catch {
-      return { ok: false, reason: "health_not_ready" };
     }
 
     const headers = accessHeaders(config);
@@ -639,9 +661,8 @@ export function createMacTranscriber(config: MacOriginConfig, fetcher: RequestFe
     headers.set("X-Allow-Cloud-Fallback", String(input.allowsCloudFallback));
     headers.set("X-Audio-Duration-Seconds", String(input.durationSeconds));
 
-    let originResponse: Response;
     try {
-      originResponse = await requestWithTimeout(
+      return await requestWithTimeout<MacAttempt>(
         new Request(new URL(TRANSCRIBE_PATH, origin), {
           method: "POST",
           headers,
@@ -649,25 +670,24 @@ export function createMacTranscriber(config: MacOriginConfig, fetcher: RequestFe
         }),
         fetcher,
         config.transcribeTimeoutMs ?? macTranscriptionTimeoutMs(input.durationSeconds),
+        async (response, signal) => {
+          if (!response.ok) return { ok: false, reason: await rejectedOriginReason(response, signal) };
+          try {
+            const transcript = validatedMacTranscript(
+              await parseBoundedJson(response, MAX_ORIGIN_JSON_BYTES, signal),
+              input.requestId,
+            );
+            return transcript === undefined
+              ? { ok: false, reason: "origin_invalid_response" }
+              : { ok: true, transcript };
+          } catch (error) {
+            if (isAbortError(error)) throw error;
+            return { ok: false, reason: "origin_invalid_response" };
+          }
+        },
       );
     } catch (error) {
       return { ok: false, reason: isAbortError(error) ? "origin_timeout" : "origin_unreachable" };
-    }
-
-    if (!originResponse.ok) {
-      return { ok: false, reason: await rejectedOriginReason(originResponse) };
-    }
-
-    try {
-      const transcript = validatedMacTranscript(
-        await parseBoundedJson(originResponse, MAX_ORIGIN_JSON_BYTES),
-        input.requestId,
-      );
-      return transcript === undefined
-        ? { ok: false, reason: "origin_invalid_response" }
-        : { ok: true, transcript };
-    } catch {
-      return { ok: false, reason: "origin_invalid_response" };
     }
   };
 }
@@ -683,10 +703,10 @@ function historyOriginPath(kind: HistoryRequestKind): string {
   }
 }
 
-async function historyErrorPayload(response: Response): Promise<Record<string, unknown> | undefined> {
+async function historyErrorPayload(response: Response, signal: AbortSignal): Promise<Record<string, unknown> | undefined> {
   try {
     if (declaredLengthExceeds(response, MAX_HEALTH_JSON_BYTES)) return undefined;
-    const bytes = await readBoundedBytes(response.body, MAX_HEALTH_JSON_BYTES);
+    const bytes = await readBoundedBytes(response.body, MAX_HEALTH_JSON_BYTES, signal);
     if (bytes === undefined || bytes.byteLength === 0) return undefined;
     const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
     return isRecord(parsed) ? parsed : undefined;
@@ -700,8 +720,8 @@ function historyRevision(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
-async function classifyHistoryFailure(response: Response): Promise<HistoryProxyResult> {
-  const payload = await historyErrorPayload(response);
+async function classifyHistoryFailure(response: Response, signal: AbortSignal): Promise<HistoryProxyResult> {
+  const payload = await historyErrorPayload(response, signal);
 
   if (response.status === 403 && payload?.error === "history_disabled") {
     return { ok: false, reason: "disabled", revision: null };
@@ -740,38 +760,30 @@ export function createHistoryProxy(config: MacOriginConfig, fetcher: RequestFetc
       ? config.historyOperationsTimeoutMs ?? HISTORY_OPERATIONS_TIMEOUT_MS
       : config.historyReadTimeoutMs ?? HISTORY_READ_TIMEOUT_MS;
 
-    let response: Response;
     try {
-      response = await requestWithTimeout(
+      return await requestWithTimeout<HistoryProxyResult>(
         isOperations
           ? new Request(url, { method: "POST", headers, body: input.body })
           : new Request(url, { method: "GET", headers }),
         fetcher,
         timeoutMs,
+        async (response, signal) => {
+          if (!response.ok) return classifyHistoryFailure(response, signal);
+          if (declaredLengthExceeds(response, MAX_HISTORY_RESPONSE_BYTES)) {
+            return { ok: false, reason: "unavailable", revision: null };
+          }
+          const bytes = await readBoundedBytes(response.body, MAX_HISTORY_RESPONSE_BYTES, signal);
+          if (bytes === undefined) return { ok: false, reason: "unavailable", revision: null };
+          const body = new TextDecoder().decode(bytes);
+          if (!isRecord(JSON.parse(body))) return { ok: false, reason: "unavailable", revision: null };
+          return { ok: true, status: response.status, body };
+        },
       );
     } catch {
       // Timeouts and transport failures are both a plain "the Mac did not answer".
       return { ok: false, reason: "unavailable", revision: null };
     }
 
-    if (!response.ok) return classifyHistoryFailure(response);
-
-    if (declaredLengthExceeds(response, MAX_HISTORY_RESPONSE_BYTES)) {
-      return { ok: false, reason: "unavailable", revision: null };
-    }
-
-    const bytes = await readBoundedBytes(response.body, MAX_HISTORY_RESPONSE_BYTES);
-    if (bytes === undefined) return { ok: false, reason: "unavailable", revision: null };
-
-    const body = new TextDecoder().decode(bytes);
-    try {
-      if (!isRecord(JSON.parse(body))) {
-        return { ok: false, reason: "unavailable", revision: null };
-      }
-    } catch {
-      return { ok: false, reason: "unavailable", revision: null };
-    }
-    return { ok: true, status: response.status, body };
   };
 }
 
@@ -1249,6 +1261,12 @@ async function handleAsset(
   for (const [name, value] of Object.entries(ASSET_SECURITY_HEADERS)) {
     headers.set(name, value);
   }
+  // Safari does not consistently match HTTPS 'self' to WSS. Name only this
+  // origin's stream endpoint; never permit arbitrary WebSocket destinations.
+  const streamURL = new URL(STREAM_PATH, url.origin);
+  streamURL.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  headers.set("Content-Security-Policy", ASSET_SECURITY_HEADERS["Content-Security-Policy"]
+    .replace("connect-src 'self';", `connect-src 'self' ${streamURL.href};`));
   headers.set("Cache-Control", assetCacheControl(assetPath));
   headers.set("X-Request-ID", requestId);
 

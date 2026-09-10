@@ -905,6 +905,58 @@ describe("history proxy endpoints", () => {
   });
 });
 
+describe("origin response deadlines", () => {
+  function stalledResponse(status = 200) {
+    const cancel = vi.fn();
+    const response = new Response(new ReadableStream<Uint8Array>({
+      start(controller) { controller.enqueue(new TextEncoder().encode('{"pending":')); },
+      cancel,
+    }), { status });
+    return { response, cancel };
+  }
+
+  it("times out and cancels a health body after its headers arrive without sending audio", async () => {
+    const stalled = stalledResponse();
+    const fetcher: RequestFetcher = vi.fn(async () => stalled.response);
+    const transcribe = createMacTranscriber({ ...MAC_ORIGIN, healthTimeoutMs: 5 }, fetcher);
+    await expect(transcribe(audioInput())).resolves.toEqual({ ok: false, reason: "health_timeout" });
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(stalled.cancel).toHaveBeenCalledOnce();
+  });
+
+  it.each([200, 503])("times out and cancels a stalled transcription body with status %s", async (status) => {
+    const stalled = stalledResponse(status);
+    const fetcher: RequestFetcher = vi.fn(async (request) =>
+      new URL(request.url).pathname === "/healthz"
+        ? Response.json({ ready: true, busy: false })
+        : stalled.response);
+    const transcribe = createMacTranscriber({ ...MAC_ORIGIN, transcribeTimeoutMs: 5 }, fetcher);
+    await expect(transcribe(audioInput())).resolves.toEqual({ ok: false, reason: "origin_timeout" });
+    expect(stalled.cancel).toHaveBeenCalledOnce();
+  });
+
+  it.each([200, 403])("bounds history body consumption with status %s", async (status) => {
+    const stalled = stalledResponse(status);
+    const proxy = createHistoryProxy(
+      { ...MAC_ORIGIN, historyReadTimeoutMs: 5 },
+      async () => stalled.response,
+    );
+    await expect(proxy({ kind: "manifest", client: "pwa", requestId: REQUEST_ID, search: "", body: null }))
+      .resolves.toEqual({ ok: false, reason: "unavailable", revision: null });
+    expect(stalled.cancel).toHaveBeenCalledOnce();
+  });
+
+  it("bounds a fetcher which ignores abort and cancels its late response", async () => {
+    let completeFetch: ((response: Response) => void) | undefined;
+    const fetcher: RequestFetcher = () => new Promise((resolve) => { completeFetch = resolve; });
+    const transcribe = createMacTranscriber({ ...MAC_ORIGIN, healthTimeoutMs: 5 }, fetcher);
+    await expect(transcribe(audioInput())).resolves.toEqual({ ok: false, reason: "health_timeout" });
+    const stalled = stalledResponse();
+    completeFetch?.(stalled.response);
+    await vi.waitFor(() => expect(stalled.cancel).toHaveBeenCalledOnce());
+  });
+});
+
 describe("history origin proxy", () => {
   function proxyInput(overrides: Partial<HistoryProxyRequest> = {}): HistoryProxyRequest {
     return {
@@ -1051,7 +1103,7 @@ describe("history origin proxy", () => {
 
 describe("PWA static assets", () => {
   const CSP =
-    "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+    "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self' wss://dictation.example.com/stream; img-src 'self' data:; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
   it.each(["/app", "/app/", "/app/import"])("serves the shell for %s", async (path) => {
     const testRuntime = runtime();

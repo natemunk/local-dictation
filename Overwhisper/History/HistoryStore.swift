@@ -217,57 +217,76 @@ actor HistoryStore {
     @discardableResult
     func saveRemote(_ capture: HistoryRemoteCapture) throws -> (entry: HistoryEntry, inserted: Bool) {
         try database.write { db in
-            try db.execute(
-                sql: """
-                    INSERT INTO \(Self.tableName) (
-                        \(Column.id),
-                        \(Column.timestamp),
-                        \(Column.rawText),
-                        \(Column.polishedText),
-                        \(Column.mode),
-                        \(Column.deliveryStatus),
-                        \(Column.refinementStatus),
-                        \(Column.asrLatency),
-                        \(Column.refinementLatency),
-                        \(Column.totalLatency),
-                        \(Column.unrecognizedCommandCandidatesJSON),
-                        \(Column.asrSelection),
-                        \(Column.asrOutcome),
-                        \(Column.refinerBackend),
-                        \(Column.refinementOutcome),
-                        \(Column.sourceKind),
-                        \(Column.remoteRoute),
-                        \(Column.cleanupBackend),
-                        \(Column.updatedAt)
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(\(Column.id)) DO NOTHING
-                    """,
-                arguments: [
-                    capture.id.uuidString.lowercased(),
-                    capture.timestamp,
-                    capture.rawText,
-                    capture.polishedText,
-                    capture.mode.rawValue,
-                    HistoryDeliveryStatus.delivered.rawValue,
-                    capture.refinementStatus.rawValue,
-                    capture.asrLatency,
-                    capture.refinementLatency,
-                    capture.totalLatency,
-                    capture.asrSelection,
-                    capture.asrOutcome,
-                    capture.refinerBackend,
-                    capture.refinementOutcome,
-                    capture.sourceKind.rawValue,
-                    capture.remoteRoute,
-                    capture.cleanupBackend,
-                    capture.timestamp,
-                ]
-            )
-            let inserted = db.changesCount > 0
-            if inserted {
-                try Self.bumpGlobalRevision(in: db)
-            }
-            return (try Self.requireEntry(capture.id, in: db), inserted)
+            try Self.saveRemoteCapture(capture, in: db)
+        }
+    }
+
+    private static func saveRemoteCapture(
+        _ capture: HistoryRemoteCapture,
+        in db: Database
+    ) throws -> (entry: HistoryEntry, inserted: Bool) {
+        try db.execute(
+            sql: """
+                INSERT INTO \(Self.tableName) (
+                    \(Column.id),
+                    \(Column.timestamp),
+                    \(Column.rawText),
+                    \(Column.polishedText),
+                    \(Column.mode),
+                    \(Column.deliveryStatus),
+                    \(Column.refinementStatus),
+                    \(Column.asrLatency),
+                    \(Column.refinementLatency),
+                    \(Column.totalLatency),
+                    \(Column.unrecognizedCommandCandidatesJSON),
+                    \(Column.asrSelection),
+                    \(Column.asrOutcome),
+                    \(Column.refinerBackend),
+                    \(Column.refinementOutcome),
+                    \(Column.sourceKind),
+                    \(Column.remoteRoute),
+                    \(Column.cleanupBackend),
+                    \(Column.updatedAt)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(\(Column.id)) DO NOTHING
+                """,
+            arguments: [
+                capture.id.uuidString.lowercased(),
+                capture.timestamp,
+                capture.rawText,
+                capture.polishedText,
+                capture.mode.rawValue,
+                HistoryDeliveryStatus.delivered.rawValue,
+                capture.refinementStatus.rawValue,
+                capture.asrLatency,
+                capture.refinementLatency,
+                capture.totalLatency,
+                capture.asrSelection,
+                capture.asrOutcome,
+                capture.refinerBackend,
+                capture.refinementOutcome,
+                capture.sourceKind.rawValue,
+                capture.remoteRoute,
+                capture.cleanupBackend,
+                capture.timestamp,
+            ]
+        )
+        let inserted = db.changesCount > 0
+        if inserted {
+            try Self.bumpGlobalRevision(in: db)
+        }
+        return (try Self.requireEntry(capture.id, in: db), inserted)
+    }
+
+    /// Consent is checked on this actor at persistence time, rather than when
+    /// an iPhone request first entered the inference queue.
+    func saveRemote(
+        _ capture: HistoryRemoteCapture,
+        authorization: HistoryPersistenceAuthorization
+    ) throws -> (entry: HistoryEntry, inserted: Bool)? {
+        try database.write { db in
+            guard authorization.isCurrent else { return nil }
+            return try Self.saveRemoteCapture(capture, in: db)
         }
     }
 

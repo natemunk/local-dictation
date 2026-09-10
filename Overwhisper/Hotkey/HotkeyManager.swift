@@ -48,6 +48,10 @@ final class HotkeyManager {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var pendingKeyUps: [UInt16: PendingKeyUp] = [:]
+    private let onRewriteClipboard: () -> Void
+    private let onRewriteEnter: () -> Bool
+    private let onRewriteEscape: () -> Bool
+    private var physicalCDown = false
     private var physicalDDown = false
     private var logicalDReleaseHandled = false
 
@@ -61,6 +65,9 @@ final class HotkeyManager {
         coordinator: DictationCoordinator,
         profileMode: @escaping () -> DictationMode,
         effectHandler: @escaping ([DictationCoordinatorEffect]) -> Void,
+        onRewriteClipboard: @escaping () -> Void = {},
+        onRewriteEnter: @escaping () -> Bool = { false },
+        onRewriteEscape: @escaping () -> Bool = { false },
         performanceSignpost: @escaping @MainActor (DictationPerformanceEvent, UInt64) -> Void = {
             DictationPerformanceSignposts.emit($0, correlationID: $1)
         }
@@ -68,6 +75,9 @@ final class HotkeyManager {
         self.coordinator = coordinator
         self.profileMode = profileMode
         self.effectHandler = effectHandler
+        self.onRewriteClipboard = onRewriteClipboard
+        self.onRewriteEnter = onRewriteEnter
+        self.onRewriteEscape = onRewriteEscape
         self.performanceSignpost = performanceSignpost
     }
 
@@ -216,6 +226,27 @@ final class HotkeyManager {
         let hyperD = isDKey && hasHyperModifiers(event.flags)
         var response = DictationEventResponse.passThrough
 
+        // Consume both halves even if modifiers are released before C. A fresh
+        // non-repeat down recovers from a lost up. Do no UI/clipboard work here.
+        if keyCode == UInt16(kVK_ANSI_C) {
+            if type == .keyDown, physicalCDown, event.getIntegerValueField(.keyboardEventAutorepeat) != 0 {
+                return nil
+            }
+            if type == .keyDown, hasHyperModifiers(event.flags) {
+                let repeatEvent = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+                physicalCDown = true
+                if !repeatEvent { onRewriteClipboard() }
+                return nil
+            }
+            if type == .keyUp, physicalCDown {
+                physicalCDown = false
+                return nil
+            }
+            if type == .keyDown, event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+                physicalCDown = false
+            }
+        }
+
         if physicalDDown,
            !isDKey,
            !CGEventSource.keyState(
@@ -226,6 +257,17 @@ final class HotkeyManager {
             dispatch(recovery.effects)
             physicalDDown = false
             logicalDReleaseHandled = false
+        }
+
+
+        if type == .keyDown,
+           (keyCode == UInt16(kVK_Return) || keyCode == UInt16(kVK_Escape)),
+           !event.flags.contains(.maskCommand), !event.flags.contains(.maskControl), !event.flags.contains(.maskAlternate) {
+            let handled = keyCode == UInt16(kVK_Return) ? onRewriteEnter() : onRewriteEscape()
+            if handled {
+                pendingKeyUps[keyCode] = PendingKeyUp(expiresAt: timestamp + Self.keyUpSuppressionLifetime)
+                return nil
+            }
         }
 
         switch type {

@@ -15,8 +15,12 @@ self.addEventListener("install", (event) => {
   event.waitUntil((async () => {
     const cache = await caches.open(CACHE_NAME);
     await cache.addAll(SHELL_ASSETS);
-    await self.skipWaiting();
+    // Existing pages offer an update only when recording and drafts are safe.
   })());
+});
+
+self.addEventListener("message", event => {
+  if (event.data?.type === "ACTIVATE_UPDATE") event.waitUntil(self.skipWaiting());
 });
 
 self.addEventListener("activate", (event) => {

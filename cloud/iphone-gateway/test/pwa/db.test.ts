@@ -108,7 +108,7 @@ describe("replaceEntriesFromStaging", () => {
 });
 
 describe("local cache management", () => {
-  it("clears entries, staging and pending but keeps the operation queue", async () => {
+  it("refreshes synchronized cache while preserving pending results, operations and key", async () => {
     const { handle } = await openFreshDatabase();
     await db.putSynchronizedEntries(handle, [entryFixture()]);
     await db.putStagedEntries(handle, [entryFixture()]);
@@ -121,7 +121,7 @@ describe("local cache management", () => {
 
     expect(await db.getSynchronizedEntries(handle)).toEqual([]);
     expect(await db.getStagedEntries(handle)).toEqual([]);
-    expect(await db.getPendingEntries(handle)).toEqual([]);
+    expect(await db.getPendingEntries(handle)).toHaveLength(1);
     expect(await db.getSetting(handle, db.SETTING_SYNCED_REVISION)).toBe(null);
     expect(await db.getSetting(handle, db.SETTING_CREDENTIALS)).toEqual({
       clientId: "a",

@@ -131,8 +131,11 @@ final class DictationDestination {
     /// fixed while observing its AX focus for a short bounded interval. Never
     /// follow focus into a different application.
     static func captureFrontmostWithRetry() async -> DictationDestination? {
-        guard let application = NSWorkspace.shared.frontmostApplication else { return nil }
+        await captureFrontmostWithRetry(for: NSWorkspace.shared.frontmostApplication)
+    }
 
+    static func captureFrontmostWithRetry(for application: NSRunningApplication?) async -> DictationDestination? {
+        guard let application else { return nil }
         let processIdentifier = application.processIdentifier
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: captureObservationDeadline)

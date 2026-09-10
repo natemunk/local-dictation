@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ApiError,
@@ -6,6 +6,7 @@ import {
 } from "../../public/app/lib/api.js";
 
 const REQUEST_ID = "00000000-0000-4000-8000-000000000123";
+afterEach(() => vi.useRealTimers());
 
 function client(fetchImpl: typeof fetch, diagnostics: Array<Record<string, unknown>>) {
   return createApiClient({
@@ -17,6 +18,38 @@ function client(fetchImpl: typeof fetch, diagnostics: Array<Record<string, unkno
 }
 
 describe("PWA gateway diagnostics", () => {
+  it.each(["headers", "body"])("bounds a stalled %s even if fetch ignores abort", async phase => {
+    vi.useFakeTimers();
+    const fetchImpl = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => {
+      if (phase === "headers") return await new Promise<Response>(() => {});
+      return { ok: true, status: 200, json: () => new Promise(() => {}) } as Response;
+    });
+    const api = createApiClient({ fetchImpl, requestTimeoutMs: 100,
+      getCredentials: () => ({ clientId: "synthetic-id", clientSecret: "synthetic-key" }),
+      recordDiagnostic: () => {},
+    });
+    const result = expect(api.healthz()).rejects.toMatchObject({ code: "REQUEST_TIMEOUT" });
+    await vi.advanceTimersByTimeAsync(100);
+    await result;
+    expect(fetchImpl.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("cancels an upload promptly without accepting its late result", async () => {
+    const controller = new AbortController();
+    let complete!: (value: Response) => void;
+    const diagnostics: Array<Record<string, unknown>> = [];
+    const api = client(vi.fn(() => new Promise<Response>(resolve => { complete = resolve; })), diagnostics);
+    const result = expect(api.transcribe({ blob: new Blob(["synthetic"]), mimeType: "audio/mp4",
+      durationSeconds: 1, mode: "literal", allowCloudFallback: false, requestId: REQUEST_ID,
+      signal: controller.signal })).rejects.toMatchObject({ code: "REQUEST_CANCELLED" });
+    controller.abort();
+    await result;
+    complete(Response.json({ request_id: REQUEST_ID, text: "synthetic result", route: "mac_local" }));
+    await Promise.resolve();
+    expect(diagnostics.at(-1)?.code).toBe("REQUEST_CANCELLED");
+    expect(diagnostics.some(event => event.outcome === "succeeded")).toBe(false);
+  });
   it("mints a stream ticket with the same protected PWA credentials", async () => {
     const diagnostics: Array<Record<string, unknown>> = [];
     const fetchImpl = vi.fn(async (_request: RequestInfo | URL, init?: RequestInit) => {

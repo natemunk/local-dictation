@@ -242,6 +242,7 @@ final class AudioRecorder: ObservableObject {
 
     var onCallbackLoss: ((AudioCallbackLossAction) -> Void)?
     var onCaptureFailure: ((String) -> Void)?
+    var onSystemInputFallback: (() -> Void)?
 
     private let sampleRate: Double = 16_000
     private let channels: AVAudioChannelCount = 1
@@ -317,11 +318,13 @@ final class AudioRecorder: ObservableObject {
                 AppLogger.audio.error(
                     "Input device \(requestedDeviceID) failed to open; using the system default"
                 )
-                selectedInputDeviceID = nil
+                // Keep the preferred selection so the next recording retries
+                // it and any fallback remains visibly disclosed per session.
                 (unit, clientFormat, maximumFrames) = try makeInputUnit(
                     deviceID: fallback
                 )
                 activeDeviceID = fallback
+                onSystemInputFallback?()
             }
             inputUnit = unit
 
@@ -423,7 +426,18 @@ final class AudioRecorder: ObservableObject {
         }
     }
 
+    struct StoppedRecording {
+        fileprivate let url: URL
+        fileprivate let runtime: AudioCaptureRuntime
+    }
+
     func stopRecording() async throws -> URL {
+        try await finishStoppedRecording(stopCapture())
+    }
+
+    /// Stop hardware synchronously before any Accessibility inspection. The
+    /// already-captured audio can drain while focus metadata is resolved.
+    func stopCapture() throws -> StoppedRecording {
         guard isRecording,
               let url = recordingURL,
               let runtime = captureRuntime
@@ -434,7 +448,12 @@ final class AudioRecorder: ObservableObject {
         stopHealthMonitoring()
         stopAndDisposeInputUnit()
         runtime.requestDrain()
+        return StoppedRecording(url: url, runtime: runtime)
+    }
 
+    func finishStoppedRecording(_ recording: StoppedRecording) async throws -> URL {
+        let url = recording.url
+        let runtime = recording.runtime
         do {
             let metrics = try await runtime.waitForCompletion()
             if captureRuntime === runtime {

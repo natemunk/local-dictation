@@ -28,6 +28,13 @@
   </button>
 </header>
 
+<div id="global-controls" class="global-controls">
+  <section id="persistent-record" aria-live="polite" hidden></section>
+  <section id="recording-recovery" aria-label="Recording recovery" hidden></section>
+  <section id="update-ready" hidden></section>
+</div>
+<dialog id="copy-recovery" aria-label="Copy text"></dialog>
+
 <main id="main-view">
 
   <section id="setup-region" aria-label="Set up"></section>
@@ -47,6 +54,7 @@
            aria-label="Search" autocomplete="off" autocapitalize="none"
            spellcheck="false" enterkeyhint="search" hidden>
     <ul id="entry-list" class="rows"></ul>
+    <div id="history-actions" hidden></div>
     <p id="list-empty" class="empty" hidden>Nothing here yet.</p>
   </section>
 

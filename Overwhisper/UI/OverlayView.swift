@@ -54,6 +54,7 @@ struct OverlayView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
+                    .truncationMode(.head)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
@@ -112,7 +113,7 @@ struct OverlayView: View {
     private var secondaryMessage: String {
         if appState.phase == .recording {
             switch appState.micInputStatus {
-            case .ok: return appState.activeProfileName
+            case .ok: return appState.microphoneNotice ?? appState.activeProfileName
             case .low: return "Microphone level is low"
             case .silent: return "No usable microphone input detected"
             }

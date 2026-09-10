@@ -9,6 +9,7 @@ import {
   ERROR_HISTORY_CHANGED,
   ERROR_HISTORY_DISABLED,
   ERROR_MISSING_CREDENTIALS,
+  ERROR_ACCESS_DENIED,
   HISTORY_PAGE_LIMIT,
   MAX_OPERATIONS_PER_REQUEST,
   isOfflineError,
@@ -83,51 +84,41 @@ export function operationBody(operation) {
  * Step 2: send the queue in batches of at most 100 and apply the results.
  * `applied` / `already_applied` drop the op, `missing` drops the op and the
  * local entry, `conflict` parks the op with the server's entry attached, and
- * `invalid` drops an op that can never succeed.
+ * `invalid` retains the change for a visible discard rather than losing text.
  */
 export async function pushOperations({ api, database, db = defaultDb }) {
-  const queue = await db.listSendableOperations(database);
   const summary = { pushed: 0, conflicts: 0, missing: 0, invalid: 0, batches: 0, revision: null };
-  if (queue.length === 0) return summary;
-
-  for (let offset = 0; offset < queue.length; offset += MAX_OPERATIONS_PER_REQUEST) {
-    const batch = queue.slice(offset, offset + MAX_OPERATIONS_PER_REQUEST);
+  const attempted = new Set();
+  // One action per entry per round keeps different entries batched while each
+  // entry's next action uses the revision returned by its own previous action.
+  for (;;) {
+    const queue = await db.listOperations(database);
+    const ids = new Set(queue.map(row => row.op_id));
+    const entries = new Set();
+    const batch = queue.filter(row => {
+      if (attempted.has(row.op_id) || row.conflict === 1 || entries.has(row.entry_id)) return false;
+      if (row.after_op_id && ids.has(row.after_op_id)) return false;
+      if (row.type !== "import" && row.base_revision === null) return false;
+      entries.add(row.entry_id);
+      return true;
+    }).slice(0, MAX_OPERATIONS_PER_REQUEST);
+    if (batch.length === 0) return summary;
+    for (const row of batch) attempted.add(row.op_id);
     const response = await api.postOperations(batch.map(operationBody));
     summary.batches += 1;
     if (typeof response?.revision === "number") summary.revision = response.revision;
-
-    const results = new Map(
-      (Array.isArray(response?.results) ? response.results : []).map((row) => [row.op_id, row]),
-    );
-
+    const results = new Map((Array.isArray(response?.results) ? response.results : [])
+      .map(row => [row.op_id, row]));
     for (const operation of batch) {
       const result = results.get(operation.op_id);
-      // An op the server did not answer for stays queued for the next sync.
-      if (result === undefined) continue;
-
-      if (result.status === "applied" || result.status === "already_applied") {
-        await db.removeOperation(database, operation.op_id);
-        if (operation.type === "import") {
-          await db.updatePendingEntry(database, operation.entry_id, {
-            local_state: "awaiting_sync",
-          });
-        }
-        summary.pushed += 1;
-      } else if (result.status === "missing") {
-        await db.removeOperation(database, operation.op_id);
-        await db.deleteEntryLocally(database, operation.entry_id);
-        summary.missing += 1;
-      } else if (result.status === "conflict") {
-        await db.markOperationConflict(database, operation.op_id, result.entry ?? null);
-        summary.conflicts += 1;
-      } else {
-        await db.removeOperation(database, operation.op_id);
-        summary.invalid += 1;
-      }
+      if (!result || !["applied", "already_applied", "missing", "conflict", "invalid"].includes(result.status)) continue;
+      await db.settleOperation(database, operation, result);
+      if (result.status === "applied" || result.status === "already_applied") summary.pushed += 1;
+      else if (result.status === "missing") summary.missing += 1;
+      else if (result.status === "conflict") summary.conflicts += 1;
+      else summary.invalid += 1;
     }
   }
-
-  return summary;
 }
 
 /* ------------------------------------------------------------------- pull */
@@ -222,7 +213,7 @@ export async function runSync({ api, database, db = defaultDb }) {
       if (isCode(error, ERROR_HISTORY_DISABLED)) {
         return { status: SYNC_HISTORY_DISABLED, attempts: attempt, push, error };
       }
-      if (isCode(error, ERROR_MISSING_CREDENTIALS)) {
+      if (isCode(error, ERROR_MISSING_CREDENTIALS) || isCode(error, ERROR_ACCESS_DENIED)) {
         return { status: SYNC_NEEDS_CREDENTIALS, attempts: attempt, push, error };
       }
       return { status: SYNC_ERROR, attempts: attempt, push, error };

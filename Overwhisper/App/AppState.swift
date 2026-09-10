@@ -73,6 +73,7 @@ final class AppState: ObservableObject {
     @Published var audioLevel: Float = 0
     @Published var recordingDuration: TimeInterval = 0
     @Published var micInputStatus: MicInputStatus = .ok
+    @Published var microphoneNotice: String?
     @Published var interleavedTyping = false
     @Published var overlayMessage = "Listening"
     @Published var liveTranscript = LiveTranscript()
@@ -253,6 +254,7 @@ final class AppState: ObservableObject {
     }
 
     func beginRecording() {
+        microphoneNotice = nil
         phase = .recording
         overlayMessage = "Listening"
         recordingDuration = 0

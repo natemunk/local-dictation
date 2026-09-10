@@ -52,7 +52,7 @@ All success and error responses include `Cache-Control: no-store`, `Pragma: no-c
 
 The browser then opens `wss://dictate.natemunk.com/stream` with two WebSocket subprotocol values: `local-dictation.v1` and the signed ticket. Browser WebSocket APIs cannot attach the Access service-token headers directly, so the public transport route validates the same-origin `Origin`, signature, request UUID, mode, expiry, and fallback consent before forwarding the upgrade. It strips the ticket, adds the dedicated Worker-to-origin Access credentials, and selects only `local-dictation.v1` at the Mac. An unsigned, expired, malformed, or cross-origin request never reaches the tunnel.
 
-Audio messages are little-endian signed 16-bit, 16 kHz, mono PCM and are bounded to 64 KiB each. Control messages are `finish` with a duration or `cancel`; server events are `ready`, `partial`, `final`, and `error`. The Worker transparently proxies frames and therefore has no audio buffer, transcript parser, Durable Object, or application storage. Cloud fallback is intentionally not attempted inside a failed socket: Dictation Inbox retains its complete M4A in memory and automatically submits it to `POST /v1/transcriptions`, where the existing fallback policy applies.
+Audio messages are little-endian signed 16-bit, 16 kHz, mono PCM and are bounded to 64 KiB each. Control messages are `finish` with a duration or `cancel`; server events are `ready`, `audio_received`, `preview_unavailable`, `partial`, `final`, and `error`. `audio_received` acknowledges PCM appended on the Mac and contains only `received_frames` and `partial_count` counters plus the request ID; it is distinct from socket readiness and from actual partial text. `preview_unavailable` leaves final batch transcription available. Older clients may ignore these additive events; newer clients also recognize actual partials from older Mac builds as receipt evidence. The Worker transparently proxies frames and therefore has no audio buffer, transcript parser, Durable Object, or application storage. Cloud fallback is intentionally not attempted inside a failed socket: Dictation Inbox retains its complete M4A in memory and automatically submits it to `POST /v1/transcriptions`, where the existing fallback policy applies.
 
 ### `GET /v1/healthz`
 
@@ -67,7 +67,7 @@ All three require `X-Dictation-Client: pwa`; anything else is `400 INVALID_REQUE
 - `revision` is required and must be a non-negative safe integer; `limit` must be 1–100; `cursor` must be at most 64 characters of `[A-Za-z0-9_-]`. Only these three parameters are forwarded.
 - The operations body must be JSON of at most 2 MiB containing an `operations` array of 1–100 items, each an object with a non-empty string `op_id`, a `type` of `import`, `edit`, `pin`, `unpin`, or `delete`, and a non-empty string `entry_id`. A present `text` must be a string of at most 100 000 characters. Deeper semantics are the Mac's business and are reported per operation.
 
-The proxy forwards the origin Access headers plus `X-Dictation-Client` and `X-Request-ID`. Timeouts are 10 s for the manifest and snapshot pages and 20 s for operations. History requests never run the Mac health pre-check and never invoke Workers AI.
+The proxy forwards the origin Access headers plus `X-Dictation-Client` and `X-Request-ID`. Timeouts are 10 s for the manifest and snapshot pages and 20 s for operations, covering both response headers and body consumption. The health and transcription deadlines likewise cover the whole response and cancel stalled bodies. History requests never run the Mac health pre-check and never invoke Workers AI.
 
 A 2xx origin body is read with a 4 MiB bound, parsed once to confirm it is a JSON object, and then forwarded verbatim with the origin status, `Cache-Control: no-store`, and `X-Request-ID`. Failures map to the gateway envelope:
 
@@ -86,7 +86,7 @@ A 2xx origin body is read with a 4 MiB bound, parsed once to confirm it is a JSO
 
 Every asset response carries:
 
-- `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`
+- `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self' wss://dictate.natemunk.com/stream; img-src 'self' data:; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`
 - `Referrer-Policy: no-referrer`
 - `X-Content-Type-Options: nosniff`
 - `X-Frame-Options: DENY`
@@ -154,4 +154,4 @@ npm run deploy:dry-run
 npm run check:startup
 ```
 
-Workers AI is remote-only. Unit tests inject deterministic Mac and cloud adapters, so they do not send audio or incur inference usage.
+Workers AI is remote-only. Unit tests inject deterministic Mac and cloud adapters, with remote bindings explicitly disabled in Vitest, so they do not open a Cloudflare binding session, send audio, or incur inference usage. CI runs both Worker/PWA tests and TypeScript checks. These tests exercise synthetic PCM, body stalls, cancellation, and queued UI actions; they do not certify real Safari audio delivery or model accuracy.

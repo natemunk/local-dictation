@@ -107,6 +107,7 @@ struct IPhoneStreamingTests {
 
         let samples = [Int16](repeating: 1_000, count: 3_200)
         try await handle.receiveAudio(Self.pcmData(samples))
+        #expect(await iterator.next() == .audioReceived(requestID: requestID, frames: 1, partials: 0))
         #expect(
             await iterator.next()
                 == .partial(requestID: requestID, text: "Live words")
@@ -119,6 +120,144 @@ struct IPhoneStreamingTests {
         #expect(saved?.duration == 0.2)
         #expect(saved.map { !FileManager.default.fileExists(atPath: $0.url.path) } == true)
         #expect(await completion.succeeded)
+    }
+
+    @Test("cancellation keeps the lease until a slow finalizer actually exits")
+    func cancellationDrainsFinalizer() async throws {
+        let requestID = UUID()
+        let probe = FinalizerDrainProbe()
+        let leases = InferenceLeaseCoordinator()
+        let lease = try #require(leases.tryBeginRemote())
+        let session = IPhoneRemoteStreamingSession(
+            request: IPhoneAudioStreamRequest(requestID: requestID, mode: .literal,
+                allowsCloudFallback: true, client: .pwa),
+            writer: try IPhoneStreamWAVWriter(requestID: requestID),
+            transcriber: PreviewStub(),
+            finalizer: { _, _ in
+                await probe.started()
+                return try await withTaskCancellationHandler {
+                    await probe.waitForExitPermission()
+                    await probe.exited()
+                    throw CancellationError()
+                } onCancel: {
+                    Task { await probe.cancelled() }
+                }
+            },
+            completion: { _ in
+                await probe.completed()
+                leases.endRemote(lease)
+            }
+        )
+        let handle = await session.start()
+        lease.installCancellation { Task { await handle.cancel() } }
+        try await handle.receiveAudio(Self.pcmData([Int16](repeating: 1, count: 3_200)))
+        let finish = Task { try await handle.finish(0.2) }
+        await probe.waitForStart()
+        leases.beginDesktop()
+        await probe.waitForCancellation()
+        // A fake finalizer deliberately ignores cancellation until released.
+        // Lease ownership must still prevent desktop final inference meanwhile.
+        await #expect(throws: IPhoneEndpointFailure.self) {
+            try await leases.waitForRemoteRelease(timeout: .milliseconds(20))
+        }
+        await probe.allowExit()
+        _ = try? await finish.value
+        try await leases.waitForRemoteRelease()
+        #expect(await probe.completedWhileRunning == false)
+        #expect(await probe.completionCount == 1)
+        leases.endDesktop()
+    }
+
+    @Test("cancel before start never starts optional inference")
+    func cancelledBeforeStart() async throws {
+        let requestID = UUID()
+        let preview = FailingPreviewStub()
+        let session = IPhoneRemoteStreamingSession(
+            request: IPhoneAudioStreamRequest(requestID: requestID, mode: .literal,
+                allowsCloudFallback: false, client: .pwa),
+            writer: try IPhoneStreamWAVWriter(requestID: requestID),
+            transcriber: preview,
+            finalizer: { _, _ in throw CancellationError() },
+            completion: { _ in }
+        )
+        await session.cancel()
+        let handle = await session.start()
+        var events = handle.events.makeAsyncIterator()
+        #expect(await events.next() == nil)
+        #expect(await preview.startCount == 0)
+    }
+
+    @Test("desktop preemption joins preview shutdown already started by Stop")
+    func repeatedPreviewCancellationDrainsReset() async throws {
+        let requestID = UUID()
+        let worker = FinalizerDrainProbe()
+        let reset = FinalizerDrainProbe()
+        let preview = DrainingPreviewStub(worker: worker, reset: reset)
+        let completed = FinalizerDrainProbe()
+        let unexpectedFinalizer = FinalizerDrainProbe()
+        let leases = InferenceLeaseCoordinator()
+        let lease = try #require(leases.tryBeginRemote())
+        let session = IPhoneRemoteStreamingSession(
+            request: IPhoneAudioStreamRequest(requestID: requestID, mode: .literal,
+                allowsCloudFallback: true, client: .pwa),
+            writer: try IPhoneStreamWAVWriter(requestID: requestID),
+            transcriber: preview,
+            finalizer: { _, _ in
+                await unexpectedFinalizer.started()
+                throw CancellationError()
+            },
+            completion: { _ in
+                await completed.completed()
+                leases.endRemote(lease)
+            }
+        )
+        let handle = await session.start()
+        lease.installCancellation { Task { await handle.cancel() } }
+        try await handle.receiveAudio(Self.pcmData([Int16](repeating: 1, count: 3_200)))
+        let cancellations = preview.cancellations
+        var calls = cancellations.makeAsyncIterator()
+        let finish = Task { try await handle.finish(0.2) }
+        #expect(await calls.next() == 1)
+        await worker.waitForStart()
+        leases.beginDesktop()
+        #expect(await calls.next() == 2)
+        await #expect(throws: IPhoneEndpointFailure.self) {
+            try await leases.waitForRemoteRelease(timeout: .milliseconds(20))
+        }
+        await worker.allowExit()
+        await reset.waitForStart()
+        // The inference task has drained, but the same shutdown still owns its
+        // reset. Repeated cancel must not admit a new session between the two.
+        await #expect(throws: IPhoneEndpointFailure.self) {
+            try await leases.waitForRemoteRelease(timeout: .milliseconds(20))
+        }
+        await reset.allowExit()
+        _ = try? await finish.value
+        try await leases.waitForRemoteRelease()
+        #expect(await completed.completionCount == 1)
+        #expect(await unexpectedFinalizer.hasStarted == false)
+        leases.endDesktop()
+    }
+
+    @Test("preview preparation failure is visible while audio receipt continues")
+    func previewFailureIsOptional() async throws {
+        let requestID = UUID()
+        let preview = FailingPreviewStub()
+        let session = IPhoneRemoteStreamingSession(
+            request: IPhoneAudioStreamRequest(requestID: requestID, mode: .literal,
+                allowsCloudFallback: true, client: .pwa),
+            writer: try IPhoneStreamWAVWriter(requestID: requestID),
+            transcriber: preview,
+            finalizer: { _, _ in throw CancellationError() },
+            completion: { _ in }
+        )
+        let handle = await session.start()
+        var events = handle.events.makeAsyncIterator()
+        #expect(await events.next() == .ready(requestID: requestID))
+        #expect(await events.next() == .previewUnavailable(requestID: requestID))
+        try await handle.receiveAudio(Self.pcmData([1, 2, 3, 4]))
+        #expect(await events.next() == .audioReceived(requestID: requestID, frames: 1, partials: 0))
+        await handle.cancel()
     }
 
     @Test("WebSocket route validates metadata and carries binary audio to final response")
@@ -263,4 +402,90 @@ private actor SocketProbe {
     private(set) var duration: TimeInterval?
     func receive(_ data: Data) { bytes.append(data) }
     func finish(_ duration: TimeInterval) { self.duration = duration }
+}
+
+private actor FailingPreviewStub: StreamingTranscriber {
+    private(set) var startCount = 0
+    func prepare() async throws {}
+    func start(samples: AsyncStream<AudioChunk>) async throws -> AsyncStream<TranscriptUpdate> {
+        startCount += 1
+        throw CancellationError()
+    }
+    func finish() async throws -> FinalTranscript { throw CancellationError() }
+    func cancel() async {}
+}
+
+private actor FinalizerDrainProbe {
+    private var running = false
+    private var didStart = false
+    private var didCancel = false
+    private var startWaiter: CheckedContinuation<Void, Never>?
+    private var cancellationWaiter: CheckedContinuation<Void, Never>?
+    private var exitWaiter: CheckedContinuation<Void, Never>?
+    private var exitAllowed = false
+    var hasStarted: Bool { didStart }
+    private(set) var completedWhileRunning = false
+    private(set) var completionCount = 0
+    func started() { running = true; didStart = true; startWaiter?.resume(); startWaiter = nil }
+    func cancelled() { didCancel = true; cancellationWaiter?.resume(); cancellationWaiter = nil }
+    func waitForStart() async {
+        if !didStart { await withCheckedContinuation { startWaiter = $0 } }
+    }
+    func waitForCancellation() async {
+        if !didCancel { await withCheckedContinuation { cancellationWaiter = $0 } }
+    }
+    func waitForExitPermission() async {
+        if !exitAllowed { await withCheckedContinuation { exitWaiter = $0 } }
+    }
+    func allowExit() { exitAllowed = true; exitWaiter?.resume(); exitWaiter = nil }
+    func exited() { running = false }
+    func completed() { completedWhileRunning = running; completionCount += 1 }
+}
+
+private actor DrainingPreviewStub: StreamingTranscriber {
+    let cancellations: AsyncStream<Int>
+    private let cancellationEvents: AsyncStream<Int>.Continuation
+    private let worker: FinalizerDrainProbe
+    private let reset: FinalizerDrainProbe
+    private var updates: AsyncStream<TranscriptUpdate>.Continuation?
+    private var shutdown = StreamingShutdownDrain()
+    private var cancelCount = 0
+
+    init(worker: FinalizerDrainProbe, reset: FinalizerDrainProbe) {
+        self.worker = worker
+        self.reset = reset
+        let pair = AsyncStream<Int>.makeStream()
+        cancellations = pair.stream
+        cancellationEvents = pair.continuation
+    }
+
+    func prepare() async throws {}
+    func start(samples: AsyncStream<AudioChunk>) async throws -> AsyncStream<TranscriptUpdate> {
+        guard cancelCount == 0 else { throw CancellationError() }
+        let pair = AsyncStream<TranscriptUpdate>.makeStream()
+        updates = pair.continuation
+        return pair.stream
+    }
+    func finish() async throws -> FinalTranscript { throw CancellationError() }
+    func cancel() async {
+        cancelCount += 1
+        cancellationEvents.yield(cancelCount)
+        if let pending = shutdown.task {
+            await pending.value
+            return
+        }
+        updates?.finish()
+        let worker = worker
+        let reset = reset
+        let pending = shutdown.begin {
+            await worker.started()
+            await worker.waitForExitPermission()
+            await worker.exited()
+            await reset.started()
+            await reset.waitForExitPermission()
+            await reset.exited()
+        }
+        await pending.value
+        shutdown.clear()
+    }
 }

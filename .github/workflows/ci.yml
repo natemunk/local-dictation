@@ -5,6 +5,25 @@ on:
   pull_request:
 
 jobs:
+  gateway-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cloud/iphone-gateway
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: cloud/iphone-gateway/package-lock.json
+      - name: Install pinned gateway dependencies
+        run: npm ci
+      - name: Check gateway and PWA types
+        run: npm run typecheck
+      - name: Test gateway and PWA without remote bindings
+        run: npm test
+
   build-test-audit:
     runs-on: macos-15
     steps:

@@ -28,7 +28,7 @@ table records applied client operations so replays are idempotent.
 The FTS index (`history_fts_v3`) covers `raw_text`, `polished_text`, `user_edited_text`,
 `destination_display_name`, `destination_bundle_identifier`.
 
-Retention: unpinned entries are pruned after `history_success_retention_days` (default 90).
+Retention: unpinned entries are pruned after `history_retention_days` (default 90).
 Pinned entries are never pruned. Secure-field sessions still create no row.
 
 Remote entries (Mac-local or imported) use the existing `delivered` delivery status (the text was
@@ -195,8 +195,13 @@ path no longer exists on the gateway. The Mac origin keeps `/healthz`.
 
 ## 4. Synchronization algorithm (PWA)
 
-1. Queue every local mutation as an operation with a fresh `op_id`; persist the queue in
-   IndexedDB before any network call.
+1. Queue every local mutation as an operation with a fresh `op_id`; atomically persist the
+   local entry and operation in IndexedDB before any network call. A completed result starts
+   without a server revision, including `saved_on_mac` results. Keep its immutable raw import
+   separate from later edits/pins/deletes. Mutations on pending imports wait for the import result. A fresh `saved_on_mac` result
+   uses the server insertion revision (1); a concurrent Mac edit produces a visible conflict.
+   Send later operations in dependency order, one operation per entry per batch; never send
+   revision zero as an invented server revision.
 2. When online, POST the queue in batches of ≤ 100 first. Apply results: `applied` and
    `already_applied` remove the op; `missing` removes the op and the local entry;
    `conflict` keeps the op flagged for visible resolution (Keep mine → resend with the
@@ -204,7 +209,9 @@ path no longer exists on the gateway. The Mac origin keeps `/healthz`.
 3. Fetch the manifest. If `revision` equals the cached synchronized revision, stop.
 4. Otherwise page through `/v1/history?revision=R` and write all pages into a staging
    store; on the last page atomically replace the synchronized cache with the staging
-   set, then record `R` as the synchronized revision.
+   set, then record `R` as the synchronized revision. Overlay pending local intent on every
+   applied result and snapshot, so an in-flight import or refresh cannot undo a newer local
+   edit, pin, or deletion. Rebase dependent operations only after their predecessor succeeds.
 5. `HISTORY_CHANGED` during paging restarts from step 3 (max 5 attempts per sync).
 6. `MAC_UNAVAILABLE` leaves the cache and queue untouched and shows Offline. Pending
    local entries (not yet imported) are shown alongside the last synchronized snapshot.
@@ -223,7 +230,7 @@ assets cached only by the service worker under a versioned cache name.
 Routes: `/app/` (main), `/app/import` (fragment import; serves the same shell).
 
 Credentials: a dedicated PWA Access service token pasted once into Settings, stored only in
-IndexedDB, redacted in the UI, removable with Clear Credentials. Sent as
+IndexedDB, redacted in the UI, removable with Remove key. Sent as
 `CF-Access-Client-Id` / `CF-Access-Client-Secret` on every `/v1/*` request.
 
 Recording: `MediaRecorder` with `audio/mp4` preferred (`audio/webm` fallback is sent with its
@@ -231,7 +238,15 @@ real MIME type and is expected to be rejected by the gateway as unsupported; the
 12 MiB / 10 min limits, tracks stopped on stop/error, audio never written to IndexedDB.
 
 Every successful transcription becomes a local entry immediately. If `history_state` is
-`pending_device_sync` or `disabled`, an `import` op is queued.
+`pending_device_sync` or `disabled`, an immutable `import` op is queued atomically with it.
+A `saved_on_mac` entry can queue a mutation using the server insertion revision (1) before the
+first snapshot; later mutations use the acknowledged revision.
+A failed completed recording stays in memory for explicit retry with the same request UUID,
+mode, and cloud consent, until success or discard. It never enters IndexedDB; page termination
+still loses the audio. Remove key removes only the token; Refresh saved copy preserves
+pending work; confirmed Remove all data from this phone waits for in-flight sync then clears all
+local stores and memory. Finish or discard any recording first; removal is blocked during capture
+or transcription. It does not revoke the token or delete Mac history.
 
 ### UX principles (non-negotiable)
 
@@ -242,8 +257,8 @@ possible and user friendly app to ever live."
   No mode pickers, toggles, or status chips compete with it.
 - The transcript appears directly under the button the moment it is ready, with one big
   **Copy** button. Copy is the only thing most sessions need.
-- History is a plain scrolling list beneath, newest first, one tap opens an entry, one tap
-  copies. Search is a single field that appears only when the list has more than a few items.
+- History starts with five newest entries, with Load more and Show all. One tap opens an entry,
+  one tap copies. Search covers the complete cached history, including hidden older entries.
 - Secondary actions (Edit, Pin, Delete) live inside an entry, not on the list.
 - Everything else (Clean/Literal, cloud fallback, credentials, export, delete cache, install
   help, connection test, privacy text) lives behind a single gear icon.
@@ -287,7 +302,12 @@ the signature, expiry, same-origin request, UUID, mode, and fallback consent; st
 adds its separate origin Access credentials; and transparently proxies frames. The ticket and
 PCM are memory-only and never enter URLs, IndexedDB, logs, or Cloudflare storage.
 
-The Mac feeds PCM to optional EOU preview and a temporary 16 kHz WAV simultaneously. On Stop,
+The Mac feeds PCM to optional EOU preview and a temporary 16 kHz WAV simultaneously. It sends
+content-free `audio_received` counters after appending PCM and `preview_unavailable` when preview
+cannot run. A socket upgrade or successful browser `send()` is not acknowledgement of audio receipt.
+Optional capture/setup and request bodies have bounded deadlines; transport backpressure selects
+the file fallback instead of growing memory without bound. Cancellation retains the remote lease
+until preview and final inference have drained, preserving desktop priority. On Stop,
 the selected batch engine and normal cleanup/history pipeline produce the authoritative response.
 A failed ticket, unsupported browser, dropped socket, preemption, or failed stream finalization
 causes the PWA to submit its completed recording through `/v1/transcriptions` with the same
@@ -324,5 +344,6 @@ References: [self-hosted applications](https://developers.cloudflare.com/cloudfl
 
 Settings → iPhone gains **Unified iPhone History** (off by default). When off: no remote
 transcript is persisted, history routes return `history_disabled`, existing local history is
-untouched. Enabling shows a disclosure that desktop history transits Cloudflare during PWA
+untouched. Disabling invalidates persistence authorization for in-flight transcriptions, even if
+re-enabled before they finish; authorization is rechecked when the database saves. Enabling shows a disclosure that desktop history transits Cloudflare during PWA
 synchronization.

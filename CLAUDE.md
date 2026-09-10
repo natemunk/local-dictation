@@ -62,11 +62,20 @@ installation as a user-visible side effect.
   persisted there. Disabling it deletes nothing.
 - The app has no telemetry SDK, Overseed service integration, Sparkle updater,
   or automatic update check.
-- Optional cleanup may call Apple Foundation Models locally or an explicitly
+- Optional dictation cleanup may call Apple Foundation Models locally or an explicitly
   configured OpenAI-compatible **text** endpoint. It must never send audio,
   destination-app context, browser location, focused-field contents, clipboard
   contents, or history.
 - Non-loopback cleanup endpoints require explicit remote opt-in.
+- Rewrite Text (Hyper+C) is a separate explicit local-only boundary under
+  PRV-029/030/031. It may read clipboard text on confirmed empty selection, excluded own-process invocation, or explicit refresh,
+  capture only explicitly selected nonprotected text, or accept finalized dictation,
+  plus separately spoken/typed instructions and bounded in-memory draft versions, for
+  Apple Foundation Models only. Instruction audio/text must never enter debug
+  retention, dictation commands, or history. Clipboard drafts are memory-only;
+  originating dictation and accepted text follow ordinary dictation history.
+  There is no network fallback, automatic paste, or clipboard watcher. Never
+  relax ordinary dictation cleanup's no-clipboard contract for this feature.
 - `scripts/privacy-audit.sh` is a source audit, not proof of runtime network
   behavior.
 

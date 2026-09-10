@@ -27,6 +27,7 @@ enum FinishTrigger: String, Codable, Sendable {
     case enter
     case menu
     case durationLimit
+    case rewrite
 }
 
 struct EnterModifiers: OptionSet, Equatable, Sendable {
@@ -64,6 +65,7 @@ enum DictationCoordinatorEffect: Equatable, Sendable {
     case startCapture(token: DictationSessionToken)
     case finish(DictationFinishRequest)
     case cancel(token: DictationSessionToken)
+    case previewOriginal(token: DictationSessionToken)
     case interleavedTypingChanged(token: DictationSessionToken, detected: Bool)
 }
 
@@ -217,6 +219,23 @@ final class DictationCoordinator {
     }
 
     @discardableResult
+    func cancelRewrite() -> DictationEventResponse {
+        // The literal preview finish already owns the source recording. Let
+        // it finish so canceling instructions cannot destroy the message.
+        if phase == .finalizing { return .consume }
+        if phase == .previewing, let session {
+            return DictationEventResponse(consumeKeyEvent: true, effects: [.previewOriginal(token: session.token)])
+        }
+        return escapePressed()
+    }
+
+    @discardableResult
+    func finishForRewrite() -> DictationEventResponse {
+        guard phase == .recording else { return .consume }
+        return requestFinish(mode: .literal, delivery: .preview, trigger: .rewrite)
+    }
+
+    @discardableResult
     func durationLimitReached(profileMode: DictationMode) -> DictationEventResponse {
         guard phase == .recording, session != nil else { return .passThrough }
         return requestFinish(
@@ -236,6 +255,7 @@ final class DictationCoordinator {
              (.polishing, .previewing),
              (.polishing, .pasting),
              (.previewing, .pasting),
+             (.pasting, .previewing),
              (_, .failed):
             phase = newPhase
             return true

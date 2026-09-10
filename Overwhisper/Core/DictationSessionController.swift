@@ -35,6 +35,7 @@ struct DictationSession {
     var deliveryCommitted = false
     var interleavedTyping = false
     var cancellationRequested = false
+    var finalizationRecoveryStarted = false
     var warnedAtTenMinutes = false
     var durationCapTriggered = false
     var audioURL: URL?
@@ -76,6 +77,17 @@ final class DictationSessionController {
         mutation(&session)
         active = session
         return true
+    }
+
+    /// The watchdog and normal ASR error path may become runnable together.
+    /// Only one may own recovery; the other must leave its history/preview
+    /// work running instead of cancelling or opening a second preview.
+    @discardableResult
+    func claimFinalizationRecovery(_ token: DictationSessionToken) -> Bool {
+        guard let session = active, session.token == token,
+              !session.cancellationRequested, !session.finalizationRecoveryStarted
+        else { return false }
+        return update(token) { $0.finalizationRecoveryStarted = true }
     }
 
     /// Clears only the generation named by `token`. A stale completion cannot

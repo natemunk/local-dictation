@@ -24,6 +24,18 @@ if rg -n 'URLSession|http://' \
   exit 1
 fi
 
+# The explicit clipboard-writing provider has no I/O or persistence surface.
+if rg -n 'URLSession|https?://|NSPasteboard|UserDefaults|HistoryStore|FileManager' Overwhisper/Writing; then
+  print -u2 "Privacy audit failed: clipboard-writing model/state has an external I/O surface."
+  exit 1
+fi
+
+# Selection rewriting may read only selected content, never the whole focused value.
+if rg -n 'kAXValueAttribute|NSAppleScript|URLSession|HistoryStore|UserDefaults' Overwhisper/Output/RewriteSelection.swift; then
+  print -u2 "Privacy audit failed: selection capture contains a whole-field, scripting, network, or persistence surface."
+  exit 1
+fi
+
 if rg -n -U 'AppLogger\.[^(]+\([^)]*localizedDescription' Overwhisper --glob '*.swift'; then
   print -u2 "Privacy audit failed: a dynamic error description can reach unified logging."
   exit 1

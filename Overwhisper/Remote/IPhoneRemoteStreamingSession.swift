@@ -26,6 +26,9 @@ actor IPhoneRemoteStreamingSession {
     private var state = State.active
     private var previewTask: Task<Void, Never>?
     private var finalizationTask: Task<IPhoneLocalProcessingResult, Error>?
+    private var receivedFrames = 0
+    private var partialCount = 0
+    private var previewUnavailable = false
 
     let events: AsyncStream<IPhoneStreamServerMessage>
 
@@ -49,8 +52,10 @@ actor IPhoneRemoteStreamingSession {
     }
 
     func start() -> IPhoneAudioStreamSession {
-        continuation.yield(.ready(requestID: request.requestID))
-        startPreview()
+        if state == .active {
+            continuation.yield(.ready(requestID: request.requestID))
+            startPreview()
+        }
         let events = events
         return IPhoneAudioStreamSession(
             events: events,
@@ -76,17 +81,26 @@ actor IPhoneRemoteStreamingSession {
                     try Task.checkCancellation()
                     await self?.publish(update)
                 }
+                await self?.markPreviewUnavailable()
             } catch {
                 // Live text is optional. The complete WAV and authoritative
                 // final engine remain available even when preview cannot load.
+                await self?.markPreviewUnavailable()
             }
         }
+    }
+
+    private func markPreviewUnavailable() {
+        guard state == .active, !previewUnavailable else { return }
+        previewUnavailable = true
+        continuation.yield(.previewUnavailable(requestID: request.requestID))
     }
 
     private func publish(_ update: TranscriptUpdate) {
         guard state == .active else { return }
         let text = TranscriptBufferText.join(update.finalized, update.volatile)
         guard !text.isEmpty else { return }
+        partialCount += 1
         continuation.yield(.partial(requestID: request.requestID, text: text))
     }
 
@@ -94,7 +108,18 @@ actor IPhoneRemoteStreamingSession {
         guard state == .active else { throw IPhoneEndpointFailure(.invalidRequest) }
         do {
             let samples = try await writer.append(data)
+            guard state == .active else { throw IPhoneEndpointFailure(.remotePreempted) }
             _ = source.yield(samples: samples)
+            receivedFrames += 1
+            // Receipt is acknowledged after the WAV write, never merely after
+            // an upgrade. Throttle metadata to the first frame and every 25th.
+            if receivedFrames == 1 || receivedFrames.isMultiple(of: 25) {
+                continuation.yield(.audioReceived(
+                    requestID: request.requestID,
+                    frames: receivedFrames,
+                    partials: partialCount
+                ))
+            }
         } catch IPhoneStreamWAVError.tooLong {
             await fail(.durationTooLong)
             throw IPhoneEndpointFailure(.durationTooLong)
@@ -109,8 +134,15 @@ actor IPhoneRemoteStreamingSession {
         state = .finalizing
         source.finish()
         previewTask?.cancel()
-        previewTask = nil
         await transcriber.cancel()
+        guard state == .finalizing, !Task.isCancelled else {
+            throw IPhoneEndpointFailure(.remotePreempted)
+        }
+        await previewTask?.value
+        previewTask = nil
+        guard state == .finalizing, !Task.isCancelled else {
+            throw IPhoneEndpointFailure(.remotePreempted)
+        }
 
         let audio: IPhoneStreamedAudio
         do {
@@ -118,6 +150,10 @@ actor IPhoneRemoteStreamingSession {
         } catch {
             await fail(.invalidRequest)
             throw IPhoneEndpointFailure(.invalidRequest)
+        }
+        guard state == .finalizing, !Task.isCancelled else {
+            audio.removeFile()
+            throw IPhoneEndpointFailure(.remotePreempted)
         }
 
         // The sample-derived duration is authoritative. A wildly inconsistent
@@ -158,14 +194,6 @@ actor IPhoneRemoteStreamingSession {
     }
 
     func cancel() async {
-        guard state != .finished else { return }
-        source.cancel()
-        previewTask?.cancel()
-        previewTask = nil
-        finalizationTask?.cancel()
-        finalizationTask = nil
-        await transcriber.cancel()
-        await writer.cancel()
         await fail(.remotePreempted, emitEvent: false)
     }
 
@@ -176,11 +204,18 @@ actor IPhoneRemoteStreamingSession {
         guard state != .finished else { return }
         state = .finished
         source.cancel()
-        previewTask?.cancel()
-        previewTask = nil
-        finalizationTask?.cancel()
-        finalizationTask = nil
+        let preview = previewTask
+        let finalizer = finalizationTask
+        preview?.cancel()
+        finalizer?.cancel()
+        // Mark terminal before suspension so finish() cannot launch new work.
+        // Keep ownership until inference actually exits: cancel() is a request,
+        // not proof that a Core ML operation has stopped using the shared engine.
         await transcriber.cancel()
+        await preview?.value
+        _ = try? await finalizer?.value
+        previewTask = nil
+        finalizationTask = nil
         await writer.cancel()
         if emitEvent {
             continuation.yield(.error(requestID: request.requestID, kind: kind))

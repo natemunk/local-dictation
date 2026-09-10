@@ -50,18 +50,24 @@ final class HistoryWindowController {
 }
 
 @MainActor
-private final class HistoryViewModel: ObservableObject {
+final class HistoryViewModel: ObservableObject {
     @Published var entries: [HistoryEntry] = []
     @Published var selection: UUID?
     @Published var query = ""
     @Published var errorMessage: String?
     @Published var editDraft = ""
     @Published var isEditing = false
+    @Published private(set) var conflictingText: String?
 
     let store: HistoryStore
     let onCopy: (String) -> Void
     let onRepaste: (String) -> Void
     let onAddVocabularyCorrection: (HistoryEntry) -> Void
+    private var editID: UUID?
+    private var editBaseRevision: Int64?
+    @Published private(set) var isSavingEdit = false
+    private var saveID: UUID?
+    private let writeEdit: (UUID, String?, Int64) async throws -> HistoryEntry
     private var loadGeneration: UInt64 = 0
     private var loadTask: Task<Void, Never>?
 
@@ -69,8 +75,12 @@ private final class HistoryViewModel: ObservableObject {
         store: HistoryStore,
         onCopy: @escaping (String) -> Void,
         onRepaste: @escaping (String) -> Void,
-        onAddVocabularyCorrection: @escaping (HistoryEntry) -> Void
+        onAddVocabularyCorrection: @escaping (HistoryEntry) -> Void,
+        writeEdit: ((UUID, String?, Int64) async throws -> HistoryEntry)? = nil
     ) {
+        self.writeEdit = writeEdit ?? { id, text, revision in
+            try await store.setUserEditedText(id: id, text: text, baseRevision: revision)
+        }
         self.store = store
         self.onCopy = onCopy
         self.onRepaste = onRepaste
@@ -79,41 +89,76 @@ private final class HistoryViewModel: ObservableObject {
 
     func beginEditing() {
         guard let entry = selectedEntry else { return }
+        conflictingText = nil
         editDraft = entry.userEditedText ?? entry.displayText
+        editBaseRevision = entry.entryRevision
+        editID = UUID()
         isEditing = true
     }
 
     func cancelEditing() {
         isEditing = false
+        conflictingText = nil
         editDraft = ""
+        editBaseRevision = nil
+        editID = nil
     }
 
     func saveEdit() {
-        guard let selection else { return }
-        let text = editDraft
-        Task { @MainActor [weak self, store] in
-            do {
-                _ = try await store.setUserEditedText(id: selection, text: text)
-                guard let self else { return }
-                self.cancelEditing()
-                self.reload()
-            } catch {
-                self?.handle(error)
-            }
-        }
+        guard let selection, let editID, let revision = editBaseRevision else { return }
+        persistEdit(id: selection, text: editDraft, revision: revision, editID: editID)
     }
 
     func revertEdit() {
-        guard let selection else { return }
-        Task { @MainActor [weak self, store] in
+        guard let entry = selectedEntry else { return }
+        persistEdit(id: entry.id, text: nil, revision: entry.entryRevision, editID: editID)
+    }
+
+    private func persistEdit(id: UUID, text: String?, revision: Int64, editID: UUID?) {
+        guard !isSavingEdit else { return }
+        let operation = UUID()
+        saveID = operation
+        isSavingEdit = true
+        Task { @MainActor [weak self, writeEdit] in
             do {
-                _ = try await store.setUserEditedText(id: selection, text: nil)
+                let updated = try await writeEdit(id, text, revision)
                 guard let self else { return }
-                self.cancelEditing()
-                self.reload()
+                if let index = self.entries.firstIndex(where: { $0.id == id }) {
+                    self.entries[index] = updated
+                }
+                if self.selection == id, self.editID == editID {
+                    if text == nil || self.editDraft == text {
+                        self.cancelEditing()
+                    } else {
+                        // Typing may continue while this write is suspended.
+                        // Keep those newer words and base their next save on
+                        // the revision returned by our successful write.
+                        self.editBaseRevision = updated.entryRevision
+                    }
+                }
             } catch {
-                self?.handle(error)
+                guard let self else { return }
+                if self.selection == id, self.editID == editID {
+                    // Keep this draft and its original revision. A retry must
+                    // never silently overwrite the other device's version.
+                    if let storeError = error as? HistoryStoreError,
+                       case .revisionConflict = storeError {
+                        self.errorMessage = "This entry changed on another device. Your draft is still open; copy it before cancelling and reopening the latest entry."
+                        if let latest = try? await self.store.fetch(id: id),
+                           let index = self.entries.firstIndex(where: { $0.id == id }) {
+                            self.entries[index] = latest
+                            if self.selection == id, self.editID == editID {
+                                self.conflictingText = latest.displayText
+                            }
+                        }
+                    } else {
+                        self.errorMessage = error.localizedDescription
+                    }
+                }
             }
+            guard let self, self.saveID == operation else { return }
+            self.saveID = nil
+            self.isSavingEdit = false
         }
     }
 
@@ -121,7 +166,7 @@ private final class HistoryViewModel: ObservableObject {
         let pinned = !entry.isPinned
         Task { @MainActor [weak self, store] in
             do {
-                _ = try await store.setPinned(id: entry.id, pinned)
+                _ = try await store.setPinned(id: entry.id, pinned, baseRevision: entry.entryRevision)
                 self?.reload()
             } catch {
                 self?.handle(error)
@@ -139,6 +184,10 @@ private final class HistoryViewModel: ObservableObject {
             return
         }
         errorMessage = error.localizedDescription
+    }
+
+    var selectedTextForDelivery: String {
+        isEditing ? editDraft : selectedEntry?.displayText ?? ""
     }
 
     var selectedEntry: HistoryEntry? {
@@ -317,8 +366,8 @@ private struct HistoryView: View {
                     }
                 }
                 Spacer()
-                Button("Copy") { viewModel.onCopy(entry.displayText) }
-                Button("Repaste Here") { viewModel.onRepaste(entry.displayText) }
+                Button("Copy") { viewModel.onCopy(viewModel.selectedTextForDelivery) }
+                Button("Paste Again") { viewModel.onRepaste(viewModel.selectedTextForDelivery) }
                     .buttonStyle(.borderedProminent)
                 Button("Add Vocabulary Correction…") {
                     viewModel.onAddVocabularyCorrection(entry)
@@ -336,11 +385,13 @@ private struct HistoryView: View {
                 if viewModel.isEditing {
                     Button("Cancel", action: viewModel.cancelEditing)
                     Button("Save", action: viewModel.saveEdit)
+                        .disabled(viewModel.isSavingEdit)
                         .keyboardShortcut(.defaultAction)
                 } else {
                     Button("Edit", systemImage: "pencil", action: viewModel.beginEditing)
                     if entry.userEditedText != nil {
                         Button("Revert to Original", action: viewModel.revertEdit)
+                            .disabled(viewModel.isSavingEdit)
                     }
                 }
             }
@@ -361,6 +412,14 @@ private struct HistoryView: View {
                         .frame(minHeight: 180)
                         .padding(4)
                         .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+                    if let conflictingText = viewModel.conflictingText {
+                        DisclosureGroup("Latest saved text from the other device") {
+                            Text(conflictingText)
+                                .textSelection(.enabled)
+                                .font(.caption)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
                     Text("Saving keeps the raw and polished transcripts unchanged. Clearing the field restores the original text.")
                         .font(.caption)
                         .foregroundStyle(.secondary)

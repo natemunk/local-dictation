@@ -80,6 +80,26 @@ struct DictationSessionControllerTests {
         #expect(controller.isCurrent(secondToken))
     }
 
+    @Test("only one failure path may claim recovery for the current generation")
+    func finalizationRecoveryHasOneOwner() {
+        let controller = DictationSessionController()
+        let first = token(generation: 1)
+        controller.install(session(for: first))
+        #expect(controller.claimFinalizationRecovery(first))
+        #expect(controller.active?.finalizationRecoveryStarted == true)
+        #expect(!controller.claimFinalizationRecovery(first))
+
+        let replacement = token(generation: 2)
+        controller.install(session(for: replacement))
+        #expect(!controller.claimFinalizationRecovery(first))
+        #expect(controller.claimFinalizationRecovery(replacement))
+
+        let cancelled = token(generation: 3)
+        controller.install(session(for: cancelled))
+        controller.update(cancelled) { $0.cancellationRequested = true }
+        #expect(!controller.claimFinalizationRecovery(cancelled))
+    }
+
     private func token(generation: UInt64) -> DictationSessionToken {
         DictationSessionToken(generation: generation, id: UUID())
     }

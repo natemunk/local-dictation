@@ -49,6 +49,8 @@ enum IPhoneStreamControl: Equatable, Sendable {
 
 enum IPhoneStreamServerMessage: Encodable, Equatable, Sendable {
     case ready(requestID: UUID)
+    case audioReceived(requestID: UUID, frames: Int, partials: Int)
+    case previewUnavailable(requestID: UUID)
     case partial(requestID: UUID, text: String)
     case final(IPhoneTranscriptionResponse)
     case error(requestID: UUID, kind: IPhoneEndpointErrorKind)
@@ -63,6 +65,8 @@ enum IPhoneStreamServerMessage: Encodable, Equatable, Sendable {
         case fallbackReason = "fallback_reason"
         case historyState = "history_state"
         case error
+        case receivedFrames = "received_frames"
+        case partialCount = "partial_count"
     }
 
     func encode(to encoder: Encoder) throws {
@@ -70,6 +74,14 @@ enum IPhoneStreamServerMessage: Encodable, Equatable, Sendable {
         switch self {
         case .ready(let requestID):
             try container.encode("ready", forKey: .type)
+            try container.encode(requestID.uuidString.lowercased(), forKey: .requestID)
+        case .audioReceived(let requestID, let frames, let partials):
+            try container.encode("audio_received", forKey: .type)
+            try container.encode(requestID.uuidString.lowercased(), forKey: .requestID)
+            try container.encode(frames, forKey: .receivedFrames)
+            try container.encode(partials, forKey: .partialCount)
+        case .previewUnavailable(let requestID):
+            try container.encode("preview_unavailable", forKey: .type)
             try container.encode(requestID.uuidString.lowercased(), forKey: .requestID)
         case .partial(let requestID, let text):
             try container.encode("partial", forKey: .type)

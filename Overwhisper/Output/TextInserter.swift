@@ -13,6 +13,12 @@ enum InsertionOutcome: Equatable, Sendable {
     case cancelled
 }
 
+/// Extra checks share the ordinary clipboard ownership and cancellation pipeline.
+struct InsertionGuard {
+    let preflight: @MainActor () async -> Bool
+    let beforePaste: @MainActor () async -> Bool
+}
+
 @MainActor
 final class TextInserter {
     static let concealedPasteboardType = NSPasteboard.PasteboardType(
@@ -78,13 +84,20 @@ final class TextInserter {
         _ text: String,
         destination: DictationDestination?,
         reactivateDestination: Bool = false,
-        performanceCorrelationID: UInt64? = nil
+        performanceCorrelationID: UInt64? = nil,
+        insertionGuard: InsertionGuard? = nil
     ) async -> InsertionOutcome {
         guard !Task.isCancelled else { return .cancelled }
 
         // Repasting history into a secure field must not touch the clipboard.
         guard destination?.isSecureField != true else {
             return .historyOnly(reason: "Secure fields cannot receive dictation or history paste")
+        }
+
+        if let insertionGuard {
+            guard await insertionGuard.preflight(), !Task.isCancelled else {
+                return .historyOnly(reason: "The original selection changed. Your rewrite is still in the popup; use Copy.")
+            }
         }
 
         guard let transcriptChangeCount = writeTranscript(
@@ -129,6 +142,15 @@ final class TextInserter {
         }
         guard clipboardContainsTranscript(text, changeCount: transcriptChangeCount) else {
             return .historyOnly(reason: "The clipboard changed before paste")
+        }
+        if let insertionGuard {
+            guard await insertionGuard.beforePaste(), !Task.isCancelled else {
+                return clipboardOutcome(text: text, expectedChangeCount: transcriptChangeCount,
+                                        reason: "The original selection changed before paste")
+            }
+            guard clipboardContainsTranscript(text, changeCount: transcriptChangeCount), destination.remainsValidForInsertion() else {
+                return .historyOnly(reason: "The destination or clipboard changed before paste")
+            }
         }
         guard pasteSimulator() else {
             return clipboardOutcome(

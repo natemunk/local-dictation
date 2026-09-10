@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createLiveStream } from "../../public/app/lib/live-stream.js";
 
 const REQUEST_ID = "00000000-0000-4000-8000-000000000123";
@@ -6,6 +6,7 @@ const REQUEST_ID = "00000000-0000-4000-8000-000000000123";
 class FakeWebSocket {
   static instances: FakeWebSocket[] = [];
   binaryType = "";
+  bufferedAmount = 0;
   protocol = "local-dictation.v1";
   onopen: (() => void) | null = null;
   onmessage: ((event: { data: string }) => void) | null = null;
@@ -27,6 +28,8 @@ class FakeWebSocket {
   message(value: unknown) { this.onmessage?.({ data: JSON.stringify(value) }); }
   fail() { this.onerror?.(); }
 }
+
+afterEach(() => vi.useRealTimers());
 
 function fixture(overrides: Record<string, unknown> = {}) {
   FakeWebSocket.instances = [];
@@ -60,6 +63,101 @@ function fixture(overrides: Record<string, unknown> = {}) {
 }
 
 describe("live transcription transport", () => {
+  it("keeps file fallback available when the final send throws", async () => {
+    const { stream } = fixture();
+    await stream.start();
+    const socket = FakeWebSocket.instances[0]!;
+    socket.message({ type: "ready", request_id: REQUEST_ID });
+    socket.send = () => { throw new Error("closed"); };
+    await expect(stream.finish(1)).resolves.toBeNull();
+  });
+  it("distinguishes local sending from Mac receipt and optional preview failure", async () => {
+    const onStatus = vi.fn();
+    const { stream } = fixture({ onStatus });
+    await stream.start();
+    const socket = FakeWebSocket.instances[0]!;
+    socket.open();
+    socket.message({ type: "ready", request_id: REQUEST_ID });
+    expect(onStatus).not.toHaveBeenCalled();
+    stream.push(new ArrayBuffer(1280));
+    expect(onStatus).toHaveBeenCalledWith("sending", "OK");
+    expect(onStatus).not.toHaveBeenCalledWith("receiving", expect.anything());
+    socket.message({ type: "audio_received", request_id: REQUEST_ID, received_frames: 1, partial_count: 0 });
+    expect(onStatus).toHaveBeenCalledWith("receiving", "STREAM_AUDIO_RECEIVED");
+    socket.message({ type: "preview_unavailable", request_id: REQUEST_ID });
+    expect(onStatus).toHaveBeenCalledWith("preview_unavailable", "STREAM_PREVIEW_UNAVAILABLE");
+    expect(stream.push(new ArrayBuffer(1280))).toBe(true);
+    socket.fail();
+    expect(onStatus).toHaveBeenCalledWith("fallback", "STREAM_SOCKET_FAILED");
+    await expect(stream.finish(1)).resolves.toBeNull();
+  });
+
+  it("bounds browser outgoing bytes and keeps fallback available", async () => {
+    const { stream, diagnostics } = fixture();
+    await stream.start();
+    const socket = FakeWebSocket.instances[0]!;
+    socket.message({ type: "ready", request_id: REQUEST_ID });
+    socket.bufferedAmount = 5 * 16_000 * 2;
+    expect(stream.push(new ArrayBuffer(1280))).toBe(false);
+    expect(socket.sent).toHaveLength(0);
+    expect(diagnostics.at(-1)?.code).toBe("STREAM_BUFFER_LIMIT");
+    await expect(stream.finish(1)).resolves.toBeNull();
+  });
+
+  it("bounds an ignored ticket request and cancels its signal", async () => {
+    vi.useFakeTimers();
+    let signal: AbortSignal | undefined;
+    const { stream, diagnostics } = fixture({ api: {
+      createStreamTicket: (input: { signal: AbortSignal }) => {
+        signal = input.signal;
+        return new Promise(() => {});
+      },
+    } });
+    const start = stream.start();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await expect(start).resolves.toBe(false);
+    expect(signal?.aborted).toBe(true);
+    expect(diagnostics.at(-1)?.code).toBe("STREAM_SETUP_TIMEOUT");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("ignores late or mismatched messages after cancel and clears timers", async () => {
+    vi.useFakeTimers();
+    const onStatus = vi.fn();
+    const { stream, partials } = fixture({ onStatus });
+    await stream.start();
+    const socket = FakeWebSocket.instances[0]!;
+    socket.message({ type: "partial", request_id: "wrong", text: "stale" });
+    stream.cancel();
+    const statusCount = onStatus.mock.calls.length;
+    socket.message({ type: "ready", request_id: REQUEST_ID });
+    socket.message({ type: "partial", request_id: REQUEST_ID, text: "late" });
+    expect(partials).toEqual([]);
+    expect(onStatus).toHaveBeenCalledTimes(statusCount);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not open a late socket after capture was cancelled", async () => {
+    let release!: (grant: unknown) => void;
+    const { stream } = fixture({ api: {
+      createStreamTicket: () => new Promise(resolve => { release = resolve; }),
+    } });
+    const start = stream.start();
+    stream.cancel();
+    release({ request_id: REQUEST_ID, protocol: "local-dictation.v1",
+      ticket: "ld-ticket.private", stream_path: "/stream" });
+    await expect(start).resolves.toBe(false);
+    expect(FakeWebSocket.instances).toHaveLength(0);
+  });
+
+  it("preserves a policy failure as a safe diagnostic code", async () => {
+    const { stream, diagnostics } = fixture({ WebSocketImpl: class {
+      constructor() { throw new DOMException("private URL", "SecurityError"); }
+    } });
+    await expect(stream.start()).resolves.toBe(false);
+    expect(diagnostics.at(-1)?.code).toBe("STREAM_POLICY_BLOCKED");
+    expect(JSON.stringify(diagnostics)).not.toContain("private URL");
+  });
   it("buffers PCM until ready and returns the authoritative final response", async () => {
     const { stream, diagnostics, partials } = fixture();
     const started = stream.start();

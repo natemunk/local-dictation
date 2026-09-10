@@ -1,7 +1,7 @@
 // Pure service-worker routing decisions. Imported by sw.js (registered as a
 // module worker) and exercised directly by the unit tests.
 
-export const CACHE_NAME = "dictation-inbox-shell-v3";
+export const CACHE_NAME = "dictation-inbox-shell-v5";
 
 export const SHELL_URL = "/app/index.html";
 
@@ -12,6 +12,9 @@ export const SHELL_ASSETS = Object.freeze([
   "/app/app.js",
   "/app/manifest.webmanifest",
   "/app/lib/api.js",
+  "/app/lib/build.js",
+  "/app/lib/history-actions.js",
+  "/app/lib/recording-recovery.js",
   "/app/lib/db.js",
   "/app/lib/diagnostics.js",
   "/app/lib/format.js",

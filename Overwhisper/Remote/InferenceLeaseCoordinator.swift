@@ -48,10 +48,22 @@ final class InferenceLeaseCoordinator: @unchecked Sendable {
         lock.unlock()
     }
 
-    func tryBeginRemote() -> RemoteLease? {
+    func tryBeginRemote(localRewriteBusy: Bool = false) -> RemoteLease? {
         lock.lock()
         defer { lock.unlock() }
-        guard !desktopActive, remoteLease == nil else { return nil }
+        guard !localRewriteBusy, !desktopActive, remoteLease == nil else { return nil }
+        let lease = RemoteLease()
+        remoteLease = lease
+        return lease
+    }
+
+    /// The caller must have completed source ASR before acquiring this lease.
+    /// Unlike a phone request, instruction ASR may belong to the active desktop
+    /// session. Keeping the same drain slot protects the next desktop ASR too.
+    func tryBeginLocalInstructions() -> RemoteLease? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard remoteLease == nil else { return nil }
         let lease = RemoteLease()
         remoteLease = lease
         return lease

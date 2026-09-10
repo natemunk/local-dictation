@@ -1,6 +1,7 @@
 // Bounded, transcript-free diagnostics for troubleshooting the installed PWA.
 // Only the closed field set below is persisted. Callers cannot add messages,
 // response bodies, audio, credentials, headers, URLs, or transcript text.
+import { BUILD_ID } from "./build.js";
 
 const DB_NAME = "dictation-inbox-diagnostics";
 const DB_VERSION = 1;
@@ -8,10 +9,35 @@ const STORE_EVENTS = "events";
 const MAX_EVENTS = 100;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CODES = new Set([
+  "CONNECTED",
+  "STREAM_ENDED",
+  "STREAM_UNSUPPORTED",
+  "STREAM_TICKET_INVALID",
+  "STREAM_PROTOCOL_REFUSED",
+  "STREAM_REMOTE_FAILED",
+  "STREAM_SOCKET_FAILED",
+  "STREAM_POLICY_BLOCKED",
+  "STREAM_CLOSED",
+  "STREAM_SETUP_FAILED",
+  "STREAM_BUFFER_LIMIT",
+  "STREAM_SETUP_TIMEOUT",
+  "STREAM_AUDIO_RECEIVED",
+  "STREAM_PARTIAL_RECEIVED",
+  "STREAM_PREVIEW_UNAVAILABLE",
+  "STREAM_NOT_READY",
+  "STREAM_FINAL_TIMEOUT",
+  "STREAM_CANCELLED",
+  "STREAM_CAPTURE_FAILED",
+  "STREAM_ORIGIN_REFUSED",
+  "STREAM_TICKET_REFUSED",
+  "STREAM_UNAVAILABLE",
+  "WEBSOCKET_REQUIRED",
   "OK",
   "REQUEST_STARTED",
   "MISSING_CREDENTIALS",
   "NETWORK_ERROR",
+  "REQUEST_TIMEOUT",
+  "REQUEST_CANCELLED",
   "ACCESS_DENIED",
   "MAC_UNAVAILABLE",
   "HISTORY_DISABLED",
@@ -42,13 +68,15 @@ const CODES = new Set([
   "NOT_FOUND",
 ]);
 const OPERATIONS = new Set([
+  "live_transcription",
+  "stream_ticket",
   "transcription",
   "health",
   "history_manifest",
   "history_page",
   "history_operations",
 ]);
-const PHASES = new Set(["authentication", "gateway", "response", "local_history"]);
+const PHASES = new Set(["authentication", "gateway", "response", "local_history", "stream", "socket", "final", "capture"]);
 const OUTCOMES = new Set(["started", "succeeded", "failed"]);
 const ROUTES = new Set(["none", "mac_local", "cloud_fallback"]);
 
@@ -110,6 +138,10 @@ function safeEvent(event, now) {
     code: safeCode(event.code),
     route: safeEnum(event.route, ROUTES, "none"),
     latency_ms: safeInteger(event.latencyMs, 30 * 60 * 1000),
+    ...(event.operation === "live_transcription" ? {
+      received_frames: safeInteger(event.receivedFrames, 1_000_000),
+      partial_count: safeInteger(event.partialCount, 100_000),
+    } : {}),
   };
 }
 
@@ -170,6 +202,7 @@ export async function formatDiagnostics() {
   const events = await listDiagnostics();
   return [
     "Local Dictation PWA diagnostics v1",
+    `Build: ${BUILD_ID}`,
     "No audio, transcripts, credentials, headers, URLs, or raw errors are included.",
     ...events.map((event) => JSON.stringify(event)),
   ].join("\n");

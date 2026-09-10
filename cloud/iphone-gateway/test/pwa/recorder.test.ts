@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   MAX_RECORDING_BYTES,
   MAX_RECORDING_MS,
@@ -25,6 +25,7 @@ function fakeScope(supported: string[] | null, withMedia = true): any {
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   delete (globalThis as any).MediaRecorder;
 });
 
@@ -148,12 +149,15 @@ describe("createRecorder", () => {
     expect(events.at(-1)).toBe("track-stopped");
   });
 
-  it("releases the microphone when the pre-recording hook fails", async () => {
+  it("preserves file recording when the optional streaming hook fails", async () => {
     let stopped = false;
     let constructed = false;
     class MediaRecorderStub {
       static isTypeSupported() { return true; }
       constructor() { constructed = true; }
+      state = "inactive";
+      start() { this.state = "recording"; }
+      stop() { this.state = "inactive"; }
     }
     const scope: any = {
       MediaRecorder: MediaRecorderStub,
@@ -164,14 +168,65 @@ describe("createRecorder", () => {
           }),
         },
       },
+      setInterval: () => 1,
+      clearInterval: () => {},
     };
     const recorder = createRecorder({
       scope,
       onStreamReady: async () => { throw new Error("tap_failed"); },
     });
 
-    await expect(recorder.start()).rejects.toThrow("tap_failed");
+    await expect(recorder.start()).resolves.toBeDefined();
+    expect(stopped).toBe(false);
+    expect(constructed).toBe(true);
+    recorder.cancel();
     expect(stopped).toBe(true);
-    expect(constructed).toBe(false);
+  });
+
+  it("starts the backup after a bounded hanging hook and aborts the optional tap", async () => {
+    vi.useFakeTimers();
+    let signal: AbortSignal | undefined;
+    const track = { stop: vi.fn() };
+    class Recorder {
+      static isTypeSupported() { return true; }
+      state = "inactive";
+      mimeType = "audio/mp4";
+      start() { this.state = "recording"; }
+      stop() { this.state = "inactive"; }
+    }
+    const onStreamError = vi.fn();
+    const recorder = createRecorder({ scope: {
+      MediaRecorder: Recorder, navigator: { mediaDevices: {
+        getUserMedia: async () => ({ getTracks: () => [track] }),
+      } }, setInterval, clearInterval, setTimeout, clearTimeout,
+    } as any, onStreamError, onStreamReady: (_stream, inputSignal) => {
+      signal = inputSignal;
+      return new Promise(() => {});
+    } });
+    const starting = recorder.start();
+    await vi.advanceTimersByTimeAsync(2_000);
+    await starting;
+    expect(signal?.aborted).toBe(true);
+    expect(onStreamError).toHaveBeenCalledOnce();
+    expect(recorder.active).toBe(true);
+    expect(track.stop).not.toHaveBeenCalled();
+    recorder.cancel();
+    expect(track.stop).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("releases late microphone permission after cancellation without starting capture", async () => {
+    let grant!: (stream: unknown) => void;
+    const track = { stop: vi.fn() };
+    const Recorder = vi.fn();
+    const recorder = createRecorder({ scope: { MediaRecorder: Recorder,
+      navigator: { mediaDevices: { getUserMedia: () => new Promise(resolve => { grant = resolve; }) } },
+    } as any });
+    const starting = expect(recorder.start()).rejects.toThrow("recording_cancelled");
+    recorder.cancel();
+    grant({ getTracks: () => [track] });
+    await starting;
+    expect(track.stop).toHaveBeenCalledOnce();
+    expect(Recorder).not.toHaveBeenCalled();
   });
 });

@@ -102,7 +102,7 @@ describe("the words a person reads", () => {
   });
 
   it("says the plain-language status lines", () => {
-    for (const line of ["Ready", "Recording…", "Transcribing…", "Syncing…", "Offline · showing saved history"]) {
+    for (const line of ["Ready", "Mac is receiving audio…", "Recording · file upload backup", "Transcribing…", "Syncing…", "Offline · showing saved history"]) {
       expect(js, line).toContain(line);
     }
   });

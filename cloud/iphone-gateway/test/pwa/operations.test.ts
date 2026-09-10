@@ -138,7 +138,7 @@ describe("pushOperations", () => {
     expect(await db.listSendableOperations(handle)).toEqual([]);
   });
 
-  it("drops invalid operations and keeps unanswered ones queued", async () => {
+  it("keeps invalid changes for visible resolution and unanswered ones queued", async () => {
     const { handle } = await openFreshDatabase();
     await db.enqueueOperation(handle, { op_id: "a", type: "pin", entry_id: "e1" });
     await db.enqueueOperation(handle, { op_id: "b", type: "pin", entry_id: "e2" });
@@ -147,21 +147,23 @@ describe("pushOperations", () => {
     const summary = await pushOperations({ api, database: handle, db });
 
     expect(summary.invalid).toBe(1);
-    expect((await db.listOperations(handle)).map((row: any) => row.op_id)).toEqual(["b"]);
+    expect((await db.listOperations(handle)).map((row: any) => row.op_id)).toEqual(["a", "b"]);
+    expect((await db.listConflictOperations(handle))[0].failure).toBe("invalid");
   });
 
-  it("marks a pending entry as awaiting sync once its import applies", async () => {
+  it("adopts an acknowledged imported entry without losing it before snapshot", async () => {
     const { handle } = await openFreshDatabase();
     const entry = entryFixture({ id: "p1", entry_revision: 0, local_state: "awaiting_import" });
     await db.putPendingEntry(handle, entry);
     await db.enqueueOperation(handle, buildImportOperation(entry));
 
     const queued = (await db.listOperations(handle))[0];
-    const api = fakeApi([{ op_id: queued.op_id, status: "applied", entry }]);
+    const api = fakeApi([{ op_id: queued.op_id, status: "applied", entry: { ...entry, entry_revision: 1 } }]);
     await pushOperations({ api, database: handle, db });
 
     const pending = await db.getPendingEntries(handle);
-    expect(pending[0].local_state).toBe("awaiting_sync");
+    expect(pending).toEqual([]);
+    expect((await db.getSynchronizedEntries(handle))[0].entry_revision).toBe(1);
   });
 
   it("splits the queue into batches of one hundred", async () => {

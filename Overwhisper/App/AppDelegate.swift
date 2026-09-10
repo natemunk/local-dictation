@@ -20,11 +20,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let iphoneEndpointServer = IPhoneEndpointServer()
     private let remoteAudioNormalizer = RemoteAudioNormalizer()
     private let inferenceLease = InferenceLeaseCoordinator()
+    private let iphoneHistoryConsent = HistoryPersistenceConsent()
     private var configuration = ConfigurationSnapshot.typedDefaults
     private var profileResolver = ProfileResolver(catalog: .nativeDefaults)
     private var historyStore: HistoryStore?
     private var statusItem: NSStatusItem!
     private var hotkeyManager: HotkeyManager!
+    private var clipboardRewriteWindow: ClipboardRewriteWindowController?
+    private var voiceRewrite: VoiceRewriteFlow!
+    private var rewriteSourceToken: DictationSessionToken?
+    private var rewriteExpansionPending = false
     private var audioRecorder: AudioRecorder!
     private var audioDeviceManager: AudioDeviceManager!
     private var overlayWindow: OverlayWindow!
@@ -49,6 +54,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var engineTask: Task<Void, Never>?
     private var modelMaintenanceTask: Task<Void, Never>?
     private var historyMaintenanceTask: Task<Void, Never>?
+    private var orphanAudioSweepTask: Task<Void, Never>?
     private var iphoneEndpointTask: Task<Void, Never>?
     private var iphoneEndpointGeneration: UInt64 = 0
     private var engineReloadPending = false
@@ -102,9 +108,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        voiceRewrite?.cancel()
+        clipboardRewriteWindow?.model.cancel()
         engineTask?.cancel()
         modelMaintenanceTask?.cancel()
         historyMaintenanceTask?.cancel()
+        orphanAudioSweepTask?.cancel()
         iphoneEndpointTask?.cancel()
         inferenceLease.endDesktop()
         Task { [iphoneEndpointServer] in
@@ -160,6 +169,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         audioRecorder.onCaptureFailure = { [weak self] message in
             self?.handleAudioCaptureFailure(message)
         }
+        audioRecorder.onSystemInputFallback = { [weak self] in
+            guard let self else { return }
+            self.appState.microphoneNotice = "Using system microphone · preferred input unavailable"
+        }
         audioDeviceManager = AudioDeviceManager()
         overlayWindow = OverlayWindow(appState: appState) { [weak self] in
             self?.cancelFromUI()
@@ -190,13 +203,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onCopy: { [weak self] token, text in self?.copyPreview(token: token, text: text) },
             onCancel: { [weak self] token in self?.cancelPreview(token: token) }
         )
+        let rewriteBusy: () -> Bool = { [weak self] in
+            guard let self else { return true }
+            if self.voiceRewrite?.isBusy == true { return true }
+            if self.rewriteSourceToken == self.activeSession?.token,
+               self.rewriteSourceToken != nil, self.coordinator.phase == .previewing { return false }
+            return self.coordinator.phase.hasActiveSession || self.inferenceLease.isBusy
+        }
+        let writingModel = ClipboardRewriteModel(
+            isDictationBusy: rewriteBusy,
+            copy: { [weak self] text in self?.textInserter.copyOnly(text) ?? false }
+        )
+        voiceRewrite = VoiceRewriteFlow(model: writingModel,
+            recorder: RewriteInstructionRecorder(selectedDevice: { [weak self] in
+                guard let self else { return nil }
+                let uid = self.appState.selectedInputDeviceUID
+                return uid.isEmpty ? nil : self.audioDeviceManager.device(forUID: uid)
+            }), transcribe: { [weak self] url in
+                guard let self else { throw CancellationError() }
+                return try await self.transcribeRewriteInstructions(url)
+            })
+        clipboardRewriteWindow = ClipboardRewriteWindowController(
+            model: writingModel, voice: voiceRewrite, isDictationBusy: rewriteBusy)
+        clipboardRewriteWindow?.onAccept = { [weak self] in self?.acceptDictationRewrite() }
+        clipboardRewriteWindow?.onCopyDictation = { [weak self] in self?.acceptDictationRewrite(copyOnly: true) }
+        clipboardRewriteWindow?.deliverSelection = { [weak self] text, destination, checks in
+            guard let self else { return .cancelled }
+            return await self.textInserter.insertText(text, destination: destination,
+                reactivateDestination: true, insertionGuard: checks)
+        }
+        clipboardRewriteWindow?.onDismiss = { [weak self] in
+            guard let self, let token = self.rewriteSourceToken else { return }
+            self.rewriteSourceToken = nil
+            // Cancel the rewrite, not the still-finalizing message. Its literal
+            // finish request will fall through to ordinary raw-text Preview.
+            if self.isCurrent(token) { self.execute(self.coordinator.cancelRewrite().effects) }
+        }
         hotkeyManager = HotkeyManager(
             coordinator: coordinator,
             // The global tap must not perform Accessibility work. The exact
             // destination profile is resolved after finish, outside the tap;
             // Option+Enter still carries an explicit Literal override.
             profileMode: { .clean },
-            effectHandler: { [weak self] effects in self?.execute(effects) }
+            effectHandler: { [weak self] effects in self?.execute(effects) },
+            onRewriteClipboard: { [weak self] in self?.handleRewriteHotkey() },
+            onRewriteEnter: { [weak self] in self?.clipboardRewriteWindow?.finishVoice() ?? false },
+            onRewriteEscape: { [weak self] in self?.clipboardRewriteWindow?.escapeVoice() ?? false }
         )
 
         let selected = appState.selectedInputDeviceUID
@@ -268,6 +320,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .removeDuplicates()
             .sink { [weak self] _ in
                 self?.updateRefinerPrivacyState()
+            }
+            .store(in: &cancellables)
+
+        appState.$unifiedHistoryEnabled
+            .removeDuplicates()
+            .sink { [iphoneHistoryConsent] enabled in
+                iphoneHistoryConsent.setEnabled(enabled)
             }
             .store(in: &cancellables)
 
@@ -447,6 +506,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pasteLastMenuItem = pasteLast
 
         menu.addItem(.separator())
+        let rewrite = NSMenuItem(title: "Rewrite Text…  Hyper+C", action: #selector(openClipboardRewrite), keyEquivalent: "")
+        rewrite.target = self
+        menu.addItem(rewrite)
+        let resumeRewrite = NSMenuItem(title: "Resume Last Rewrite…", action: #selector(resumeLastRewrite), keyEquivalent: "")
+        resumeRewrite.target = self
+        menu.addItem(resumeRewrite)
         let history = NSMenuItem(title: "History…", action: #selector(openHistory), keyEquivalent: "")
         history.target = self
         menu.addItem(history)
@@ -482,6 +547,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 updateSession(request.token) { $0.captureFinishTask = task }
             case .cancel(let token):
                 cancelSessionImmediately(token: token)
+            case .previewOriginal(let token):
+                guard isCurrent(token) else { continue }
+                updateSession(token) { $0.deliveredText = $0.rawText }
+                showPreview(token: token)
             case .interleavedTypingChanged(let token, let detected):
                 guard isCurrent(token) else { continue }
                 updateSession(token) { $0.interleavedTyping = detected }
@@ -512,8 +581,107 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sessionController.update(token, update)
     }
 
+    @objc private func openClipboardRewrite() {
+        if voiceRewrite.isActive { clipboardRewriteWindow?.expand() }
+        else { clipboardRewriteWindow?.beginFromFrontmost(listen: false) }
+    }
+
+    @objc private func resumeLastRewrite() { clipboardRewriteWindow?.resume() }
+
+    private func handleRewriteHotkey() {
+        if coordinator.phase == .recording {
+            rewriteSourceToken = activeSession?.token
+            rewriteExpansionPending = false
+            execute(coordinator.finishForRewrite().effects)
+        } else if rewriteSourceToken != nil && !voiceRewrite.isActive {
+            rewriteExpansionPending = true
+        } else {
+            // No clipboard, audio, or window work in the global event tap.
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if self.voiceRewrite.isActive { self.clipboardRewriteWindow?.handleActiveHotkey(); return }
+                guard !self.coordinator.phase.hasActiveSession, !self.inferenceLease.isBusy,
+                      self.appState.engineReady else { NSSound.beep(); return }
+                self.clipboardRewriteWindow?.beginFromFrontmost()
+            }
+        }
+    }
+
+    private func transcribeRewriteInstructions(_ url: URL) async throws -> String {
+        guard let engine = transcriptionEngine,
+              let lease = inferenceLease.tryBeginLocalInstructions() else { throw LocalDictationError.engineUnavailable }
+        // The caller only arrives after source ASR resolves. Retain this lease
+        // until the actual provider returns, even if its caller is canceled.
+        let task = Task { try await engine.transcribe(audioURL: url) }
+        lease.installCancellation { task.cancel() }
+        defer { inferenceLease.endRemote(lease) }
+        return try await withTaskCancellationHandler {
+            let result = try await task.value
+            try Task.checkCancellation()
+            return result.text
+        } onCancel: { task.cancel() }
+    }
+
+    private func acceptDictationRewrite(copyOnly: Bool = false) {
+        guard let token = rewriteSourceToken, isCurrent(token),
+              let model = clipboardRewriteWindow?.model, model.isComplete, !model.isRunning, !model.isDelivering else { return }
+        let text = model.result
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        if copyOnly && !textInserter.copyOnly(text) {
+            model.setNotice(PreviewNotice.copyFailureMessage)
+            return
+        }
+        model.isDelivering = true
+        let original = model.isOriginal
+        let generated = !original && model.usedLocalModel
+        updateSession(token) {
+            $0.deliveredText = text
+            $0.cleanupMode = original ? .literal : .clean
+            $0.pastedRaw = original
+            $0.refinementStatus = generated ? .succeeded : .notRequested
+            $0.refinerBackend = generated ? "apple_foundation" : "none"
+            $0.refinementOutcome = generated ? "accepted" : "not_requested"
+            // This explicit writing step has no dictation-cleanup timing sample.
+            // Mark the backend honestly; the metric remains timing-incomplete.
+            $0.metricCleanupBackend = generated ? "apple_foundation" : "none"
+        }
+        rewriteSourceToken = nil
+        if copyOnly {
+            updateSession(token) { $0.deliveryCommitted = true }
+            appState.lastTranscription = text
+        }
+        clipboardRewriteWindow?.dismiss(restoreFocus: copyOnly, notify: false)
+        let task = Task { @MainActor [weak self] in
+            defer { model.isDelivering = false; model.dictationCanPaste = false }
+            guard let self else { return }
+            await self.finalizeHistoryBeforeDelivery(token: token, refinementLatency: nil)
+            guard !Task.isCancelled, self.isCurrent(token) else { return }
+            model.isDelivering = false
+            model.dictationCanPaste = false
+            if copyOnly {
+                self.updateSession(token) { $0.deliveryCommitted = true }
+                self.appState.lastTranscription = text
+                await self.updateHistoryDelivery(token: token, status: .previewed, deliveredText: text)
+                guard self.isCurrent(token) else { return }
+                self.queueMeasuredMetric(token: token, outcome: .previewed, deliveredText: text)
+                self.completeSession(token: token)
+            } else { self.deliverPreview(token: token, text: text) }
+        }
+        updateSession(token) { $0.finalizationTask = task }
+    }
+
+    private func abandonVoiceRewrite(for token: DictationSessionToken) {
+        guard rewriteSourceToken == token else { return }
+        rewriteSourceToken = nil
+        rewriteExpansionPending = false
+        voiceRewrite.cancel()
+        clipboardRewriteWindow?.dismiss(restoreFocus: false, notify: false)
+    }
+
     private func beginCapture(token: DictationSessionToken) {
         guard coordinator.owns(token) else { return }
+        voiceRewrite?.cancel()
+        clipboardRewriteWindow?.interruptForDictation()
         inferenceLease.beginDesktop()
 
         if let prior = activeSession, prior.token != token {
@@ -538,6 +706,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // These happen before permission checks or model work so the key-down
         // feedback path stays under the 100 ms product gate.
         appState.beginRecording()
+        appState.overlayMessage = "Dictating message"
         overlayWindow.show(position: appState.overlayPosition, token: token)
         DictationPerformanceSignposts.emit(.overlay, correlationID: token.generation)
 
@@ -714,11 +883,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let destination = await DictationDestination.captureFrontmostWithRetry()
-        // Accessibility retries do not necessarily observe Swift task
-        // cancellation. Re-check generation ownership before touching the
-        // process-wide recorder so Escape + an immediate restart cannot let an
-        // old finish task stop the new recording.
+        // Capture the app identity at finish, then stop microphone hardware
+        // before any potentially slow AX messages. Audio drainage is separate
+        // and remains owned by this recording generation.
+        let destinationApplication = NSWorkspace.shared.frontmostApplication
+        let stoppedRecording: AudioRecorder.StoppedRecording
+        do {
+            stoppedRecording = try audioRecorder.stopCapture()
+        } catch {
+            failSession(token: request.token, "Could not finish the recording: \(error.localizedDescription)")
+            return
+        }
+        let destination = await DictationDestination.captureFrontmostWithRetry(for: destinationApplication)
         guard !Task.isCancelled, isCurrent(request.token) else { return }
         let initialProfile = resolveProfile(for: destination).profile
         updateSession(request.token) {
@@ -729,7 +905,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let audioURL: URL
         do {
-            audioURL = try await audioRecorder.stopRecording()
+            audioURL = try await audioRecorder.finishStoppedRecording(stoppedRecording)
             guard !Task.isCancelled, isCurrent(request.token) else {
                 if FileManager.default.fileExists(atPath: audioURL.path) {
                     try? FileManager.default.removeItem(at: audioURL)
@@ -757,15 +933,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             updateSession(request.token) { $0.audioURL = nil }
             appState.liveTranscript = LiveTranscript()
             appState.overlayMessage = "Secure field · recording discarded"
-            completeSession(token: request.token, toastDuration: .milliseconds(250))
+            completeSession(token: request.token, toastDuration: .seconds(2))
             return
         }
 
+        if request.trigger == .rewrite, rewriteSourceToken == request.token {
+            overlayWindow.hide(token: request.token)
+            voiceRewrite.begin(source: nil, dictation: true, listen: !rewriteExpansionPending)
+            clipboardRewriteWindow?.show(allowDuringDictation: true)
+            if rewriteExpansionPending { clipboardRewriteWindow?.expand() }
+        }
+
+        let recordingDuration = activeSession.map {
+            max(0, ($0.stoppedAt ?? Date()).timeIntervalSince($0.startedAt))
+        } ?? 0
+        let finalizationDeadline = DictationFinalizationDeadline.seconds(
+            selection: activeSession?.asrSelection ?? appState.asrSelection,
+            audioDuration: recordingDuration
+        )
         let watchdog = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(120))
+            try? await Task.sleep(for: .seconds(finalizationDeadline))
             guard !Task.isCancelled, let self, self.isCurrent(request.token) else { return }
-            self.activeSession?.finalizationTask?.cancel()
-            self.failSession(token: request.token, "Transcription exceeded its two-minute safety deadline. The recording was not pasted.")
+            await self.recoverFinalizationTimeout(token: request.token)
         }
         updateSession(request.token) { $0.finalizationWatchdog = watchdog }
 
@@ -807,7 +996,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let engine = self.activeSession?.engine else {
                     throw LocalDictationError.engineUnavailable
                 }
-                try await self.inferenceLease.waitForRemoteRelease()
+                try await self.inferenceLease.waitForRemoteRelease(timeout: .seconds(finalizationDeadline))
                 try Task.checkCancellation()
                 guard self.isCurrent(request.token) else { return }
                 if let selection = self.activeSession?.asrSelection {
@@ -880,7 +1069,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     )
                     await self.handleEOUFallback(
                         fallback.transcript,
-                        batchError: error,
                         token: request.token,
                         asrLatency: latency
                     )
@@ -900,26 +1088,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateSession(request.token) { $0.finalizationTask = finalizationTask }
     }
 
-    /// A 120M EOU preview is useful recovery text, not authoritative ASR. It
-    /// bypasses commands and cleanup and can only enter an editable preview.
+    private func recoverFinalizationTimeout(token: DictationSessionToken) async {
+        guard let session = activeSession, session.token == token,
+              !session.finalizationRecoveryStarted
+        else { return }
+        let recovery = DictationRecoveryText.select(
+            rawText: session.rawText,
+            liveText: appState.liveTranscript.displayed
+        )
+        // Detach the watchdog before cancelling: the old task's defer must not
+        // cancel this recovery while it waits for history persistence.
+        updateSession(token) {
+            $0.finalizationWatchdog = nil
+            $0.finalizationTask = nil
+        }
+        session.finalizationTask?.cancel()
+        cancelStreamingSession(token: token)
+        guard let recovery else {
+            failSession(token: token, "Transcription timed out. No recovery text is available; please record again.")
+            return
+        }
+        await handleTranscriptRecovery(
+            recovery.transcript,
+            source: recovery.source,
+            reason: "Transcription timed out; review the recovered text before copying or pasting.",
+            token: token,
+            asrLatency: session.metricTiming.asrLatencySeconds
+                ?? session.stoppedAt.map { Date().timeIntervalSince($0) } ?? 0
+        )
+    }
+
+    /// EOU recovery is preview-only and never executes commands or cleanup.
     private func handleEOUFallback(
         _ raw: FinalTranscript,
-        batchError: Error,
         token: DictationSessionToken,
         asrLatency: Double
     ) async {
-        guard isCurrent(token), !raw.text.isEmpty else { return }
+        await handleTranscriptRecovery(
+            raw,
+            source: .eouPreviewFallback,
+            reason: "Batch transcription failed; review the recovered live text before copying or pasting.",
+            token: token,
+            asrLatency: asrLatency
+        )
+    }
+
+    private func handleTranscriptRecovery(
+        _ raw: FinalTranscript,
+        source: ASRTranscriptSource,
+        reason: String,
+        token: DictationSessionToken,
+        asrLatency: Double
+    ) async {
+        guard !Task.isCancelled, !raw.text.isEmpty,
+              sessionController.claimFinalizationRecovery(token)
+        else { return }
         updateSession(token) { session in
             session.rawText = raw.text
             session.deliveredText = raw.text
             session.cleanupMode = .literal
             session.metricDictationMode = .literal
-            session.metricSpeechEngine = "fluidaudio"
-            session.metricSpeechModel = "parakeet-eou-320ms"
+            if source == .eouPreviewFallback {
+                session.metricSpeechEngine = "fluidaudio"
+                session.metricSpeechModel = "parakeet-eou-320ms"
+            }
             session.metricCleanupBackend = "none"
             session.recognizedCommandCount = 0
             session.refinementStatus = .notRequested
-            session.asrOutcome = "eou_preview_fallback"
+            session.asrOutcome = source == .eouPreviewFallback ? "eou_preview_fallback" : "final"
             session.refinerBackend = "none"
             session.refinementOutcome = "not_requested"
             session.pastedRaw = true
@@ -928,12 +1164,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lastTextMenuItem?.isEnabled = true
         pasteLastMenuItem?.isEnabled = true
 
-        let historySaved = await saveRawHistory(
-            token: token,
-            mode: .literal,
-            asrLatency: asrLatency,
-            unrecognizedCommands: []
-        )
+        let historySaved: Bool
+        if activeSession?.historyID != nil {
+            historySaved = true
+        } else {
+            historySaved = await saveRawHistory(
+                token: token, mode: .literal, asrLatency: asrLatency, unrecognizedCommands: []
+            )
+        }
         guard !Task.isCancelled, isCurrent(token) else { return }
 
         if historySaved,
@@ -950,23 +1188,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         totalLatency: activeSession.map {
                             Date().timeIntervalSince($0.startedAt)
                         },
-                        error: "Batch ASR failed; EOU preview fallback: \(batchError.localizedDescription)",
+                        error: reason,
                         asrSelection: activeSession?.asrSelection.rawValue,
-                        asrOutcome: "eou_preview_fallback",
+                        asrOutcome: source == .eouPreviewFallback ? "eou_preview_fallback" : "final",
                         refinerBackend: "none",
                         refinementOutcome: "not_requested"
                     )
                 )
             } catch {
-                appState.lastError = "EOU recovery history could not be finalized: \(error.localizedDescription)"
+                appState.lastError = "Recovery history could not be finalized: \(error.localizedDescription)"
             }
         } else {
             let copied = textInserter.copyOnly(raw.text)
             appState.lastError = copied
-                ? "History is unavailable; the EOU recovery transcript was copied and opened in Preview."
-                : "History and clipboard recovery are unavailable; the EOU transcript remains open in Preview."
+                ? "History is unavailable; the recovery transcript was copied and opened in Preview."
+                : "History and clipboard recovery are unavailable; the recovery text remains open in Preview."
         }
         showPreview(token: token)
+        previewWindow.showNotice(reason, token: token)
     }
 
     private func handleRawTranscript(
@@ -1025,6 +1264,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             appState.lastError = copied
                 ? "History is unavailable; dictation continued with clipboard recovery."
                 : "History and the recovery clipboard write failed; dictation delivery will still be attempted."
+        }
+
+        if request.trigger == .rewrite, rewriteSourceToken == token {
+            updateSession(token) {
+                $0.deliveredText = raw.text
+                $0.refinementStatus = .notRequested
+                $0.refinerBackend = "none"
+                $0.refinementOutcome = "not_requested"
+            }
+            await finalizeHistoryBeforeDelivery(token: token, refinementLatency: nil)
+            guard !Task.isCancelled, isCurrent(token),
+                  coordinator.transition(token: token, to: .previewing) else { return }
+            // Dismissal may happen during the awaited history write above.
+            guard rewriteSourceToken == token else { showPreview(token: token); return }
+            updateSession(token) { $0.state = .previewing }
+            appState.phase = .previewing
+            overlayWindow.hide(token: token)
+            voiceRewrite.resolveSource(raw.text)
+            return
         }
 
         let refinerBackend = cleanupMode == .clean
@@ -1149,9 +1407,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showPreview(token: DictationSessionToken) {
+        abandonVoiceRewrite(for: token)
         guard let session = activeSession,
               session.token == token,
-              coordinator.transition(token: token, to: .previewing)
+              (coordinator.phase == .previewing || coordinator.transition(token: token, to: .previewing))
         else { return }
         updateSession(token) { $0.state = .previewing }
         appState.phase = .previewing
@@ -1197,6 +1456,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appState.recordInsertionDiagnostic(outcome)
         guard isCurrent(token) else { return }
 
+        var toastDuration = Duration.milliseconds(250)
         switch outcome {
         case .pasteEventSent:
             let deliveryStatus: HistoryDeliveryStatus = session.pastedRaw
@@ -1215,7 +1475,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             updateSession(token) { $0.deliveryCommitted = true }
         case .clipboardOnly(let reason):
-            appState.overlayMessage = "Copied to clipboard"
+            appState.overlayMessage = "Copied · ⌘V to paste"
+            toastDuration = .seconds(2)
             appState.lastError = reason
             await updateHistoryDelivery(
                 token: token,
@@ -1230,14 +1491,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             updateSession(token) { $0.deliveryCommitted = true }
         case .historyOnly(let reason):
-            appState.overlayMessage = "Saved to history"
+            guard session.historyID != nil else {
+                appState.lastError = "Clipboard and history are unavailable; your text remains open in Preview."
+                showPreview(token: token)
+                previewWindow.showNotice(appState.lastError!, token: token)
+                return
+            }
+            toastDuration = .seconds(2)
             appState.lastError = reason
-            await updateHistoryDelivery(
+            let historyConfirmed = await updateHistoryDelivery(
                 token: token,
                 status: .historyOnly,
                 deliveredText: insertionText,
                 error: reason
             )
+            guard isCurrent(token) else { return }
+            guard historyConfirmed else {
+                showPreview(token: token)
+                previewWindow.showNotice("Clipboard and history recovery failed. Your text is still here; select it to copy manually.", token: token)
+                return
+            }
+            appState.overlayMessage = "Saved to history · Copy or Paste Again"
             queueMeasuredMetric(
                 token: token,
                 outcome: .historyOnly,
@@ -1259,7 +1533,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         appState.lastTranscription = insertionText
-        completeSession(token: token, toastDuration: .milliseconds(250))
+        completeSession(token: token, toastDuration: toastDuration)
     }
 
     private func deliverPreview(token: DictationSessionToken, text: String) {
@@ -1280,13 +1554,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func copyPreview(token: DictationSessionToken, text: String) {
         guard isCurrent(token) else { return }
+        guard previewWindow.attemptCopy(text, token: token, using: textInserter.copyOnly) else {
+            appState.lastError = PreviewNotice.copyFailureMessage
+            return
+        }
         updateSession(token) {
             $0.deliveredText = text
             $0.deliveryCommitted = true
         }
-        if !textInserter.copyOnly(text) {
-            appState.lastError = "Could not copy the preview text to the clipboard"
-        }
+        appState.lastTranscription = text
         previewWindow.close(token: token)
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -1315,6 +1591,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func cancelSessionImmediately(token: DictationSessionToken) {
+        abandonVoiceRewrite(for: token)
         guard matchesActiveSession(token) else { return }
         let pasteMayHaveBeenCommitted = appState.phase == .pasting
         updateSession(token) {
@@ -1372,6 +1649,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func failSession(token: DictationSessionToken, _ message: String) {
+        abandonVoiceRewrite(for: token)
         guard let session = activeSession,
               session.token == token,
               !session.cancellationRequested
@@ -1421,6 +1699,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         toastDuration: Duration? = nil
     ) {
         guard let session = activeSession, session.token == token else { return }
+        abandonVoiceRewrite(for: token)
         let toastMessage = appState.overlayMessage
         retireRuntime(session, hideOverlay: toastDuration == nil)
         inferenceLease.endDesktop()
@@ -1636,8 +1915,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ready: appState.iphoneEndpointEnabled
                 && appState.engineReady
                 && transcriptionEngine != nil
-                && !inferenceLease.isBusy,
-            busy: inferenceLease.isBusy,
+                && !inferenceLease.isBusy && voiceRewrite?.isBusy != true,
+            busy: inferenceLease.isBusy || voiceRewrite?.isBusy == true,
             selectedEngine: appState.engineReady ? appState.asrSelection.rawValue : nil
         )
     }
@@ -1681,8 +1960,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               appState.engineReady,
               let engine = transcriptionEngine
         else { throw IPhoneEndpointFailure(.engineUnavailable) }
-        guard activeSession == nil else { throw IPhoneEndpointFailure(.desktopBusy) }
-        guard let lease = inferenceLease.tryBeginRemote() else {
+        guard activeSession == nil, voiceRewrite?.isBusy != true else { throw IPhoneEndpointFailure(.desktopBusy) }
+        guard let lease = inferenceLease.tryBeginRemote(localRewriteBusy: clipboardRewriteWindow?.model.blocksRemoteInference == true) else {
             throw IPhoneEndpointFailure(.remoteBusy)
         }
 
@@ -1703,7 +1982,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let started = ContinuousClock.now
         // Resolved on MainActor before the detached work starts; the save then
         // happens on the history actor, never here.
-        let unifiedHistoryStore = appState.unifiedHistoryEnabled ? historyStore : nil
+        let unifiedHistoryStore = historyStore
+        let historyAuthorization = iphoneHistoryConsent.authorization()
 
         let work = Task.detached(priority: .utility) {
             try await Self.runIPhoneTranscription(
@@ -1717,7 +1997,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 cleanupExecutor: executor,
                 deadline: deadline,
                 started: started,
-                unifiedHistoryStore: unifiedHistoryStore
+                unifiedHistoryStore: unifiedHistoryStore,
+                historyAuthorization: historyAuthorization
             )
         }
         lease.installCancellation { work.cancel() }
@@ -1765,8 +2046,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               appState.engineReady,
               let engine = transcriptionEngine
         else { throw IPhoneEndpointFailure(.engineUnavailable) }
-        guard activeSession == nil else { throw IPhoneEndpointFailure(.desktopBusy) }
-        guard let lease = inferenceLease.tryBeginRemote() else {
+        guard activeSession == nil, voiceRewrite?.isBusy != true else { throw IPhoneEndpointFailure(.desktopBusy) }
+        guard let lease = inferenceLease.tryBeginRemote(localRewriteBusy: clipboardRewriteWindow?.model.blocksRemoteInference == true) else {
             throw IPhoneEndpointFailure(.remoteBusy)
         }
 
@@ -1797,7 +2078,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let cleanup = makeIPhoneCleanupPipeline(mode: request.mode)
         let executor = CleanupExecutor()
         let started = ContinuousClock.now
-        let unifiedHistoryStore = appState.unifiedHistoryEnabled ? historyStore : nil
+        let unifiedHistoryStore = historyStore
+        let historyAuthorization = iphoneHistoryConsent.authorization()
         let leaseCoordinator = inferenceLease
         let metricRequest = IPhoneTranscriptionRequest(
             requestID: request.requestID,
@@ -1828,16 +2110,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         duration: duration
                     ),
                     started: started,
-                    unifiedHistoryStore: unifiedHistoryStore
+                    unifiedHistoryStore: unifiedHistoryStore,
+                    historyAuthorization: historyAuthorization
                 )
             },
             completion: { [weak self] result in
-                leaseCoordinator.endRemote(lease)
                 await self?.completeIPhoneAudioStream(
                     result,
                     metricRequest: metricRequest,
                     selection: selection
                 )
+                // Publish completion before admitting another remote request,
+                // so stale status cannot clear the next request's activity.
+                leaseCoordinator.endRemote(lease)
             }
         )
         lease.installCancellation {
@@ -1877,7 +2162,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         cleanupExecutor: CleanupExecutor,
         deadline: Duration,
         started: ContinuousClock.Instant,
-        unifiedHistoryStore: HistoryStore?
+        unifiedHistoryStore: HistoryStore?,
+        historyAuthorization: HistoryPersistenceAuthorization?
     ) async throws -> IPhoneLocalProcessingResult {
         try await withThrowingTaskGroup(of: IPhoneLocalProcessingResult.self) { group in
             group.addTask {
@@ -1895,7 +2181,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     requestedCleanupBackend: requestedCleanupBackend,
                     cleanupExecutor: cleanupExecutor,
                     started: started,
-                    unifiedHistoryStore: unifiedHistoryStore
+                    unifiedHistoryStore: unifiedHistoryStore,
+                    historyAuthorization: historyAuthorization
                 )
             }
             group.addTask {
@@ -1921,7 +2208,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         cleanupExecutor: CleanupExecutor,
         deadline: Duration,
         started: ContinuousClock.Instant,
-        unifiedHistoryStore: HistoryStore?
+        unifiedHistoryStore: HistoryStore?,
+        historyAuthorization: HistoryPersistenceAuthorization?
     ) async throws -> IPhoneLocalProcessingResult {
         let processingRequest = IPhoneTranscriptionRequest(
             requestID: request.requestID,
@@ -1945,7 +2233,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     requestedCleanupBackend: requestedCleanupBackend,
                     cleanupExecutor: cleanupExecutor,
                     started: started,
-                    unifiedHistoryStore: unifiedHistoryStore
+                    unifiedHistoryStore: unifiedHistoryStore,
+                    historyAuthorization: historyAuthorization
                 )
             }
             group.addTask {
@@ -1971,7 +2260,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         requestedCleanupBackend: IPhoneCleanupBackend,
         cleanupExecutor: CleanupExecutor,
         started: ContinuousClock.Instant,
-        unifiedHistoryStore: HistoryStore?
+        unifiedHistoryStore: HistoryStore?,
+        historyAuthorization: HistoryPersistenceAuthorization?
     ) async throws -> IPhoneLocalProcessingResult {
         try Task.checkCancellation()
         let asrStarted = ContinuousClock.now
@@ -2008,6 +2298,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let elapsed = max(0, started.duration(to: .now).seconds)
         let historyState = await Self.saveIPhoneHistory(
             store: unifiedHistoryStore,
+            authorization: historyAuthorization,
             request: request,
             rawText: raw.text,
             cleanedText: cleaned.text,
@@ -2043,6 +2334,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// of the same ID is idempotent. Never logs transcript text.
     private static func saveIPhoneHistory(
         store: HistoryStore?,
+        authorization: HistoryPersistenceAuthorization?,
         request: IPhoneTranscriptionRequest,
         rawText: String,
         cleanedText: String,
@@ -2053,10 +2345,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         cleanupLatency: TimeInterval?,
         totalLatency: TimeInterval
     ) async -> IPhoneHistoryState {
-        guard let store else { return .disabled }
+        guard let store, let authorization else { return .disabled }
         let isClean = request.mode == .clean
         do {
-            _ = try await store.saveRemote(
+            let saved = try await store.saveRemote(
                 HistoryRemoteCapture(
                     id: request.requestID,
                     rawText: rawText,
@@ -2072,9 +2364,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     asrSelection: selection.rawValue,
                     refinerBackend: isClean ? cleanupBackend.rawValue : "none",
                     refinementOutcome: cleanupOutcome
-                )
+                ),
+                authorization: authorization
             )
-            return .savedOnMac
+            return saved == nil ? .disabled : .savedOnMac
         } catch {
             // The device keeps the text and imports it later.
             AppLogger.app.error("Unified history could not store an iPhone transcription")
@@ -2702,17 +2995,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @discardableResult
     private func updateHistoryDelivery(
         token: DictationSessionToken,
         status: HistoryDeliveryStatus,
         deliveredText: String,
         error: String? = nil
-    ) async {
+    ) async -> Bool {
         guard let historyStore,
               let session = activeSession,
               session.token == token,
               let id = session.historyID
-        else { return }
+        else { return false }
         let stopToPasteLatency = status == .pasteEventSent || status == .pastedRaw
             ? session.stoppedAt.map { Date().timeIntervalSince($0) }
             : nil
@@ -2732,10 +3026,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     stopToPasteLatency: stopToPasteLatency
                 )
             )
+            return true
         } catch {
             if isCurrent(token) {
                 appState.lastError = "Could not finalize history: \(error.localizedDescription)"
             }
+            return false
         }
     }
 
@@ -3291,19 +3587,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func cleanupOrphanedTemporaryAudio() {
-        let directory = FileManager.default.temporaryDirectory
-        guard let files = try? FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: nil
-        ) else { return }
-        let orphanPrefixes = ["local_dictation_recording_", "local-dictation-iphone-"]
-        let cutoff = Date().addingTimeInterval(-60 * 60)
-        for file in files where orphanPrefixes.contains(where: file.lastPathComponent.hasPrefix) {
-            let values = try? file.resourceValues(forKeys: [.contentModificationDateKey])
-            guard let modified = values?.contentModificationDate, modified < cutoff else { continue }
-            try? FileManager.default.removeItem(at: file)
+        orphanAudioSweepTask?.cancel()
+        let candidates = TemporaryAudioOrphanSweep.capture(in: FileManager.default.temporaryDirectory)
+        let deferred = TemporaryAudioOrphanSweep.removeEligible(candidates)
+        guard !deferred.isEmpty else { return }
+        orphanAudioSweepTask = Task.detached(priority: .utility) {
+            do {
+                try await Task.sleep(for: .seconds(TemporaryAudioOrphanSweep.minimumAge + 1))
+                try Task.checkCancellation()
+                TemporaryAudioOrphanSweep.removeEligible(deferred)
+            } catch { }
         }
     }
+
 }
 
 private enum LocalDictationError: LocalizedError {

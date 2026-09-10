@@ -16,10 +16,13 @@ actor FluidAudioParakeetStreamingTranscriber: StreamingTranscriber {
 
     private var sessionID: UUID?
     private var worker: Task<Void, Never>?
+    private var finishingTask: Task<String, Error>?
+    private var shutdown = StreamingShutdownDrain()
     private var outputContinuation: AsyncStream<TranscriptUpdate>.Continuation?
     private var sessionFailure: StreamingTranscriberError?
     private var lastSequence: Int64?
     private var latestUpdate = TranscriptUpdate(finalized: "", volatile: "")
+    private var startGeneration: UInt64 = 0
 
     init(
         manager: StreamingEouAsrManager = StreamingEouAsrManager(chunkSize: .ms320),
@@ -32,6 +35,7 @@ actor FluidAudioParakeetStreamingTranscriber: StreamingTranscriber {
     }
 
     func prepare() async throws {
+        guard shutdown.task == nil else { throw CancellationError() }
         guard !isPrepared else { return }
         if let preparationTask {
             try await preparationTask.value
@@ -66,7 +70,9 @@ actor FluidAudioParakeetStreamingTranscriber: StreamingTranscriber {
     func start(
         samples: AsyncStream<AudioChunk>
     ) async throws -> AsyncStream<TranscriptUpdate> {
-        guard worker == nil else { throw StreamingTranscriberError.alreadyRunning }
+        guard worker == nil, shutdown.task == nil else { throw StreamingTranscriberError.alreadyRunning }
+        startGeneration &+= 1
+        let generation = startGeneration
 
         // EOU is an optional preview aid. Delay its first preparation so short
         // dictations never compete with the authoritative batch engine, and so
@@ -76,8 +82,11 @@ actor FluidAudioParakeetStreamingTranscriber: StreamingTranscriber {
             try await prepare()
         }
         try Task.checkCancellation()
+        guard startGeneration == generation else { throw CancellationError() }
 
         await manager.reset()
+        try Task.checkCancellation()
+        guard startGeneration == generation else { throw CancellationError() }
 
         let id = UUID()
         let pair = AsyncStream<TranscriptUpdate>.makeStream(
@@ -104,19 +113,19 @@ actor FluidAudioParakeetStreamingTranscriber: StreamingTranscriber {
         guard let id = sessionID, let worker else {
             throw StreamingTranscriberError.noActiveSession
         }
-
-        // The recorder finishes its AsyncStream after AudioOutputUnitStop. Drain
-        // that bounded buffer before flushing FluidAudio's decoder tail.
-        await worker.value
-        guard sessionID == id else { throw StreamingTranscriberError.noActiveSession }
-
-        if let sessionFailure {
-            closeSession(id: id)
-            throw sessionFailure
-        }
+        guard finishingTask == nil else { throw StreamingTranscriberError.alreadyRunning }
+        let task = Task { try await self.finishDecoder(sessionID: id, worker: worker) }
+        finishingTask = task
 
         do {
-            let tail = try await manager.finish()
+            let tail = try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
+            try Task.checkCancellation()
+            guard sessionID == id else { throw CancellationError() }
+            finishingTask = nil
             let finalText = StreamingTranscriptText.join(
                 latestUpdate.finalized,
                 StreamingTranscriptText.normalized(tail).isEmpty
@@ -130,6 +139,14 @@ actor FluidAudioParakeetStreamingTranscriber: StreamingTranscriber {
             closeSession(id: id)
             return final
         } catch {
+            // A cancelled finish must never publish or clear a successor's
+            // buffer after the decoder's asynchronous finish returns.
+            if Task.isCancelled, sessionID == id {
+                await cancelActiveWork()
+                throw CancellationError()
+            }
+            guard sessionID == id, !Task.isCancelled else { throw CancellationError() }
+            finishingTask = nil
             let failure = StreamingTranscriberError.inferenceFailed(
                 error.localizedDescription
             )
@@ -138,11 +155,19 @@ actor FluidAudioParakeetStreamingTranscriber: StreamingTranscriber {
         }
     }
 
+    private func finishDecoder(sessionID id: UUID, worker: Task<Void, Never>) async throws -> String {
+        // Drain recorded chunks before flushing the decoder tail. This whole
+        // operation is retained so cancellation waits before resetting it.
+        await worker.value
+        try Task.checkCancellation()
+        guard sessionID == id else { throw CancellationError() }
+        if let sessionFailure { throw sessionFailure }
+        return try await manager.finish()
+    }
+
     func cancel() async {
-        preparationTask?.cancel()
-        preparationTask = nil
-        guard let id = sessionID else { return }
-        await cancel(sessionID: id)
+        startGeneration &+= 1
+        await cancelActiveWork()
     }
 
     private func consume(
@@ -251,6 +276,7 @@ actor FluidAudioParakeetStreamingTranscriber: StreamingTranscriber {
         outputContinuation?.finish()
         outputContinuation = nil
         worker = nil
+        finishingTask = nil
         sessionID = nil
         sessionFailure = nil
         lastSequence = nil
@@ -258,18 +284,44 @@ actor FluidAudioParakeetStreamingTranscriber: StreamingTranscriber {
 
     private func cancel(sessionID id: UUID) async {
         guard sessionID == id else { return }
+        await cancelActiveWork()
+    }
+
+    private func cancelActiveWork() async {
+        if let pending = shutdown.task {
+            await pending.value
+            return
+        }
+        guard preparationTask != nil || worker != nil || finishingTask != nil || sessionID != nil else { return }
+        let preparation = preparationTask
         let activeWorker = worker
+        let finish = finishingTask
         let continuation = outputContinuation
+        let manager = manager
 
         sessionID = nil
-        worker = nil
         outputContinuation = nil
         sessionFailure = nil
         lastSequence = nil
 
+        preparation?.cancel()
         activeWorker?.cancel()
+        finish?.cancel()
         continuation?.finish()
-        await manager.reset()
+        // Keep start() closed until this exact worker and its reset have
+        // drained. Otherwise an immediate restart could be reset by this old
+        // cancellation after it has already acquired a new session.
+        let pending = shutdown.begin {
+            _ = try? await preparation?.value
+            await activeWorker?.value
+            _ = try? await finish?.value
+            await manager.reset()
+        }
+        await pending.value
+        preparationTask = nil
+        worker = nil
+        finishingTask = nil
+        shutdown.clear()
     }
 
     nonisolated private static func defaultModelRootURL() -> URL {

@@ -30,7 +30,7 @@ On first launch:
 4. Wait for the local model to move through Downloading, Validating, and Optimizing. The first download is roughly 600 MB and macOS optimization can take several minutes.
 5. Confirm Settings → Speech says **Ready**.
 
-For a first dictation, open Apple Notes, click in a blank note, tap Hyper+D, speak, then tap Hyper+D again. Local Dictation sends Command+V only if the destination is still safe. Otherwise, the transcript remains available on the clipboard and in Local Dictation History.
+For a first dictation, open Apple Notes, click in a blank note, tap Hyper+D, speak, then tap Hyper+D again. Local Dictation sends Command+V only if the destination is still safe. Otherwise, it offers clipboard or history recovery; if neither succeeds, a review window keeps the text available.
 
 ## Set up a Hyper key
 
@@ -114,9 +114,107 @@ The global shortcut is Hyper+D (`Command+Control+Option+Shift+D`):
 
 If you type any other key while recording, Enter immediately and permanently returns to the foreground app for that session. The overlay says `Typing detected · Hyper+D to finish`; Hyper+D remains the finisher. Local Dictation never synthesizes Return and cannot auto-submit a form or terminal command.
 
-Insertion is deliberately conservative. At finish, Local Dictation briefly retries transient Accessibility focus misses while keeping the captured frontmost app fixed. It posts Command+V to the exact captured editable AX element, a reviewed same-focus-token app, or—when an app exposes no focused field—a reviewed destination whose app PID and focused AX window both remain unchanged. Otherwise it leaves verified text on the clipboard. It never follows focus into another app/window or claims that posting a paste event proves an editor accepted it. Normal attempts leave ordinary text on the clipboard for clipboard-manager recovery. Optional **Private Clipboard Mode** adds best-effort concealed/transient markers. Secure fields discard the recording before batch transcription, history, or clipboard use. Terminal destinations are forced to Literal mode and automatic insertion removes every line break.
+Insertion is deliberately conservative. At finish, Local Dictation briefly retries transient Accessibility focus misses while keeping the captured frontmost app fixed. It posts Command+V to the exact captured editable AX element, a reviewed same-focus-token app, or—when an app exposes no focused field—a reviewed destination whose app PID and focused AX window both remain unchanged. Otherwise it leaves verified text on the clipboard. It never follows focus into another app/window or claims that posting a paste event proves an editor accepted it. Normal attempts leave ordinary text on the clipboard for clipboard-manager recovery. Optional **Private Clipboard Mode** adds best-effort concealed/transient markers. Microphone capture stops before the bounded Accessibility check while the finish-time app remains fixed. Secure fields discard the recording before batch transcription, history, or clipboard use. Terminal destinations are forced to Literal mode and automatic insertion removes every line break.
 
 The overlay warns at 10 minutes. Recording stops at the hard 15-minute cap and opens preview instead of inserting automatically; configuration may shorten this cap but cannot extend it.
+
+
+## Voice-guided rewriting (Hyper+C)
+
+**Select text and press Hyper+C** to speak instructions such as “make this shorter
+and friendlier.” Source priority is active dictation, readable selection, then
+clipboard when an empty selection is confirmed. If the app cannot read the
+selection, the popup offers **Use current clipboard…** or typed source text;
+it does not silently substitute unrelated clipboard contents. Protected fields
+are excluded from selection capture. From Local Dictation's own windows, Hyper+C
+uses the clipboard and labels that choice; it never reads your History selection.
+
+The compact popup clearly indicates when the microphone is listening and shows
+live instruction text. **Enter** finishes instructions and rewrites locally.
+Review and edit before accepting. **Command+Return** replaces a validated TextEdit
+selection, pastes an active dictation to its captured destination, or copies other
+results. The button always names the action. Other editors support selection as
+source when Accessibility exposes it, with Copy until replacement is verified.
+
+**While dictating:** start with **Hyper+D**, then press **Hyper+C** instead of
+finishing. The message ends and separate instruction recording begins. Message
+ASR may finish while instructions are captured; source and instruction batch ASR
+never overlap. Instructions are never appended to the message or treated as commands.
+
+**While listening, Hyper+C again** stops recording and opens options, retaining
+instructions without automatically rewriting. During transcription/generation,
+it opens options without starting another job. **While reviewing a completed
+result, Hyper+C starts a spoken revision of that edited result.** The immutable
+original remains available to the local model as reference. **Options / Command+O**
+opens the menu from the compact popup without recording.
+
+Eight presets plus Custom instruction are available: Clean up, Make concise,
+Simplify, Friendly message, Draft an email, Project update, Organize into bullets,
+and **Draft a reply**. Reply drafting requires direction about what to say and
+always defaults to Copy; it never replaces the incoming message or sends anything.
+Use arrows and Return in the preset list, Tab between controls, and normal editing
+keys inside text fields. In the instructions field, **Return** rewrites and
+**Shift+Return** inserts a newline. **Previous / Next / Original** navigate up to
+five recent drafts and the immutable original. Next from Original returns to the
+last-viewed draft; edits to Original are retained as a separate draft. Manual edits
+are preserved before another revision.
+
+In TextEdit, **Insert after selection** preserves the selected text and adds a
+blank line plus the result immediately after it. Replace/Insert require the exact
+original editable element, selected range, and selected text to remain valid.
+They never operate on terminals or protected fields. If checks fail before copying,
+the clipboard is untouched; later failures retain the draft and report the fallback.
+**Replace and Insert use the clipboard and leave the result there.** There is no
+automatic clipboard restoration or paste retry. A posted paste event is not proof
+that an arbitrary editor accepted it; TextEdit's plain/rich text paths have a separate
+opt-in acceptance harness.
+
+Escape during instructions or generation cancels the operation; a prior completed
+draft remains available. Escape from review closes the popup. Canceling while the
+original dictation is still transcribing lets it finish into ordinary Preview.
+Dismissing its rewrite after transcription also returns to raw Preview, where you
+can accept the original message or cancel it explicitly.
+**Rewrite Text…** starts a new source-based session; **Resume Last Rewrite…**
+reopens the retained draft without recapturing text or recording. Clipboard refresh
+asks before discarding content, skips confirmation for an empty recovery screen,
+and is disabled while linked to active dictation. Explicit clipboard recovery from
+a voice invocation starts instruction recording; recovery from Options stays in
+Options. Closing during a revision retains the previous completed draft, including
+manual edits. If no completed draft exists yet, Resume opens the source and options.
+Restarting the app discards these memory-only drafts.
+
+iPhone requests return busy while local rewriting is running or draining instead
+of canceling it. Desktop dictation still preempts remote inference. See the
+[reliability validation and test checklist](docs/rewrite-reliability-validation.md).
+
+Selection/clipboard sources, draft replies, versions, and instruction text never
+enter history or iPhone sync. Originating dictation and explicitly accepted text
+follow ordinary dictation history policy and reuse its existing provenance fields.
+Manual edits without a model call do not claim an AI cleanup. Private Clipboard
+Mode still applies to every clipboard write.
+
+Only Apple's on-device writing model is used (macOS 26+ with Apple Intelligence).
+The experimental dictation cleanup setting and any configured text endpoint do
+not control this feature. Oversized source/instruction input is rejected rather
+than truncated. Instruction recording stops at one minute and requires review;
+instruction transcription and rewriting each have a 45-second cancellation limit.
+Live instruction preview is optional; final batch ASR remains authoritative.
+Instruction audio is temporary and deleted after completion/cancellation, never
+retained by Debug Session or history. A lazy separate EOU preview decoder is reused
+for instruction recordings; no preview inference runs while idle.
+
+Desktop dictation preempts clipboard voice instructions. Phone work reports busy
+while instructions are being recorded/transcribed; canceled instruction inference
+must drain before another batch ASR starts. Phone dictation can still interrupt a
+clipboard rewrite once instruction transcription is complete.
+
+Apple also assigns Hyper+C to its Traditional-to-Simplified Chinese conversion
+Service. Local Dictation consumes this chord through its event tap while running;
+another shortcut utility can still intercept it first. Use the menu entry if it
+conflicts and check System Settings → Keyboard → Keyboard Shortcuts → Services
+and Raycast assignments. The app does not change those settings. Actual shortcut
+precedence, recording handoff timing, and cross-app focus require a manual check.
+
 
 ## Source-build details
 
@@ -217,7 +315,7 @@ Local values override typed defaults. A malformed edit is rejected transactional
 
 Runtime behavior is intentionally small: terminals use Literal mode, ordinary apps use Clean prose with explicit formatting only, and Linear uses Clean structured paragraphs with protected ticket IDs. Friendly app matches cover Slack, Notes, Notion, and generic browsers without duplicating policy. Legacy hostname settings are parsed as ignored values and surfaced as a configuration notice.
 
-History is actor-isolated GRDB/SQLite with WAL and FTS5. Raw text is saved before cleanup/delivery for every nonsecure session when the history store is healthy; if it is unavailable, Local Dictation first copies the raw result for recovery, shows a warning, and continues normal cleanup/delivery. Successful, failed, pending, and cancelled rows share the configurable 90-day default retention. Search falls back to escaped literal matching when an FTS query cannot represent punctuation.
+History is actor-isolated GRDB/SQLite with WAL and FTS5. Raw text is saved before cleanup/delivery for every nonsecure session when the history store is healthy; if it is unavailable, Local Dictation first copies the raw result for recovery, shows a warning, and continues normal cleanup/delivery. Successful, failed, pending, and cancelled rows share the configurable 90-day default retention. History edits check the revision that was opened and preserve your draft if another device changed it. A failed Copy keeps the review window open. The finalization watchdog respects the selected engine's duration-aware deadline and offers available raw/partial text for review when it times out. Search falls back to escaped literal matching when an FTS query cannot represent punctuation.
 
 The same local database also has a separate `dictation_metrics` table for transcript-free analytics. Analytics are enabled by default and can be disabled under Settings → Privacy without affecting dictation. Destination-app analytics have their own switch. **Delete Transcript History**, **Reset Analytics**, and **Delete Everything** have intentionally separate scopes; transcript retention never cascades into metrics. Delete Everything removes both database datasets plus retained debug sessions, then checkpoints and rebuilds the database files. Home Base is only an optional read-only viewer and Local Dictation does not require it to be installed or running. Local Dictation preserves honest outcomes such as `paste_event_sent`, `pasted_raw`, and `previewed`; Home Base must recognize those values before treating them as successful deliveries for time-saved calculations.
 
@@ -293,7 +391,7 @@ Core dependencies are pinned in `Package.resolved`: FluidAudio, WhisperKit, GRDB
 
 ## Status and acceptance
 
-The current automated snapshot is 219 Swift tests across 34 suites plus 289 Worker/PWA tests across 15 files. On the current development Mac, two consecutive same-identity source installs retained Microphone, Input Monitoring, Accessibility, and Hyper+D readiness, and the menu-bar agent remained alive after Settings closed. The additive metrics migration, honest legacy backfill, real measured-event write, and Home Base's read-only schema/event parsing have also been exercised against the installed app; Home Base outcome classification still needs the consumer-side alignment described above. The existing Access-protected gateway, PWA file-upload flow, visible cloud fallback, and unified history have been exercised from an iPhone. This live-streaming revision still requires a Worker redeploy, Mac app reinstall, and real-device Safari comparison; the staged 20-dictation rollout also remains pending. The full product requirements, corpus contracts, and acceptance matrix are checked in under [docs](docs). Source compilation and contract tests are not evidence that latency, accuracy, sleep/wake recovery, the full cross-app insertion matrix, or the one-week Raycast cutover gates have passed.
+Current source changes, an installed Mac build, and a deployed Worker are separate states. Local hardening now adds recoverable phone uploads, ordered history mutations, honest audio-receipt feedback, cancellation draining, bounded response bodies, and idle-only PWA updates. Worker/PWA tests and type checks run in CI alongside the Swift checks. See [docs/hardening-validation.md](docs/hardening-validation.md) for this change's verification and release checklist. No test count, health check, socket upgrade, or source build proves live Safari audio transmission, partial results, latency, accuracy, sleep/wake recovery, or cross-app insertion. The existing Mac and deployed Safari fixes remain in use until an explicitly approved install/deploy; real-device acceptance of these source changes is pending.
 
 ## Origin and license
 

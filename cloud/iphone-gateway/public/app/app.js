@@ -5,6 +5,9 @@
 // third-party code. Audio never touches storage; credentials never reach a log.
 
 import * as db from "./lib/db.js";
+import { changeEntry, saveTranscript, visibleEntries } from "./lib/history-actions.js";
+import { createRecordingRecovery, canApplyUpdate } from "./lib/recording-recovery.js";
+import { BUILD_ID } from "./lib/build.js";
 import {
   ApiError,
   ERROR_ACCESS_DENIED,
@@ -32,10 +35,6 @@ import {
   SYNC_NEEDS_CREDENTIALS,
   SYNC_OFFLINE,
   SYNC_OK,
-  buildDeleteOperation,
-  buildEditOperation,
-  buildImportOperation,
-  buildPinOperation,
   runSync,
 } from "./lib/sync.js";
 import { entryFromImport, importErrorMessage, parseImportFragment } from "./lib/fragment.js";
@@ -59,6 +58,7 @@ import { randomUuid } from "./lib/uuid.js";
 
 const MAX_IMPORT_CHARACTERS = 100_000;
 const SEARCH_APPEARS_ABOVE = 5;
+const HISTORY_PAGE_SIZE = 5;
 const COPIED_MS = 1500;
 const TOAST_MS = 2000;
 
@@ -75,11 +75,17 @@ const dom = {
   search: document.getElementById("search-input"),
   list: document.getElementById("entry-list"),
   listEmpty: document.getElementById("list-empty"),
+  historyActions: document.getElementById("history-actions"),
   settingsButton: document.getElementById("settings-button"),
   main: document.getElementById("main-view"),
   detail: document.getElementById("detail-view"),
   settings: document.getElementById("settings-view"),
   toast: document.getElementById("toast"),
+  recovery: document.getElementById("recording-recovery"),
+  copyRecovery: document.getElementById("copy-recovery"),
+  persistentRecord: document.getElementById("persistent-record"),
+  update: document.getElementById("update-ready"),
+  globalControls: document.getElementById("global-controls"),
 };
 
 const state = {
@@ -88,6 +94,7 @@ const state = {
   pending: [],
   operations: [],
   query: "",
+  historyVisibleCount: HISTORY_PAGE_SIZE,
   credentials: null,
   cleanUp: true,
   allowCloudFallback: false,
@@ -109,10 +116,13 @@ const state = {
   showOriginal: false,
   askDelete: false,
   askClear: false,
+  askRemoveAll: false,
+  removingAll: false,
   showSecret: false,
   testResult: null,
   diagnosticCount: 0,
   liveText: "",
+  liveStatus: "connecting",
 };
 
 let recorder = null;
@@ -122,6 +132,12 @@ let recordingRequestId = null;
 let recordingMode = null;
 let recordingAllowsCloudFallback = null;
 let toastTimer = null;
+let waitingWorker = null;
+let updateRequested = false;
+let syncTask = null;
+let syncAgain = false;
+let editGeneration = 0;
+const recovery = createRecordingRecovery();
 
 const api = createApiClient({ getCredentials: () => state.credentials });
 
@@ -187,12 +203,7 @@ function notOnMacIds() {
 
 /** Synchronized cache plus local-only entries, de-duplicated by id. */
 function combinedEntries() {
-  const byId = new Map();
-  for (const entry of state.entries) byId.set(entry.id, entry);
-  for (const entry of state.pending) {
-    if (!byId.has(entry.id)) byId.set(entry.id, entry);
-  }
-  return [...byId.values()];
+  return visibleEntries(state.entries, state.pending, state.operations);
 }
 
 function findEntry(id) {
@@ -250,7 +261,7 @@ function describeProblem(error) {
     }
     if (error.code === ERROR_INVALID_AUDIO) {
       return problemWithReference(
-        { text: "The recording could not be read.", label: "Record again", run: retry },
+        { text: "The recording could not be read.", label: "Record again", run: recordAgain },
         error,
       );
     }
@@ -294,7 +305,14 @@ function setProblem(error) {
 
 function retry() {
   state.problem = null;
-  void sync();
+  if (recovery.pending !== null) void submitPendingRecording();
+  else void sync();
+}
+
+function recordAgain() {
+  if (!recovery.discard()) return;
+  state.problem = null;
+  void startRecording();
 }
 
 /* --------------------------------------------------------------- rendering */
@@ -302,6 +320,8 @@ function retry() {
 function renderSetup() {
   clear(dom.setup);
 
+  clear(dom.copyRecovery);
+  if (state.copyFallbackText === null && dom.copyRecovery.open) dom.copyRecovery.close();
   if (state.copyFallbackText !== null) {
     const card = el("section", "card");
     card.append(el("p", "caption", "Press and hold the text to copy it."));
@@ -313,7 +333,8 @@ function renderSetup() {
       state.copyFallbackText = null;
       renderSetup();
     }));
-    dom.setup.append(card);
+    dom.copyRecovery.append(card);
+    if (!dom.copyRecovery.open) dom.copyRecovery.showModal();
     area.focus();
     area.select();
   }
@@ -362,7 +383,15 @@ function labelled(text, input) {
 
 function statusInfo() {
   if (state.recordingStarting) return { text: "Starting microphone…" };
-  if (state.recording) return { text: "Recording…" };
+  if (state.recording) return { text: state.liveStatus === "receiving"
+    ? "Mac is receiving audio…"
+    : state.liveStatus === "preview_unavailable"
+      ? "Live words unavailable · recording continues"
+      : state.liveStatus === "sending"
+        ? "Sending audio · waiting for Mac…"
+    : state.liveStatus === "fallback"
+      ? "Recording · file upload backup"
+      : "Recording · connecting live audio…" };
   if (state.transcribing) return { text: "Transcribing…" };
   if (state.problem !== null) {
     const reference = typeof state.problem.reference === "string"
@@ -370,6 +399,7 @@ function statusInfo() {
       : "";
     return { text: `${state.problem.text}${reference}`, bad: true, action: state.problem };
   }
+  if (recovery.pending !== null) return { text: "Recording kept on this page. Retry when you are ready." };
   if (state.historyDisabled) return { text: "Your Mac is not saving history yet." };
   if (state.syncing) return { text: "Syncing…" };
   if (!state.online) return { text: "Offline · showing saved history" };
@@ -390,6 +420,7 @@ function renderRecord() {
   dom.recordButton.className = state.recording ? "record-button on" : "record-button";
   dom.recordButton.disabled = state.recordingStarting
     || state.transcribing
+    || recovery.pending !== null
     || !isRecordingSupported();
 
   dom.timer.hidden = !state.recording;
@@ -398,6 +429,7 @@ function renderRecord() {
   dom.liveTranscript.hidden = state.liveText === "";
   dom.liveTranscript.textContent = state.liveText;
 
+  renderGlobalControls();
   const info = statusInfo();
   dom.status.textContent = info.text;
   dom.status.className = info.bad === true ? "status bad" : "status";
@@ -406,6 +438,45 @@ function renderRecord() {
   if (info.action !== undefined && info.action !== null && info.action.label !== null) {
     dom.statusAction.append(button(info.action.label, "big", info.action.run));
   }
+}
+
+function updateIsSafe() {
+  return canApplyUpdate({ ...state, hasRecording: recovery.pending !== null,
+    settingsOpen: !dom.settings.hidden });
+}
+
+function renderGlobalControls() {
+  clear(dom.persistentRecord);
+  const away = dom.main.hidden && (state.recording || state.recordingStarting || state.transcribing);
+  dom.globalControls.className = away ? "global-controls active-sheet" : "global-controls";
+  for (const sheet of [dom.settings, dom.detail]) sheet.className = away ? "sheet with-recording" : "sheet";
+  dom.persistentRecord.hidden = !away;
+  if (away) {
+    dom.persistentRecord.append(el("p", "status", statusInfo().text));
+    if (state.recording) dom.persistentRecord.append(button("Stop recording", "big", () => void stopRecording()));
+  }
+  clear(dom.recovery);
+  dom.recovery.hidden = recovery.pending === null || (dom.main.hidden && !state.transcribing);
+  if (!dom.recovery.hidden) {
+    if (state.transcribing) {
+      dom.recovery.append(button("Cancel transcription", "plain", () => recovery.cancel()));
+    } else {
+      dom.recovery.append(el("p", "caption", "Your recording is kept on this page until you retry or discard it. Closing this page loses it."));
+      dom.recovery.append(button("Retry recording", "big", () => void submitPendingRecording()));
+      dom.recovery.append(button("Discard recording", "plain warn", () => {
+        if (!recovery.discard()) return;
+        state.problem = null;
+        render();
+      }));
+    }
+  }
+  clear(dom.update);
+  dom.update.hidden = waitingWorker === null || !updateIsSafe();
+  if (!dom.update.hidden) dom.update.append(button("Update ready · reload", "plain", () => {
+    if (!updateIsSafe() || waitingWorker === null) return;
+    updateRequested = true;
+    waitingWorker.postMessage({ type: "ACTIVATE_UPDATE" });
+  }));
 }
 
 function renderResult() {
@@ -459,7 +530,6 @@ function entryRow(entry, notOnMac) {
 function renderList() {
   const all = combinedEntries();
   const notOnMac = notOnMacIds();
-  const matches = searchEntries(all, state.query);
 
   dom.history.hidden = state.credentials === null && all.length === 0;
   dom.search.hidden = all.length <= SEARCH_APPEARS_ABOVE;
@@ -467,9 +537,30 @@ function renderList() {
     state.query = "";
     dom.search.value = "";
   }
+  // Search always covers the complete saved history, independent of browsing
+  // depth. Clearing it restores the user's previous browsing limit.
+  const matches = searchEntries(all, state.query);
+  const searching = state.query.trim() !== "";
+  const visible = searching ? matches : matches.slice(0, state.historyVisibleCount);
 
   clear(dom.list);
-  for (const entry of matches) dom.list.append(entryRow(entry, notOnMac.has(entry.id)));
+  for (const entry of visible) dom.list.append(entryRow(entry, notOnMac.has(entry.id)));
+
+  clear(dom.historyActions);
+  dom.historyActions.hidden = searching || visible.length >= matches.length;
+  if (!dom.historyActions.hidden) {
+    dom.historyActions.append(el("p", "caption", `Showing ${visible.length} of ${matches.length}`));
+    const actions = el("div", "trio");
+    actions.append(button("Load more", "plain", () => {
+      state.historyVisibleCount += HISTORY_PAGE_SIZE;
+      renderList();
+    }));
+    actions.append(button("Show all", "plain", () => {
+      state.historyVisibleCount = Infinity;
+      renderList();
+    }));
+    dom.historyActions.append(actions);
+  }
 
   dom.listEmpty.hidden = matches.length > 0;
   dom.listEmpty.textContent = state.query === ""
@@ -508,10 +599,18 @@ function renderDetail() {
   const conflict = conflictFor(entry.id);
   if (conflict !== null) {
     const card = el("section", "card");
-    card.append(el("p", "ask", "This was also changed on your Mac."));
+    card.append(el("p", "ask", conflict.failure === "invalid"
+      ? "This change could not be saved. Your words are still here."
+      : "This was also changed on your Mac."));
+    if (conflict.type === "edit") {
+      card.append(el("h3", null, "Your change"), el("p", "transcript", conflict.text));
+      card.append(el("h3", null, "On your Mac"), el("p", "transcript", displayTextOf(conflict.server_entry) || "No saved text"));
+    } else {
+      card.append(el("p", "caption", conflict.type === "delete" ? "You asked to delete this." : "You changed whether to keep this pinned."));
+    }
     const row = el("div", "trio");
-    row.append(button("Keep mine", "plain", () => void keepMine(conflict)));
-    row.append(button("Use Mac's", "plain", () => void useMacs(conflict)));
+    if (conflict.failure !== "invalid") row.append(button("Keep mine", "plain", () => void keepMine(conflict)));
+    row.append(button(conflict.failure === "invalid" ? "Discard this change" : "Use Mac's", "plain", () => void useMacs(conflict)));
     card.append(row);
     body.append(card);
   }
@@ -527,6 +626,7 @@ function renderDetail() {
     const row = el("div", "trio");
     row.append(button("Save", "plain", () => void saveEdit(entry)));
     row.append(button("Cancel", "plain", () => {
+      editGeneration += 1;
       state.editing = false;
       state.editDraft = "";
       state.showOriginal = false;
@@ -569,6 +669,7 @@ function renderDetail() {
     } else {
       const row = el("div", "trio");
       row.append(button("Edit", "plain", () => {
+        editGeneration += 1;
         state.editing = true;
         state.editDraft = displayTextOf(entry);
         renderDetail();
@@ -669,18 +770,27 @@ function renderSettings() {
   historyActions.append(button("Export", "plain", exportEntries));
   historyActions.append(button("Copy all", "plain", () => void copyAll()));
   if (state.askClear) {
-    historyActions.append(el("p", "ask", "Delete history on this phone?"));
+    historyActions.append(el("p", "ask", "Refresh the saved copy from your Mac? Unsaved work and your key stay here."));
     const row = el("div", "trio");
-    row.append(button("Delete", "plain warn", () => void clearHistory()));
+    row.append(button("Refresh saved copy", "plain", () => void clearHistory()));
     row.append(button("Cancel", "plain", () => {
       state.askClear = false;
       renderSettings();
     }));
     historyActions.append(row);
   } else {
-    historyActions.append(button("Delete history on this phone", "plain warn", () => {
+    historyActions.append(button("Refresh saved copy", "plain", () => {
       state.askClear = true;
       renderSettings();
+    }));
+  }
+  if (state.askRemoveAll) {
+    historyActions.append(el("p", "ask", "Remove every saved word and your key from this phone? Changes not yet on your Mac will be lost. Your Mac is untouched."));
+    historyActions.append(button("Remove all phone data", "plain warn", () => void removeAllPhoneData()));
+    historyActions.append(button("Cancel", "plain", () => { state.askRemoveAll = false; renderSettings(); }));
+  } else {
+    historyActions.append(button("Remove all data from this phone", "plain warn", () => {
+      state.askRemoveAll = true; renderSettings();
     }));
   }
   history.append(historyActions);
@@ -690,6 +800,7 @@ function renderSettings() {
   const diagnostics = el("section", "group");
   const diagnosticCount = state.diagnosticCount;
   diagnostics.append(el("h2", null, "Diagnostics"));
+  diagnostics.append(el("p", "caption", `App ${BUILD_ID}`));
   diagnostics.append(el(
     "p",
     "caption",
@@ -740,6 +851,7 @@ function render() {
   renderList();
   renderDetail();
   renderSettings();
+  renderGlobalControls();
 }
 
 /* --------------------------------------------------------------- data load */
@@ -762,8 +874,22 @@ async function reload() {
 
 /* -------------------------------------------------------------------- sync */
 
-async function sync({ silent = false } = {}) {
-  if (state.syncing) return;
+function sync(options = {}) {
+  if (state.removingAll) return syncTask ?? Promise.resolve();
+  if (state.syncing) {
+    syncAgain = true;
+    return syncTask;
+  }
+  syncTask = (async () => {
+    do {
+      syncAgain = false;
+      await performSync(options);
+    } while (syncAgain && !state.removingAll);
+  })().finally(() => { syncTask = null; });
+  return syncTask;
+}
+
+async function performSync({ silent = false } = {}) {
   if (state.credentials === null) {
     if (!silent) openSettings();
     return;
@@ -806,15 +932,17 @@ async function startRecording() {
     openSettings();
     return;
   }
-  if (!isRecordingSupported() || state.recordingStarting || state.recording || state.transcribing) {
+  if (!isRecordingSupported() || state.recordingStarting || state.recording || state.transcribing || recovery.pending !== null || state.removingAll) {
     return;
   }
 
   state.recordingStarting = true;
+  state.liveStatus = "connecting";
   state.problem = null;
   renderRecord();
 
   const requestId = randomUuid();
+  recordingRequestId = requestId;
   const mode = state.cleanUp ? "clean" : "literal";
   const allowsCloudFallback = state.allowCloudFallback;
   let candidateCapture = null;
@@ -827,6 +955,11 @@ async function startRecording() {
         requestId,
         mode,
         allowCloudFallback: allowsCloudFallback,
+        onStatus: (status) => {
+          if (recordingRequestId !== requestId) return;
+          state.liveStatus = status;
+          renderRecord();
+        },
         onPartial: (text) => {
           if (recordingRequestId !== requestId) return;
           state.liveText = text;
@@ -837,9 +970,16 @@ async function startRecording() {
         onChunk: (chunk) => candidateStream?.push(chunk),
       });
     } catch {
+      state.liveStatus = "fallback";
+      void recordDiagnostic({ operation: "live_transcription", phase: "capture",
+        outcome: "failed", requestId, code: "STREAM_CAPTURE_FAILED" });
       candidateCapture = null;
       candidateStream = null;
     }
+  } else {
+    state.liveStatus = "fallback";
+    void recordDiagnostic({ operation: "live_transcription", phase: "capture",
+      outcome: "failed", requestId, code: "STREAM_UNSUPPORTED" });
   }
 
   recorder = createRecorder({
@@ -847,8 +987,8 @@ async function startRecording() {
       state.elapsedMs = elapsed;
       dom.timer.textContent = formatElapsed(elapsed);
     },
-    onAutoStop: () => {
-      toast("Ten minute limit reached");
+    onAutoStop: (reason) => {
+      toast(reason === "size" ? "Recording size limit reached" : "Ten minute limit reached");
       void stopRecording();
     },
     onError: () => {
@@ -866,17 +1006,27 @@ async function startRecording() {
       toast("Recording stopped");
       renderRecord();
     },
-    onStreamReady: async (microphoneStream) => {
+    onStreamError: () => {
+      candidateStream?.captureFailed();
+      void candidateCapture?.cancel();
+      if (liveStream === candidateStream) liveStream = null;
+      if (pcmCapture === candidateCapture) pcmCapture = null;
+      if (recordingRequestId === requestId) {
+        state.liveStatus = "fallback";
+        renderRecord();
+      }
+    },
+    onStreamReady: async (microphoneStream, signal) => {
       if (candidateCapture === null || candidateStream === null) return;
       try {
-        await candidateCapture.attach(microphoneStream);
+        await candidateCapture.attach(microphoneStream, { signal });
         if (liveStream !== candidateStream) {
           await candidateCapture.cancel();
           return;
         }
         pcmCapture = candidateCapture;
       } catch {
-        candidateStream.cancel();
+        candidateStream.captureFailed();
         await candidateCapture.cancel();
         if (liveStream === candidateStream) liveStream = null;
         if (pcmCapture === candidateCapture) pcmCapture = null;
@@ -889,17 +1039,6 @@ async function startRecording() {
     recordingMode = mode;
     recordingAllowsCloudFallback = allowsCloudFallback;
     liveStream = candidateStream;
-    if (candidateCapture !== null) {
-      try {
-        await candidateCapture.prepare();
-      } catch {
-        candidateStream?.cancel();
-        await candidateCapture.cancel();
-        candidateCapture = null;
-        candidateStream = null;
-        liveStream = null;
-      }
-    }
     const streamStart = candidateStream?.start() ?? Promise.resolve(false);
     await recorder.start();
     if (candidateCapture !== null && candidateStream !== null) {
@@ -973,47 +1112,49 @@ async function stopRecording() {
     return;
   }
 
-  let response = activeStream === null
-    ? null
-    : await activeStream.finish(recording.durationSeconds);
-
-  if (response === null) {
-    if (!isGatewayCompatible(recording.mimeType)) {
-      state.problem = {
-        text: "This browser cannot send audio your Mac accepts.",
-        label: null,
-        run: null,
-      };
-      state.elapsedMs = 0;
-      state.liveText = "";
-      state.transcribing = false;
-      renderRecord();
-      return;
-    }
-    try {
-      response = await uploadRecording(recording, requestId, mode, allowsCloudFallback);
-    } catch (error) {
-      state.elapsedMs = 0;
-      state.liveText = "";
-      state.transcribing = false;
-      setProblem(error);
-      render();
-      return;
-    }
-  }
-
-  await acceptTranscription(response, requestId, mode);
+  recovery.retain({ recording, requestId, mode, allowCloudFallback: allowsCloudFallback });
+  await submitPendingRecording(activeStream);
 }
 
-async function uploadRecording(recording, requestId, mode, allowCloudFallback) {
-  return api.transcribe({
-    blob: recording.blob,
-    mimeType: recording.mimeType,
-    durationSeconds: recording.durationSeconds,
-    mode,
-    allowCloudFallback,
-    requestId,
-  });
+async function submitPendingRecording(activeStream = null) {
+  if (recovery.pending === null || recovery.busy || state.removingAll) return;
+  const { requestId, mode } = recovery.pending;
+  state.transcribing = true;
+  state.problem = null;
+  renderRecord();
+  try {
+    const response = await recovery.submit(async (pending, signal) => {
+      const cancelStream = () => activeStream?.cancel();
+      signal.addEventListener("abort", cancelStream, { once: true });
+      try {
+        let result = activeStream === null ? null : await activeStream.finish(pending.recording.durationSeconds);
+        if (signal.aborted) throw new DOMException("Cancelled", "AbortError");
+        if (result !== null) return result;
+        if (!isGatewayCompatible(pending.recording.mimeType)) {
+          throw new ApiError(ERROR_UNSUPPORTED_AUDIO, "Unsupported recording");
+        }
+        return await api.transcribe({
+          blob: pending.recording.blob,
+          mimeType: pending.recording.mimeType,
+          durationSeconds: pending.recording.durationSeconds,
+          mode: pending.mode,
+          allowCloudFallback: pending.allowCloudFallback,
+          requestId: pending.requestId,
+          signal,
+        });
+      } finally {
+        signal.removeEventListener("abort", cancelStream);
+      }
+    });
+    await acceptTranscription(response, requestId, mode);
+  } catch (error) {
+    state.elapsedMs = 0;
+    state.transcribing = false;
+    state.problem = error?.name === "AbortError" || error?.code === "REQUEST_CANCELLED"
+      ? { text: "Transcription cancelled. Your recording is still here.", label: null, run: null }
+      : describeProblem(error);
+    render();
+  }
 }
 
 async function acceptTranscription(response, requestId, mode) {
@@ -1050,10 +1191,7 @@ async function acceptTranscription(response, requestId, mode) {
 
   const persistenceStartedAt = Date.now();
   try {
-    await db.putPendingEntry(state.handle, entry);
-    if (!savedOnMac) {
-      await db.enqueueOperation(state.handle, buildImportOperation(entry));
-    }
+    await saveTranscript(state.handle, entry, savedOnMac);
     if (historyState === "disabled") state.historyDisabled = true;
 
     await db.setSetting(state.handle, db.SETTING_LAST_ROUTE, entry.remote_route);
@@ -1096,58 +1234,45 @@ async function acceptTranscription(response, requestId, mode) {
 /* ------------------------------------------------------------- entry edits */
 
 async function saveEdit(entry) {
+  if (state.removingAll) return;
   const text = state.editDraft;
-  state.editing = false;
-  state.editDraft = "";
-  state.showOriginal = false;
-
-  if (entry.entry_revision === 0) {
-    // Still local: rewrite the queued import instead of queueing an edit.
-    await db.updatePendingEntry(state.handle, entry.id, { raw_text: text, display_text: text });
-    const queued = state.operations.find(
-      (operation) => operation.entry_id === entry.id && operation.type === "import",
-    );
-    if (queued !== undefined) {
-      await db.updateOperation(state.handle, queued.op_id, { text });
+  const generation = editGeneration;
+  try {
+    await changeEntry(state.handle, entry, "edit", text);
+    if (generation === editGeneration && state.detailId === entry.id && state.editDraft === text) {
+      state.editing = false;
+      state.editDraft = "";
+      state.showOriginal = false;
     }
-  } else {
-    await db.enqueueOperation(state.handle, buildEditOperation(entry, text));
-    await db.putSynchronizedEntries(state.handle, [{ ...entry, user_edited_text: text }]);
+    await reload();
+    render();
+    void sync({ silent: true });
+  } catch {
+    toast("Your change could not be saved. Keep this page open and try again.");
   }
-
-  await reload();
-  render();
-  void sync({ silent: true });
 }
 
 async function togglePin(entry) {
-  const pinned = entry.is_pinned !== true;
-  if (entry.entry_revision === 0) {
-    await db.updatePendingEntry(state.handle, entry.id, { is_pinned: pinned });
-  } else {
-    await db.enqueueOperation(state.handle, buildPinOperation(entry, pinned));
-    await db.putSynchronizedEntries(state.handle, [{ ...entry, is_pinned: pinned }]);
-  }
-  await reload();
-  render();
-  void sync({ silent: true });
+  if (state.removingAll) return;
+  try {
+    await changeEntry(state.handle, entry, "pin", entry.is_pinned !== true);
+    await reload();
+    render();
+    void sync({ silent: true });
+  } catch { toast("Your change could not be saved. Try again."); }
 }
 
 async function deleteEntry(entry) {
-  state.askDelete = false;
-  if (entry.entry_revision !== 0) {
-    await db.enqueueOperation(state.handle, buildDeleteOperation(entry));
-  } else {
-    const queued = state.operations.find((operation) => operation.entry_id === entry.id);
-    if (queued !== undefined) await db.removeOperation(state.handle, queued.op_id);
-  }
-  await db.deleteEntryLocally(state.handle, entry.id);
-  if (state.result !== null && state.result.id === entry.id) state.result = null;
-  closeDetail();
-  await reload();
-  render();
-  toast("Deleted");
-  void sync({ silent: true });
+  if (state.removingAll) return;
+  try {
+    await changeEntry(state.handle, entry, "delete");
+    state.askDelete = false;
+    if (state.result?.id === entry.id) state.result = null;
+    await reload();
+    closeDetail();
+    toast("Deletion saved on this phone");
+    void sync({ silent: true });
+  } catch { toast("Your change could not be saved. Try again."); }
 }
 
 async function keepMine(operation) {
@@ -1167,10 +1292,7 @@ async function keepMine(operation) {
 }
 
 async function useMacs(operation) {
-  if (operation.server_entry !== null && operation.server_entry !== undefined) {
-    await db.putSynchronizedEntries(state.handle, [operation.server_entry]);
-  }
-  await db.removeOperation(state.handle, operation.op_id);
+  await db.discardEntryOperations(state.handle, operation.entry_id, operation.server_entry);
   await reload();
   render();
 }
@@ -1179,8 +1301,7 @@ async function useMacs(operation) {
 
 async function storeImport(meta, text) {
   const entry = entryFromImport(meta, text);
-  await db.putPendingEntry(state.handle, entry);
-  await db.enqueueOperation(state.handle, buildImportOperation(entry));
+  await saveTranscript(state.handle, entry, false);
 }
 
 async function importFromClipboard() {
@@ -1295,12 +1416,44 @@ async function clearHistory() {
   await reload();
   state.result = null;
   render();
-  toast("Deleted from this phone");
+  toast("Refreshing saved copy");
+  void sync({ silent: true });
+}
+
+async function removeAllPhoneData() {
+  if (state.recording || state.recordingStarting || state.transcribing || recovery.pending !== null) {
+    toast("Finish or discard your recording first.");
+    return;
+  }
+  state.removingAll = true;
+  try {
+    // Let any already-started sync settle before clearing; it must not refill
+    // this phone after the user has removed its data.
+    await syncTask;
+    await db.clearAllDeviceData(state.handle);
+    await clearDiagnostics();
+    state.credentials = null;
+    state.result = null;
+    state.copyFallbackText = null;
+    state.editDraft = "";
+    state.editing = false;
+    state.detailId = null;
+    state.clipboardImport = null;
+    state.askRemoveAll = false;
+    state.problem = null;
+    state.historyDisabled = false;
+    state.diagnosticCount = 0;
+    await reload();
+    closeSettings();
+    toast("All phone data removed");
+  } catch { toast("Some phone data could not be removed. Try again."); }
+  finally { state.removingAll = false; render(); }
 }
 
 /* ---------------------------------------------------------------- settings */
 
 async function saveCredentials(clientId, clientSecret) {
+  if (state.removingAll) return;
   if (clientId === "" || clientSecret === "") {
     toast("Both lines are needed");
     return;
@@ -1315,6 +1468,7 @@ async function saveCredentials(clientId, clientSecret) {
 }
 
 async function clearCredentials() {
+  if (state.removingAll) return;
   await db.deleteSetting(state.handle, db.SETTING_CREDENTIALS);
   state.credentials = null;
   state.testResult = null;
@@ -1323,11 +1477,13 @@ async function clearCredentials() {
 }
 
 async function setCleanUp(on) {
+  if (state.removingAll) return;
   state.cleanUp = on;
   await db.setSetting(state.handle, db.SETTING_DEFAULT_MODE, on ? "clean" : "literal");
 }
 
 async function setAllowCloudFallback(allow) {
+  if (state.removingAll) return;
   state.allowCloudFallback = allow;
   await db.setSetting(state.handle, db.SETTING_ALLOW_CLOUD_FALLBACK, allow);
 }
@@ -1350,16 +1506,19 @@ async function testConnection() {
 /* ------------------------------------------------------------- navigation */
 
 function openDetail(id, { edit = false } = {}) {
+  editGeneration += 1;
   state.detailId = id;
   state.editing = edit;
   state.editDraft = edit ? displayTextOf(findEntry(id)) : "";
   state.showOriginal = false;
   state.askDelete = false;
   renderDetail();
+  renderGlobalControls();
   window.scrollTo(0, 0);
 }
 
 function closeDetail() {
+  editGeneration += 1;
   state.detailId = null;
   state.editing = false;
   state.editDraft = "";
@@ -1379,6 +1538,7 @@ function openSettings() {
   dom.main.hidden = true;
   dom.detail.hidden = true;
   renderSettings();
+  renderGlobalControls();
   void refreshSafeDiagnostics();
   window.scrollTo(0, 0);
 }
@@ -1393,6 +1553,7 @@ function closeSettings() {
 /* --------------------------------------------------------------- listeners */
 
 function wireEvents() {
+  dom.copyRecovery.addEventListener("cancel", () => { state.copyFallbackText = null; });
   dom.recordButton.addEventListener("click", () => {
     if (state.recording) void stopRecording();
     else void startRecording();
@@ -1402,6 +1563,13 @@ function wireEvents() {
     renderList();
   });
   dom.settingsButton.addEventListener("click", openSettings);
+
+  window.addEventListener("beforeunload", event => {
+    if (state.recording || state.recordingStarting || recovery.pending !== null || state.editing) {
+      event.preventDefault();
+      event.returnValue = "";
+    }
+  });
 
   window.addEventListener("online", () => {
     state.online = true;
@@ -1420,12 +1588,26 @@ function wireEvents() {
 function registerServiceWorker() {
   if (!("serviceWorker" in navigator)) return;
 
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (updateRequested && updateIsSafe()) window.location.reload();
+  });
   const register = () => {
     navigator.serviceWorker
-      .register("/app/sw.js", { type: "module", scope: "/app/" })
-      .catch(() => {
-        // A failed registration only costs offline shell caching.
-      });
+      .register("/app/sw.js", { type: "module", scope: "/app/", updateViaCache: "none" })
+      .then(registration => {
+        waitingWorker = registration.waiting;
+        renderGlobalControls();
+        registration.addEventListener("updatefound", () => {
+          const installing = registration.installing;
+          installing?.addEventListener("statechange", () => {
+            if (installing.state === "installed" && navigator.serviceWorker.controller) {
+              waitingWorker = registration.waiting;
+              renderGlobalControls();
+            }
+          });
+        });
+      })
+      .catch(() => { /* Offline shell updates can wait. */ });
   };
 
   // Boot is async, so `load` has usually already fired by the time we get here.

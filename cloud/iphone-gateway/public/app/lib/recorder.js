@@ -7,6 +7,7 @@
 /** Contract limits, mirrored from the gateway. */
 export const MAX_RECORDING_MS = 10 * 60 * 1000;
 export const MAX_RECORDING_BYTES = 12 * 1024 * 1024;
+const OPTIONAL_STREAM_TIMEOUT_MS = 2_000;
 
 /** Preference order; the first supported type wins. */
 export const PREFERRED_MIME_TYPES = Object.freeze([
@@ -64,7 +65,8 @@ export function isGatewayCompatible(mimeType) {
  *   onElapsed?: (ms: number) => void,
  *   onError?: (error: Error) => void,
  *   onAutoStop?: (reason: "duration" | "size") => void,
- *   onStreamReady?: (stream: MediaStream) => Promise<void> | void,
+ *   onStreamReady?: (stream: MediaStream, signal: AbortSignal) => Promise<void> | void,
+ *   onStreamError?: (error: Error) => void,
  *   scope?: typeof globalThis,
  * }} [handlers]
  */
@@ -78,6 +80,9 @@ export function createRecorder(handlers = {}) {
   let timer = null;
   let stopReason = null;
   let settle = null;
+  let generation = 0;
+  let starting = false;
+  let startController = null;
 
   function releaseTracks() {
     if (stream !== null) {
@@ -118,18 +123,45 @@ export function createRecorder(handlers = {}) {
 
     /** Ask for the microphone and start capturing. */
     async start() {
+      if (starting || recorder !== null) throw new Error("recording_active");
       if (!isRecordingSupported(scope)) {
         throw new Error("recording_unsupported");
       }
       const mimeType = pickMimeType(scope);
+      const activeGeneration = ++generation;
+      const controller = new AbortController();
+      startController = controller;
+      starting = true;
       try {
-        stream = await scope.navigator.mediaDevices.getUserMedia({ audio: true });
+        const acquired = await scope.navigator.mediaDevices.getUserMedia({ audio: true });
+        if (activeGeneration !== generation) {
+          for (const track of acquired.getTracks()) track.stop();
+          throw new Error("recording_cancelled");
+        }
+        stream = acquired;
 
         // A best-effort streaming tap may attach here. MediaRecorder starts
-        // only after the hook resolves, so both transports begin with the
-        // same first captured sample. The caller owns any hook failure and can
-        // resolve normally to preserve file recording as the fallback.
-        await handlers.onStreamReady?.(stream);
+        // after a bounded hook, so optional worklet setup cannot indefinitely
+        // prevent the complete-file recording from starting.
+        let hookTimer;
+        try {
+          if (handlers.onStreamReady) {
+            await Promise.race([
+              handlers.onStreamReady(stream, controller.signal),
+              new Promise((_, reject) => {
+                hookTimer = (scope.setTimeout ?? globalThis.setTimeout)(
+                  () => reject(new Error("stream_setup_timeout")), OPTIONAL_STREAM_TIMEOUT_MS,
+                );
+              }),
+            ]);
+          }
+        } catch (error) {
+          controller.abort();
+          handlers.onStreamError?.(error instanceof Error ? error : new Error("stream_setup_failed"));
+        } finally {
+          if (hookTimer !== undefined) (scope.clearTimeout ?? globalThis.clearTimeout)(hookTimer);
+        }
+        if (activeGeneration !== generation) throw new Error("recording_cancelled");
 
         const constructorOptions = mimeType === null ? {} : { mimeType };
         recorder = new scope.MediaRecorder(stream, constructorOptions);
@@ -139,6 +171,7 @@ export function createRecorder(handlers = {}) {
         startedAt = Date.now();
 
         recorder.ondataavailable = (event) => {
+          if (activeGeneration !== generation) return;
           const chunk = event.data;
           if (chunk === undefined || chunk === null || chunk.size === 0) return;
           bytes += chunk.size;
@@ -164,11 +197,15 @@ export function createRecorder(handlers = {}) {
 
         return { mimeType: recorder.mimeType || mimeType || "" };
       } catch (error) {
-        releaseTracks();
-        discard();
-        recorder = null;
-        startedAt = 0;
+        if (activeGeneration === generation) {
+          releaseTracks();
+          discard();
+          recorder = null;
+          startedAt = 0;
+        }
         throw error;
+      } finally {
+        if (activeGeneration === generation) starting = false;
       }
     },
 
@@ -221,10 +258,16 @@ export function createRecorder(handlers = {}) {
 
     /** Abandon a recording without producing a Blob. */
     cancel() {
+      generation += 1;
+      starting = false;
+      startController?.abort();
+      startController = null;
       const active = recorder;
       recorder = null;
       startedAt = 0;
+      const pending = settle;
       settle = null;
+      pending?.reject(new Error("recording_cancelled"));
       try {
         if (active !== null && active.state !== "inactive") {
           active.onstop = null;

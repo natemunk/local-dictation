@@ -10,6 +10,14 @@ import {
 const REQUEST_ID = "00000000-0000-4000-8000-000000000123";
 
 describe("PWA privacy-safe diagnostics", () => {
+  it.each(["STREAM_SOCKET_FAILED", "STREAM_POLICY_BLOCKED", "STREAM_CAPTURE_FAILED"])(
+    "retains streaming failure %s without accepting arbitrary error text", async code => {
+      const event = await recordDiagnostic({ operation: "live_transcription",
+        phase: "stream", outcome: "failed", requestId: REQUEST_ID, code });
+      expect(event).toMatchObject({ operation: "live_transcription", phase: "stream", code });
+      const unknown = await recordDiagnostic({ code: "private transcript" });
+      expect(unknown.code).toBe("UNEXPECTED_ERROR");
+    });
   beforeEach(async () => {
     await clearDiagnostics();
   });
@@ -85,7 +93,20 @@ describe("PWA privacy-safe diagnostics", () => {
 
     const report = await formatDiagnostics();
     expect(report).toContain("Local Dictation PWA diagnostics v1");
+    expect(report).toContain("Build: ");
     expect(report).toContain(REQUEST_ID);
     expect(report).toContain("No audio, transcripts, credentials, headers, URLs, or raw errors");
+  });
+
+  it("keeps bounded receipt and partial counters without content", async () => {
+    const event = await recordDiagnostic({ operation: "live_transcription", phase: "stream",
+      outcome: "succeeded", code: "STREAM_AUDIO_RECEIVED", requestId: REQUEST_ID,
+      receivedFrames: 25, partialCount: 3, bytes: 1234, transcript: "private sample" });
+    expect(event).toMatchObject({ received_frames: 25, partial_count: 3 });
+    expect(JSON.stringify(event)).not.toContain("private sample");
+    expect(JSON.stringify(event)).not.toContain("bytes");
+    const clamped = await recordDiagnostic({ operation: "live_transcription", receivedFrames: Infinity,
+      partialCount: "private sample" });
+    expect(clamped).toMatchObject({ received_frames: 0, partial_count: 0 });
   });
 });

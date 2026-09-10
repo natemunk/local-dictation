@@ -9,6 +9,9 @@ export default defineConfig({
         plugins: [
           cloudflareTest({
             wrangler: { configPath: "./wrangler.jsonc" },
+            // Contract tests inject Mac/AI adapters. Never open a remote binding
+            // session or require Cloudflare credentials to run the suite.
+            remoteBindings: false,
           }),
         ],
         test: {

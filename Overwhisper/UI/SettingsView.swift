@@ -205,6 +205,11 @@ struct SettingsView: View {
             }
 
             Section("Microphone") {
+                if let notice = appState.microphoneNotice {
+                    Label(notice, systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
                 Picker("Input", selection: $appState.selectedInputDeviceUID) {
                     Text("System Default").tag("")
                     ForEach(audioDeviceManager.inputDevices) { device in

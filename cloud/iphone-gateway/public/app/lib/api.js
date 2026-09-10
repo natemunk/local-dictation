@@ -20,6 +20,8 @@ export const HISTORY_PAGE_LIMIT = 100;
 /** Error codes the UI branches on. */
 export const ERROR_MISSING_CREDENTIALS = "MISSING_CREDENTIALS";
 export const ERROR_NETWORK = "NETWORK_ERROR";
+export const ERROR_REQUEST_TIMEOUT = "REQUEST_TIMEOUT";
+export const ERROR_REQUEST_CANCELLED = "REQUEST_CANCELLED";
 export const ERROR_ACCESS_DENIED = "ACCESS_DENIED";
 export const ERROR_MAC_UNAVAILABLE = "MAC_UNAVAILABLE";
 export const ERROR_HISTORY_DISABLED = "HISTORY_DISABLED";
@@ -51,7 +53,7 @@ export class ApiError extends Error {
 /** True for the failures that mean "the Mac cannot be reached right now". */
 export function isOfflineError(error) {
   return error instanceof ApiError
-    && (error.code === ERROR_NETWORK || error.code === ERROR_MAC_UNAVAILABLE);
+    && [ERROR_NETWORK, ERROR_MAC_UNAVAILABLE, ERROR_REQUEST_TIMEOUT].includes(error.code);
 }
 
 function readRevision(body) {
@@ -95,6 +97,7 @@ async function toApiError(response) {
  *   baseUrl?: string,
  *   newRequestId?: () => string,
  *   recordDiagnostic?: (event: Record<string, unknown>) => unknown,
+ *   requestTimeoutMs?: number,
  * }} options
  */
 export function createApiClient(options) {
@@ -141,32 +144,64 @@ export function createApiClient(options) {
       requestId,
       code: "REQUEST_STARTED",
     });
-    let response;
-    try {
-      response = await doFetch(`${baseUrl}${path}`, {
+    const controller = new AbortController();
+    const callerSignal = init.signal;
+    let deadline;
+    let rejectAborted;
+    let timedOut = false;
+    const aborted = new Promise((_, reject) => { rejectAborted = reject; });
+    const abort = () => {
+      controller.abort();
+      rejectAborted(new ApiError(
+        timedOut ? ERROR_REQUEST_TIMEOUT : ERROR_REQUEST_CANCELLED,
+        timedOut ? "The request took too long. Please try again." : "The request was cancelled.",
+        { requestId },
+      ));
+    };
+    callerSignal?.addEventListener("abort", abort, { once: true });
+    const defaultTimeout = operation === "transcription" ? 240_000
+      : operation === "history_operations" ? 25_000
+        : operation.startsWith("history_") ? 15_000 : 5_000;
+    deadline = setTimeout(() => { timedOut = true; abort(); }, options.requestTimeoutMs ?? defaultTimeout);
+    // The race covers headers AND JSON consumption; even a broken adapter
+    // ignoring AbortSignal cannot leave the interface stuck indefinitely.
+    const work = async () => {
+      if (callerSignal?.aborted) { abort(); throw new ApiError(ERROR_REQUEST_CANCELLED, "The request was cancelled.", { requestId }); }
+      const response = await doFetch(`${baseUrl}${path}`, {
         ...init,
+        signal: controller.signal,
         cache: "no-store",
         credentials: "omit",
         redirect: "follow",
       });
-    } catch {
-      const error = new ApiError(
-        ERROR_NETWORK,
-        "No connection to the gateway.",
-        { requestId },
-      );
+      if (!response.ok) throw await toApiError(response);
+      const body = await readJson(response);
+      if (body === null) {
+        throw new ApiError(ERROR_UNEXPECTED, "The gateway sent an unreadable response.", {
+          status: response.status, requestId,
+        });
+      }
+      return { response, body };
+    };
+    try {
+      const { response, body } = await Promise.race([aborted, work()]);
       void logDiagnostic({
         operation,
-        phase: "gateway",
-        outcome: "failed",
-        requestId,
-        code: error.code,
+        phase: "response",
+        outcome: "succeeded",
+        requestId: typeof body.request_id === "string" ? body.request_id : requestId,
+        status: response.status,
+        code: "OK",
+        route: typeof body.route === "string" ? body.route : "none",
         latencyMs: Date.now() - startedAt,
       });
-      throw error;
-    }
-    if (!response.ok) {
-      const error = await toApiError(response);
+      return body;
+    } catch (failure) {
+      const error = failure instanceof ApiError ? failure
+        : controller.signal.aborted
+          ? new ApiError(timedOut ? ERROR_REQUEST_TIMEOUT : ERROR_REQUEST_CANCELLED,
+            timedOut ? "The request took too long. Please try again." : "The request was cancelled.", { requestId })
+          : new ApiError(ERROR_NETWORK, "No connection to the gateway.", { requestId });
       void logDiagnostic({
         operation,
         phase: "gateway",
@@ -177,53 +212,32 @@ export function createApiClient(options) {
         latencyMs: Date.now() - startedAt,
       });
       throw error;
+    } finally {
+      clearTimeout(deadline);
+      callerSignal?.removeEventListener("abort", abort);
     }
-    const body = await readJson(response);
-    if (body === null) {
-      const error = new ApiError(ERROR_UNEXPECTED, "The gateway sent an unreadable response.", {
-        status: response.status,
-        requestId,
-      });
-      void logDiagnostic({
-        operation,
-        phase: "response",
-        outcome: "failed",
-        requestId,
-        status: response.status,
-        code: error.code,
-        latencyMs: Date.now() - startedAt,
-      });
-      throw error;
-    }
-    void logDiagnostic({
-      operation,
-      phase: "response",
-      outcome: "succeeded",
-      requestId: typeof body.request_id === "string" ? body.request_id : requestId,
-      status: response.status,
-      code: "OK",
-      route: typeof body.route === "string" ? body.route : "none",
-      latencyMs: Date.now() - startedAt,
-    });
-    return body;
   }
 
   return {
-    /** Mint a short-lived, single-purpose WebSocket credential. */
-    async createStreamTicket({ requestId, mode, allowCloudFallback }) {
+    /**
+     * Mint a short-lived, single-purpose WebSocket credential.
+     * @param {{requestId?: string, mode: string, allowCloudFallback: boolean, signal?: AbortSignal}} input
+     */
+    async createStreamTicket({ requestId, mode, allowCloudFallback, signal = undefined }) {
       const id = requestId ?? newRequestId();
       const operation = "stream_ticket";
       const headers = authHeaders(id, operation);
       headers.set("X-Dictation-Mode", mode);
       headers.set("X-Allow-Cloud-Fallback", String(Boolean(allowCloudFallback)));
-      return send(STREAM_TICKET_PATH, { method: "POST", headers }, id, operation);
+      return send(STREAM_TICKET_PATH, { method: "POST", headers, signal }, id, operation);
     },
 
     /**
      * Upload one recording. `requestId` doubles as the history entry id, so the
      * caller generates it before recording finishes.
+     * @param {{blob: Blob, mimeType: string, durationSeconds: number, mode: string, allowCloudFallback: boolean, requestId?: string, signal?: AbortSignal}} input
      */
-    async transcribe({ blob, mimeType, durationSeconds, mode, allowCloudFallback, requestId }) {
+    async transcribe({ blob, mimeType, durationSeconds, mode, allowCloudFallback, requestId, signal = undefined }) {
       const id = requestId ?? newRequestId();
       const operation = "transcription";
       const headers = authHeaders(id, operation);
@@ -231,7 +245,7 @@ export function createApiClient(options) {
       headers.set("X-Dictation-Mode", mode);
       headers.set("X-Allow-Cloud-Fallback", String(Boolean(allowCloudFallback)));
       headers.set("X-Audio-Duration-Seconds", String(Math.max(1, Math.round(durationSeconds))));
-      return send(TRANSCRIPTIONS_PATH, { method: "POST", headers, body: blob }, id, operation);
+      return send(TRANSCRIPTIONS_PATH, { method: "POST", headers, body: blob, signal }, id, operation);
     },
 
     async fetchManifest() {
