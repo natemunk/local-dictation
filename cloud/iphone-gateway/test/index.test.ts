@@ -243,10 +243,20 @@ describe("iPhone gateway", () => {
       client: "pwa",
     });
 
-    const last = grant.ticket.at(-1) === "a" ? "b" : "a";
-    await expect(
-      authority.verifyProtocols(`${STREAM_PROTOCOL}, ${grant.ticket.slice(0, -1)}${last}`),
-    ).rejects.toMatchObject({ code: "invalid" });
+    const separator = grant.ticket.lastIndexOf(".");
+    const signature = atob(grant.ticket.slice(separator + 1).replaceAll("-", "+").replaceAll("_", "/") + "=");
+    expect(signature.length).toBe(32);
+    // Base64url's final character includes unused bits: changing only those
+    // leaves the signature intact. Flip an actual bit in each signature byte.
+    for (let index = 0; index < signature.length; index += 1) {
+      const altered = signature.slice(0, index)
+        + String.fromCharCode(signature.charCodeAt(index) ^ 1)
+        + signature.slice(index + 1);
+      const encoded = btoa(altered).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
+      await expect(
+        authority.verifyProtocols(`${STREAM_PROTOCOL}, ${grant.ticket.slice(0, separator + 1)}${encoded}`),
+      ).rejects.toMatchObject({ code: "invalid" });
+    }
 
     current = grant.expiresAt;
     await expect(authority.verifyProtocols(`${STREAM_PROTOCOL}, ${grant.ticket}`))
