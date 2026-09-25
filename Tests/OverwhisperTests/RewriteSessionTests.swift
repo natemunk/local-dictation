@@ -175,20 +175,30 @@ struct RewriteSessionTests {
     }
     @Test func canceledAXLookupReturnsWithoutStackingMoreWork() async throws {
         let access = RewriteSelectionAccess(operationLimit: 0.01)
-        let start = ContinuousClock.now
+        let gate = DispatchSemaphore(value: 0)
+        defer { gate.signal() }
         let first = await access.perform(fallback: false) { _ in
-            Thread.sleep(forTimeInterval: 0.12)
+            // Keep the fake AX operation alive until after the busy check,
+            // regardless of when a loaded CI runner resumes the test task.
+            #expect(gate.wait(timeout: .now() + 10) == .success)
             return true
         }
         #expect(!first)
-        #expect(start.duration(to: .now) < .milliseconds(100))
+        // Deliberately outlive the old 120 ms fake-operation sleep. Busy
+        // ownership must remain true until this test explicitly opens the gate.
+        try await Task.sleep(for: .milliseconds(300))
         let second = await access.perform(fallback: false) { _ in
             Issue.record("Busy AX executor must not enqueue another operation")
             return true
         }
         #expect(!second)
-        try await Task.sleep(for: .milliseconds(150))
-        let third = await access.perform(fallback: false) { _ in true }
+        gate.signal()
+        let releasedBy = ContinuousClock.now.advanced(by: .seconds(5))
+        var third = false
+        repeat {
+            third = await access.perform(fallback: false) { _ in true }
+            if !third { try await Task.sleep(for: .milliseconds(1)) }
+        } while !third && ContinuousClock.now < releasedBy
         #expect(third)
     }
 

@@ -21,9 +21,18 @@ three changes separately:
   The final debug and release functional suites pass. An optimized run with the
   performance fixture concurrently enabled tripped the existing rewrite AX test's
   100 ms timing/busy-window assertion; the full functional rerun and three isolated
-  repetitions passed without changing rewrite code or its assertions. Run the
-  benchmark separately from timing-sensitive functional tests. Its isolated
-  reviewed-build run measured 2.1% instrumentation overhead.
+  repetitions passed without changing rewrite code or its assertions. However,
+  GitHub run 36154215696 subsequently reproduced both this issue and the cleanup
+  test's 200 ms assertion without the benchmark enabled. Passing isolated runs
+  did not establish CI reliability. Test-only follow-up replaces fixed provider
+  sleeps with explicit gates, deliberately delays the caller 300 ms, and asserts
+  timeout return while work remains blocked, busy rejection, and eventual release.
+  Ten-second rescue bounds fail rather than hang on a broken implementation.
+  Production deadlines and rewrite behavior are unchanged. Keep numerical
+  performance measurements separate; the isolated reviewed-build fixture measured
+  2.1% instrumentation overhead.
+  The gated follow-up passed five consecutive full local suites with the
+  performance fixture also enabled (303 app tests plus five corpus tests each).
 - Synthetic iPhone tests exercise both production upload and streaming
   finalization paths: busy cleanup reports deterministic, and desktop preemption
   releases the remote ASR lease while cancellation-ignoring cleanup drains.

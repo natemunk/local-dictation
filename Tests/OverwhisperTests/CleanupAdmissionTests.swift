@@ -15,6 +15,11 @@ final class CancellationIgnoringCleanupGate: @unchecked Sendable {
         return entered
     }
 
+    var isOpen: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return released
+    }
+
     func wait() async {
         await withCheckedContinuation { continuation in
             lock.lock()
@@ -36,16 +41,11 @@ final class CancellationIgnoringCleanupGate: @unchecked Sendable {
     }
 }
 
-private func uncooperativeDelay() async {
-    await withCheckedContinuation { continuation in
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.25) { continuation.resume() }
-    }
-}
-
 private struct DelayedAppleAdapter: AppleFoundationModelAdapter {
+    let gate: CancellationIgnoringCleanupGate
     func availability() -> AppleFoundationModelAvailability { .available }
     func generate(transcript: String, staticRules: String) async throws -> String {
-        await uncooperativeDelay()
+        await gate.wait()
         return transcript
     }
 }
@@ -64,38 +64,62 @@ struct CleanupAdmissionTests {
     }
     @Test func uncooperativeTimeoutHoldsSlotAndRecovers() async throws {
         let admission = CleanupAdmissionController()
-        let start = ContinuousClock.now
+        let gate = CancellationIgnoringCleanupGate()
+        // Rescue only bounds a broken implementation that waits for provider
+        // exit. Passing requires the caller to return while this gate is closed.
+        let rescue = DispatchWorkItem { gate.open() }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 10, execute: rescue)
+        defer { rescue.cancel(); gate.open() }
         do {
-            _ = try await CleanupDeadline.run(for: .milliseconds(20), admission: admission) {
-                await uncooperativeDelay()
+            _ = try await CleanupDeadline.run(for: .milliseconds(100), admission: admission) {
+                await gate.wait()
                 return "late"
             }
             Issue.record("Deadline should win")
         } catch is CleanupDeadlineError {} catch { Issue.record("Unexpected error") }
-        #expect(start.duration(to: .now) < .milliseconds(200))
-        #expect(admission.snapshot().state != .idle)
+        // Reproduce delayed caller resumption without releasing the provider.
+        // Correctness must not depend on the old 200 ms assertion window.
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(gate.hasStarted)
+        #expect(!gate.isOpen)
+        #expect(admission.snapshot().state == .draining)
         do {
             _ = try await CleanupDeadline.run(admission: admission) { "must not run" }
             Issue.record("Occupied admission must reject")
         } catch is CleanupAdmissionError {} catch { Issue.record("Unexpected error") }
-        try await Task.sleep(for: .milliseconds(300))
+        gate.open()
+        let releasedBy = ContinuousClock.now.advanced(by: .seconds(5))
+        while admission.snapshot().state != .idle && ContinuousClock.now < releasedBy {
+            try await Task.sleep(for: .milliseconds(1))
+        }
         #expect(admission.snapshot().state == .idle)
         #expect(try await CleanupDeadline.run(admission: admission) { "ready" } == "ready")
     }
 
     @Test func freshRefinersShareAdmissionAndLabelFallback() async throws {
         let admission = CleanupAdmissionController()
+        let gate = CancellationIgnoringCleanupGate()
+        let rescue = DispatchWorkItem { gate.open() }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 10, execute: rescue)
+        defer { rescue.cancel(); gate.open() }
         func pipeline() -> CleanupPipeline {
             CleanupPipeline(refiner: AppleFoundationRefiner(
-                adapter: DelayedAppleAdapter(), deadline: .milliseconds(20),
+                adapter: DelayedAppleAdapter(gate: gate), deadline: .milliseconds(100),
                 admission: admission, platformSupportsFoundationModels: { true }))
         }
         let first = try await pipeline().process("We should ship.", mode: .clean)
         #expect(first.fallbackReasonLabel == "deadline_exceeded")
+        #expect(gate.hasStarted)
+        #expect(!gate.isOpen)
         let second = try await pipeline().process("We should ship.", mode: .clean)
         #expect(second.fallbackReasonLabel == "admission_busy")
         #expect(second.text == "We should ship.")
-        try await Task.sleep(for: .milliseconds(300))
+        gate.open()
+        let releasedBy = ContinuousClock.now.advanced(by: .seconds(5))
+        while admission.snapshot().state != .idle && ContinuousClock.now < releasedBy {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(admission.snapshot().state == .idle)
     }
 
     @Test func callerCancellationReleasesRemoteLeaseButNotCleanupSlot() async throws {
