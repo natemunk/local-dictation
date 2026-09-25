@@ -92,6 +92,7 @@ struct OutputSafetyRegressionTests {
         )
         for bundleIdentifier in [
             "com.anthropic.claudefordesktop",
+            "com.anysphere.sand",
             "com.mitchellh.ghostty",
             "com.openai.chat",
             "com.openai.atlas",
@@ -108,6 +109,11 @@ struct OutputSafetyRegressionTests {
                 bundleIdentifier: "com.example.UnreviewedEditor"
             )
         )
+        for bundleIdentifier in ["com.anysphere.cursor", "com.anysphere.sand.helper"] {
+            #expect(!DictationDestination.isApprovedFocusTokenFallback(
+                bundleIdentifier: bundleIdentifier
+            ))
+        }
     }
 
     @Test("system-wide focus is a PID-checked fallback to app-scoped focus")

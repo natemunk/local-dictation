@@ -134,7 +134,7 @@ real-device gates above.
 
 ## Manual application matrix still required
 
-Exercise Ghostty, Terminal, iTerm2, Warp, VS Code editor/integrated terminal, Claude, Codex/ChatGPT, Slack, Linear, Chrome, Safari, Gmail, Todoist, Notion, and Notes with wrong-field probes, secure fields, app/Space switching, unrelated typing during recording, empty audio, rich text, selected text, clipboard managers, endpoint outage, permission denial/revocation, sleep/wake, microphone unplug/switch, and long sessions. Record source revision, build command, OS/hardware, result, and any retained artifacts for each run.
+Exercise Ghostty, Terminal, iTerm2, Warp, VS Code editor/integrated terminal, Claude, Grok Bot (`com.anysphere.sand`), Codex/ChatGPT, Slack, Linear, Chrome, Safari, Gmail, Todoist, Notion, and Notes with wrong-field probes, secure fields, app/Space switching, unrelated typing during recording, empty audio, rich text, selected text, clipboard managers, endpoint outage, permission denial/revocation, sleep/wake, microphone unplug/switch, and long sessions. Record source revision, build command, OS/hardware, result, and any retained artifacts for each run.
 
 ## Rewrite reliability follow-up
 

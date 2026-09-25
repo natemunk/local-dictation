@@ -75,6 +75,7 @@ final class DictationDestination {
         "notion.id",
         "com.notion.id",
         "com.anthropic.claudefordesktop",
+        "com.anysphere.sand", // Grok Bot's installed macOS bundle identifier.
         "com.mitchellh.ghostty",
         "com.openai.codex",
         "com.openai.chat",
