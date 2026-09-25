@@ -58,8 +58,14 @@ for bundle_name in "${required_bundles[@]}"; do
 done
 
 hub_bundle="$RESOURCES/swift-transformers_Hub.bundle"
-[[ -f "$hub_bundle/t5_tokenizer_config.json" ]] || fail "Hub bundle is missing t5_tokenizer_config.json"
-[[ -f "$hub_bundle/gpt2_tokenizer_config.json" ]] || fail "Hub bundle is missing gpt2_tokenizer_config.json"
+# SwiftPM emits either flat bundles or macOS Contents/Resources bundles,
+# depending on the build system. Match Bundle's resource lookup layout.
+hub_resources="$hub_bundle"
+if [[ -d "$hub_bundle/Contents" ]]; then
+  hub_resources="$hub_bundle/Contents/Resources"
+fi
+[[ -f "$hub_resources/t5_tokenizer_config.json" ]] || fail "Hub bundle is missing t5_tokenizer_config.json"
+[[ -f "$hub_resources/gpt2_tokenizer_config.json" ]] || fail "Hub bundle is missing gpt2_tokenizer_config.json"
 
 while IFS= read -r -d '' candidate; do
   [[ "$candidate" == "$BINARY" ]] && continue
