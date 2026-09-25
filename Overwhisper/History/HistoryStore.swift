@@ -14,6 +14,7 @@ actor HistoryStore {
     static let metadataMigrationIdentifier = "history_metadata_v2"
     static let metricsMigrationIdentifier = "dictation_metrics_v1"
     static let unifiedMigrationIdentifier = "history_unified_v3"
+    static let metricsDetailMigrationIdentifier = "dictation_metrics_v2"
     static let expectedMigrationIdentifiers = [
         schemaMigrationIdentifier,
         searchMigrationIdentifier,
@@ -21,11 +22,13 @@ actor HistoryStore {
         metadataMigrationIdentifier,
         metricsMigrationIdentifier,
         unifiedMigrationIdentifier,
+        metricsDetailMigrationIdentifier,
     ]
 
     private static let tableName = "dictation_history"
     private static let searchTableName = "dictation_history_fts"
     private static let metricsTableName = "dictation_metrics"
+    private static let metricDetailColumns = DictationMetricDetails.columnNames
     private static let syncStateTableName = "history_sync_state"
     private static let syncOperationsTableName = "history_sync_operations"
 
@@ -702,8 +705,9 @@ actor HistoryStore {
                         \(MetricsColumn.createdAt),
                         \(MetricsColumn.updatedAt),
                         \(MetricsColumn.eventRevision),
-                        \(MetricsColumn.schemaVersion)
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        \(MetricsColumn.schemaVersion),
+                        \(Self.metricDetailColumns.joined(separator: ", "))
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \(Self.metricDetailColumns.map { _ in "?" }.joined(separator: ", ")))
                     ON CONFLICT(\(MetricsColumn.eventID)) DO UPDATE SET
                         \(MetricsColumn.completedAt) = excluded.\(MetricsColumn.completedAt),
                         \(MetricsColumn.recordingDurationSeconds) = excluded.\(MetricsColumn.recordingDurationSeconds),
@@ -726,10 +730,11 @@ actor HistoryStore {
                         \(MetricsColumn.timingComplete) = excluded.\(MetricsColumn.timingComplete),
                         \(MetricsColumn.updatedAt) = excluded.\(MetricsColumn.updatedAt),
                         \(MetricsColumn.eventRevision) = excluded.\(MetricsColumn.eventRevision),
-                        \(MetricsColumn.schemaVersion) = excluded.\(MetricsColumn.schemaVersion)
+                        \(MetricsColumn.schemaVersion) = excluded.\(MetricsColumn.schemaVersion),
+                        \(Self.metricDetailColumns.map { "\($0) = excluded.\($0)" }.joined(separator: ", "))
                     WHERE excluded.\(MetricsColumn.eventRevision) > \(Self.metricsTableName).\(MetricsColumn.eventRevision)
                     """,
-                arguments: [
+                arguments: StatementArguments([
                     event.eventID.uuidString.lowercased(),
                     event.completedAt,
                     event.recordingDurationSeconds,
@@ -754,7 +759,7 @@ actor HistoryStore {
                     now,
                     event.eventRevision,
                     event.schemaVersion,
-                ]
+                ] as [(any DatabaseValueConvertible)?]) + StatementArguments(event.details.databaseValues)
             )
             return db.changesCount > 0
         }
@@ -1253,7 +1258,7 @@ actor HistoryStore {
                     .defaults(to: 0)
                 table.column(MetricsColumn.schemaVersion, .integer)
                     .notNull()
-                    .defaults(to: DictationMetricEvent.currentSchemaVersion)
+                    .defaults(to: 1)
             }
             _ = try backfillLegacyMetrics(in: db)
         }
@@ -1305,6 +1310,12 @@ actor HistoryStore {
             }
         }
 
+        migrator.registerMigration(metricsDetailMigrationIdentifier) { db in
+            try db.alter(table: metricsTableName) { table in
+                for phase in DictationMetricPhase.allCases { table.add(column: phase.rawValue, .double) }
+                for name in DictationMetricDetails.labelColumns { table.add(column: name, .text) }
+            }
+        }
         return migrator
     }
 
@@ -1509,7 +1520,7 @@ actor HistoryStore {
                     false,
                     now,
                     now,
-                    DictationMetricEvent.currentSchemaVersion,
+                    1,
                 ]
             )
             insertedCount += db.changesCount
@@ -1543,7 +1554,7 @@ actor HistoryStore {
             )
         }
 
-        return DictationMetricEvent(
+        var event = DictationMetricEvent(
             eventID: eventID,
             completedAt: row[MetricsColumn.completedAt],
             recordingDurationSeconds: row[MetricsColumn.recordingDurationSeconds],
@@ -1567,6 +1578,8 @@ actor HistoryStore {
             eventRevision: row[MetricsColumn.eventRevision],
             schemaVersion: row[MetricsColumn.schemaVersion]
         )
+        event.details = DictationMetricDetails(row: row)
+        return event
     }
 
     private static func fetchEntry(_ id: UUID, in db: Database) throws -> HistoryEntry? {

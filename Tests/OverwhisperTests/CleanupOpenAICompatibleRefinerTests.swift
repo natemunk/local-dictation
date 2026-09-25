@@ -22,7 +22,8 @@ struct CleanupOpenAICompatibleRefinerTests {
                 model: "local-cleaner",
                 apiKey: "TOP_SECRET_API_KEY"
             ),
-            session: stubbedSession()
+            session: stubbedSession(),
+            admission: CleanupAdmissionController()
         )
         let input = TextRefinementInput(
             transcript: "OpenRouter um",
@@ -83,7 +84,8 @@ struct CleanupOpenAICompatibleRefinerTests {
                 endpoint: URL(string: "http://localhost:8080/v1/chat/completions")!,
                 model: "local-cleaner"
             ),
-            session: stubbedSession()
+            session: stubbedSession(),
+            admission: CleanupAdmissionController()
         )
 
         do {
@@ -113,7 +115,8 @@ struct CleanupOpenAICompatibleRefinerTests {
                 endpoint: URL(string: "https://api.example.com/v1/chat/completions")!,
                 model: "cleaner"
             ),
-            session: stubbedSession()
+            session: stubbedSession(),
+            admission: CleanupAdmissionController()
         )
         do {
             _ = try await blocked.refine(emptyNetworkInput("hello"))
@@ -130,7 +133,8 @@ struct CleanupOpenAICompatibleRefinerTests {
                 endpoint: URL(string: "https://127.attacker.example/v1/chat/completions")!,
                 model: "cleaner"
             ),
-            session: stubbedSession()
+            session: stubbedSession(),
+            admission: CleanupAdmissionController()
         )
         do {
             _ = try await loopbackLookalike.refine(emptyNetworkInput("hello"))
@@ -147,7 +151,8 @@ struct CleanupOpenAICompatibleRefinerTests {
                 model: "cleaner",
                 allowRemote: true
             ),
-            session: stubbedSession()
+            session: stubbedSession(),
+            admission: CleanupAdmissionController()
         )
         do {
             _ = try await insecure.refine(emptyNetworkInput("hello"))
@@ -164,7 +169,8 @@ struct CleanupOpenAICompatibleRefinerTests {
                 model: "cleaner",
                 allowRemote: true
             ),
-            session: stubbedSession()
+            session: stubbedSession(),
+            admission: CleanupAdmissionController()
         )
         let allowedResult = try? await allowed.refine(emptyNetworkInput("hello"))
         #expect(allowedResult == "hello")

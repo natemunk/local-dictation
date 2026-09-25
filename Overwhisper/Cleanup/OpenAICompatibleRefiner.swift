@@ -110,14 +110,17 @@ enum OpenAICompatibleRefinerError: Error, Equatable, CustomStringConvertible, Se
 final class OpenAICompatibleRefiner: TextRefiner, @unchecked Sendable {
     private let configuration: OpenAICompatibleRefinerConfiguration
     private let session: URLSession
+    private let admission: CleanupAdmissionController
     private let redirectDelegate = CleanupRedirectBlockingDelegate()
 
     init(
         configuration: OpenAICompatibleRefinerConfiguration,
-        session: URLSession = .shared
+        session: URLSession = .shared,
+        admission: CleanupAdmissionController
     ) {
         self.configuration = configuration
         self.session = session
+        self.admission = admission
     }
 
     func refine(_ input: TextRefinementInput) async throws -> String {
@@ -148,7 +151,7 @@ final class OpenAICompatibleRefiner: TextRefiner, @unchecked Sendable {
         )
         let frozenRequest = request
 
-        let (data, response) = try await CleanupDeadline.run(for: configuration.deadline) { [session, redirectDelegate] in
+        let (data, response) = try await CleanupDeadline.run(for: configuration.deadline, admission: admission) { [session, redirectDelegate] in
             try await session.data(for: frozenRequest, delegate: redirectDelegate)
         }
         guard let httpResponse = response as? HTTPURLResponse else {

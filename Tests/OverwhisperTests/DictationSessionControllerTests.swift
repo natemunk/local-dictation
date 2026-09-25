@@ -13,6 +13,8 @@ struct DictationSessionControllerTests {
         controller.install(session(for: current))
 
         #expect(!controller.update(stale) { $0.rawText = "stale" })
+        #expect(!controller.update(stale) { $0.metricDetails.record(.inference, from: 1, to: 2) })
+        #expect(controller.active?.metricDetails.durations.isEmpty == true)
         #expect(controller.clear(stale) == nil)
         #expect(controller.active?.token == current)
         #expect(controller.active?.rawText.isEmpty == true)

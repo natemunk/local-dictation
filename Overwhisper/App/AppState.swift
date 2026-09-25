@@ -109,6 +109,8 @@ final class AppState: ObservableObject {
     @Published var configurationDiagnostic: String?
     @Published var configurationNotices: [String] = []
     @Published var diagnosticRuntimeState = DiagnosticRuntimeState()
+    var cleanupAdmissionSnapshotProvider: () -> CleanupAdmissionSnapshot = { .idle }
+    @Published var cleanupAdmissionSnapshot = CleanupAdmissionSnapshot.idle
     @Published var microphonePermissionGranted = false
     @Published var inputMonitoringGranted = false
     @Published var accessibilityGranted = false

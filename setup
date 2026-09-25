@@ -262,6 +262,12 @@ plutil -replace CFBundleExecutable -string LocalDictation "$PLIST"
 plutil -replace CFBundleIdentifier -string com.natemunk.LocalDictation "$PLIST"
 plutil -replace CFBundleShortVersionString -string 0.1.0 "$PLIST"
 plutil -replace CFBundleVersion -string 1 "$PLIST"
+BUILD_REVISION=$("$GIT_BIN" -C "$PROJECT_ROOT" rev-parse --short=12 HEAD 2>/dev/null || print unknown)
+BUILD_DIRTY=""
+if [[ -n "$("$GIT_BIN" -C "$PROJECT_ROOT" status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
+  BUILD_DIRTY="-dirty-$(/bin/date -u +%Y%m%dT%H%M%SZ)"
+fi
+plutil -replace LocalDictationBuildLabel -string "0.1.0/$BUILD_REVISION$BUILD_DIRTY" "$PLIST"
 plutil -replace LSMinimumSystemVersion -string 15.0 "$PLIST"
 
 resource_bundles=("$BIN_DIRECTORY"/*.bundle(N))

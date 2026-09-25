@@ -18,6 +18,11 @@ struct DiagnosticsSettingsView: View {
             }
 
             Section("Runtime") {
+                valueRow("Optional cleanup", value: cleanupAdmissionDescription)
+                if appState.cleanupAdmissionSnapshot.state == .draining {
+                    Text("Waiting for cancelled model work to exit. Deterministic cleanup remains available; optional cleanup resumes when the provider exits or the app restarts.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 diagnosticRow("Hyper+D event tap", state: snapshot.tap.state)
                 valueRow("Tap disables", value: String(snapshot.tap.disableCount))
                 valueRow("Tap rebuilds", value: String(snapshot.tap.rebuildCount))
@@ -134,6 +139,15 @@ struct DiagnosticsSettingsView: View {
             }
             Label(state.displayName, systemImage: state.symbolName)
                 .foregroundStyle(state.color)
+        }
+    }
+
+    private var cleanupAdmissionDescription: String {
+        let state = appState.cleanupAdmissionSnapshot
+        switch state.state {
+        case .idle: return "Idle"
+        case .running: return "Running · \(Int(state.elapsedSeconds)) s"
+        case .draining: return "Draining after timeout/cancellation · \(Int(state.elapsedSeconds)) s"
         }
     }
 

@@ -24,6 +24,8 @@ struct DictationSession {
     var refinementError: String?
     var stoppedAt: Date?
     var metricTiming = DictationMetricTiming()
+    var metricDetails = DictationMetricDetails()
+    var captureRequestedAtUptime: TimeInterval?
     var metricDictationMode: HistoryDictationMode?
     var metricSpeechEngine: String?
     var metricSpeechModel: String?

@@ -75,6 +75,14 @@ Hold Command+Control+Option+Shift and tap D. This needs no extra utility. macOS 
 
 Local Dictation normally lives behind the `LD` item in the right side of the macOS menu bar. Its menu provides Start/Finish Dictation, History, Configuration, Settings, and Quit.
 
+**Correct Last Dictation…** reuses the personal vocabulary dialog for the last
+saved desktop dictation from this app run, including recovery text. It is disabled
+while dictation or rewrite is active. Deleted/expired entries are not substituted,
+and corrections are saved only after you confirm them.
+
+For the optional cleanup admission status, metrics v2 definitions, and read-only
+performance queries, see [Focused reliability diagnostics](docs/focused-diagnostics.md).
+
 If macOS hides the item because the menu bar is crowded, launch `~/Applications/Local Dictation.app` again from Finder or Spotlight. The already-running app opens Settings instead of starting a duplicate. Settings → General shows live permission and Hyper+D health; Settings → Diagnostics provides a privacy-safe operational report.
 
 After pulling a source update, run:

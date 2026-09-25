@@ -160,4 +160,5 @@ struct IPhoneLocalProcessingResult: Sendable {
     let cleanupLatencySeconds: TimeInterval?
     let recognizedCommandCount: Int
     let cleanupOutcome: String
+    var cleanupFallbackReason: String? = nil
 }

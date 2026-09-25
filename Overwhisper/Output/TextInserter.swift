@@ -85,7 +85,8 @@ final class TextInserter {
         destination: DictationDestination?,
         reactivateDestination: Bool = false,
         performanceCorrelationID: UInt64? = nil,
-        insertionGuard: InsertionGuard? = nil
+        insertionGuard: InsertionGuard? = nil,
+        timingObserver: (@MainActor (DictationMetricPhase, TimeInterval, TimeInterval) -> Void)? = nil
     ) async -> InsertionOutcome {
         guard !Task.isCancelled else { return .cancelled }
 
@@ -129,11 +130,14 @@ final class TextInserter {
             return .historyOnly(reason: "The clipboard changed before paste")
         }
 
+        let validationStarted = ProcessInfo.processInfo.systemUptime
         let destinationIsValid = await destination.validateForInsertion(
             reactivateIfNeeded: reactivateDestination
         )
         guard !Task.isCancelled else { return .cancelled }
-        guard destinationIsValid, destination.remainsValidForInsertion() else {
+        let stillValid = destinationIsValid && destination.remainsValidForInsertion()
+        timingObserver?(.pasteValidation, validationStarted, ProcessInfo.processInfo.systemUptime)
+        guard stillValid else {
             return clipboardOutcome(
                 text: text,
                 expectedChangeCount: transcriptChangeCount,
@@ -160,6 +164,8 @@ final class TextInserter {
             )
         }
 
+        let postedAt = ProcessInfo.processInfo.systemUptime
+        timingObserver?(.pasteEvent, postedAt, postedAt)
         if let performanceCorrelationID {
             performanceSignpost(.pasteEventPost, performanceCorrelationID)
         }

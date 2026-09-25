@@ -34,6 +34,22 @@ struct DictationMetricsTests {
             "updated_at",
             "event_revision",
             "schema_version",
+            "hotkey_to_capture_ready_seconds",
+            "capture_stop_seconds",
+            "destination_capture_seconds",
+            "remaining_drain_wait_seconds",
+            "inference_lease_wait_seconds",
+            "engine_transcription_seconds",
+            "raw_history_write_seconds",
+            "pre_delivery_history_seconds",
+            "paste_validation_seconds",
+            "stop_to_paste_event_seconds",
+            "insertion_failure_kind",
+            "insertion_tier",
+            "capture_outcome",
+            "cleanup_fallback_reason",
+            "build_label",
+            "foreground_bundle_identifier",
         ]))
         #expect(try await store.metricsForeignKeyCount() == 0)
         #expect(try await store.metricCount() == 0)
@@ -43,7 +59,8 @@ struct DictationMetricsTests {
         ]
         #expect(
             try await store.metricsDatabaseColumnNames().allSatisfy { column in
-                forbiddenFragments.allSatisfy {
+                // Explicit numeric-duration exception, never transcript text.
+                column == "engine_transcription_seconds" || forbiddenFragments.allSatisfy {
                     !column.localizedCaseInsensitiveContains($0)
                 }
             }
@@ -371,6 +388,62 @@ struct DictationMetricsTests {
         }
 
         #expect(try await store.metricCount() == 40)
+    }
+
+    @Test("v2 details round trip, redact, retain revisions, and reset with analytics")
+    func metricDetails() async throws {
+        let store = try HistoryStore.inMemory()
+        let id = UUID()
+        var event = metric(id: id, outcome: "clipboard_only", revision: 2)
+        event.details.record(.destinationCapture, from: 10, to: 10.25)
+        event.details.record(.drainWait, from: 10.25, to: 10.26)
+        event.details.record(.inference, from: .nan, to: 11)
+        event.details.captureOutcome = .noEligibleDestination
+        event.details.insertionFailure = .destinationMissing
+        event.details.cleanupFallbackReason = "admission_busy"
+        event.details.buildLabel = "0.1.0/abc-dirty"
+        event.details.foregroundBundleIdentifier = "com.example.Editor"
+        event.details.redactDestination(enabled: false)
+        #expect(try await store.upsertMetric(event, analyticsEnabled: false) == false)
+        #expect(try await store.metricCount() == 0)
+        #expect(try await store.upsertMetric(event))
+        let read = try #require(try await store.fetchMetric(eventID: id))
+        #expect(read == event)
+        #expect(read.details.durations[.inference] == nil)
+        #expect(read.details.durations[.pasteEvent] == nil)
+        #expect(read.details.foregroundBundleIdentifier == nil)
+        #expect(try await store.upsertMetric(metric(id: id, outcome: "pending", revision: 1)) == false)
+        #expect(try await store.fetchMetric(eventID: id) == event)
+        _ = try await store.resetAnalytics()
+        #expect(try await store.fetchMetric(eventID: id) == nil)
+        _ = try await store.upsertMetric(event)
+        _ = try await store.deleteEverything()
+        #expect(try await store.metricCount() == 0)
+    }
+
+    @Test("v2 migration leaves existing metrics and timing semantics unchanged")
+    func metricDetailsMigration() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("migration.sqlite")
+        let id = UUID()
+        do {
+            let legacy = try DatabaseQueue(path: url.path)
+            try HistoryStore.makeMigrator().migrate(legacy, upTo: HistoryStore.unifiedMigrationIdentifier)
+            try await legacy.write { db in
+                try db.execute(sql: """
+                    INSERT INTO dictation_metrics(event_id,completed_at,created_at,updated_at,delivery_outcome,
+                    source_kind,asr_latency_seconds,stop_to_delivery_latency_seconds,schema_version)
+                    VALUES (?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'clipboard_only','measured',0.4,0.6,1)
+                    """, arguments: [id.uuidString.lowercased()])
+            }
+        }
+        let store = try HistoryStore(databaseURL: url)
+        let event = try #require(try await store.fetchMetric(eventID: id))
+        #expect(event.schemaVersion == 1)
+        #expect(event.asrLatencySeconds == 0.4)
+        #expect(event.stopToDeliveryLatencySeconds == 0.6)
+        #expect(event.details == DictationMetricDetails())
     }
 
     private func metric(

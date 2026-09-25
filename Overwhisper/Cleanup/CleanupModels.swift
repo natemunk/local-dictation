@@ -257,8 +257,19 @@ struct CleanupMetadata: Equatable, Sendable {
 }
 
 enum CleanupFallbackReason: Equatable, Sendable {
+    case deadlineExceeded
+    case admissionBusy
     case refinerFailure(String)
     case validationFailure(RefinementValidationFailure)
+
+    var metricLabel: String {
+        switch self {
+        case .deadlineExceeded: "deadline_exceeded"
+        case .admissionBusy: "admission_busy"
+        case .refinerFailure: "refiner_failure"
+        case .validationFailure: "validation_failure"
+        }
+    }
 }
 
 enum CleanupRefinementOutcome: Equatable, Sendable {
@@ -271,4 +282,9 @@ struct CleanupResult: Equatable, Sendable {
     let text: String
     let metadata: CleanupMetadata
     let outcome: CleanupRefinementOutcome
+
+    var fallbackReasonLabel: String? {
+        if case .deterministicFallback(let reason) = outcome { return reason.metricLabel }
+        return nil
+    }
 }

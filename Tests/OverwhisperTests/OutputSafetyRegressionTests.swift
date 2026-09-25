@@ -320,7 +320,15 @@ struct OutputSafetyRegressionTests {
             }
         )
 
-        let outcome = await inserter.insertText("Transcript", destination: destination)
+        var measured: [DictationMetricPhase] = []
+        let outcome = await inserter.insertText("Transcript", destination: destination,
+            timingObserver: { phase, start, end in
+                #expect(end >= start)
+                if phase == .pasteEvent { #expect(pasteWasAttempted) }
+                if phase == .pasteValidation { #expect(!pasteWasAttempted) }
+                measured.append(phase)
+            })
+        #expect(measured == [.pasteValidation, .pasteEvent])
 
         #expect(outcome == .pasteEventSent)
         #expect(pasteWasAttempted)

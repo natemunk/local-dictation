@@ -9,6 +9,7 @@ struct CleanupAppleFoundationRefinerTests {
         let adapter = RecordingAppleFoundationAdapter(availability: .available, output: "unused")
         let refiner = AppleFoundationRefiner(
             adapter: adapter,
+            admission: CleanupAdmissionController(),
             platformSupportsFoundationModels: { false }
         )
 
@@ -38,6 +39,7 @@ struct CleanupAppleFoundationRefinerTests {
             )
             let refiner = AppleFoundationRefiner(
                 adapter: adapter,
+                admission: CleanupAdmissionController(),
                 platformSupportsFoundationModels: { true }
             )
             do {
@@ -57,6 +59,7 @@ struct CleanupAppleFoundationRefinerTests {
         let adapter = RecordingAppleFoundationAdapter(availability: .available, output: "OpenRouter")
         let refiner = AppleFoundationRefiner(
             adapter: adapter,
+            admission: CleanupAdmissionController(),
             platformSupportsFoundationModels: { true }
         )
         let input = TextRefinementInput(

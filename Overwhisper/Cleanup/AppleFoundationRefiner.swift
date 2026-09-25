@@ -50,11 +50,13 @@ protocol AppleFoundationModelAdapter: Sendable {
 struct AppleFoundationRefiner: TextRefiner, Sendable {
     private let adapter: any AppleFoundationModelAdapter
     private let deadline: Duration
+    private let admission: CleanupAdmissionController
     private let platformSupportsFoundationModels: @Sendable () -> Bool
 
     init(
         adapter: any AppleFoundationModelAdapter = SystemAppleFoundationModelAdapter(),
         deadline: Duration = CleanupDeadline.standard,
+        admission: CleanupAdmissionController,
         platformSupportsFoundationModels: @escaping @Sendable () -> Bool = {
             if #available(macOS 26.0, *) { return true }
             return false
@@ -62,6 +64,7 @@ struct AppleFoundationRefiner: TextRefiner, Sendable {
     ) {
         self.adapter = adapter
         self.deadline = deadline
+        self.admission = admission
         self.platformSupportsFoundationModels = platformSupportsFoundationModels
     }
 
@@ -78,7 +81,7 @@ struct AppleFoundationRefiner: TextRefiner, Sendable {
 
         let transcript = input.transcript
         let rules = CleanupRefinementRules.text(for: input)
-        return try await CleanupDeadline.run(for: deadline) { [adapter] in
+        return try await CleanupDeadline.run(for: deadline, admission: admission) { [adapter] in
             try await adapter.generate(
                 transcript: transcript,
                 staticRules: rules

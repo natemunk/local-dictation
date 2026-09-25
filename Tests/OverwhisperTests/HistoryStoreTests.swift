@@ -27,6 +27,7 @@ struct HistoryStoreTests {
             HistoryStore.metadataMigrationIdentifier,
             HistoryStore.metricsMigrationIdentifier,
             HistoryStore.unifiedMigrationIdentifier,
+            HistoryStore.metricsDetailMigrationIdentifier,
         ])
         #expect(health.retentionPolicy == HistoryRetentionPolicy(retentionDays: 30))
         #expect(health.retentionDays == 30)
@@ -96,6 +97,7 @@ struct HistoryStoreTests {
             HistoryStore.metadataMigrationIdentifier,
             HistoryStore.metricsMigrationIdentifier,
             HistoryStore.unifiedMigrationIdentifier,
+            HistoryStore.metricsDetailMigrationIdentifier,
         ])
 
         let reopened = try HistoryStore(databaseURL: databaseURL)
@@ -107,6 +109,7 @@ struct HistoryStoreTests {
             HistoryStore.metadataMigrationIdentifier,
             HistoryStore.metricsMigrationIdentifier,
             HistoryStore.unifiedMigrationIdentifier,
+            HistoryStore.metricsDetailMigrationIdentifier,
         ])
         #expect(try await reopened.health().entryCount == 1)
     }

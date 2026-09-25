@@ -8,37 +8,6 @@ enum CleanupDeadlineError: Error, Equatable, CustomStringConvertible, Sendable {
     }
 }
 
-enum CleanupDeadline {
-    static let standard: Duration = .seconds(2)
-
-    static func run<Value: Sendable>(
-        for duration: Duration = standard,
-        operation: @escaping @Sendable () async throws -> Value
-    ) async throws -> Value {
-        try await withThrowingTaskGroup(of: Value.self) { group in
-            group.addTask {
-                try await operation()
-            }
-            group.addTask {
-                try await Task.sleep(for: duration)
-                try Task.checkCancellation()
-                throw CleanupDeadlineError.exceeded
-            }
-
-            do {
-                guard let value = try await group.next() else {
-                    throw CleanupDeadlineError.exceeded
-                }
-                group.cancelAll()
-                return value
-            } catch {
-                group.cancelAll()
-                throw error
-            }
-        }
-    }
-}
-
 enum DeterministicRefinerError: Error, Equatable, CustomStringConvertible, Sendable {
     case invalidCandidateRange(CleanupTextRange)
 

@@ -64,6 +64,7 @@ struct CleanupPipeline: Sendable {
         mode: CleanupMode,
         commandsAllowed: Bool = true
     ) async throws -> CleanupResult {
+        try Task.checkCancellation()
         switch mode {
         case .literal:
             let commandAnalysis = commandProcessor.analyze(transcript.text)
@@ -111,6 +112,7 @@ struct CleanupPipeline: Sendable {
                     try await refiner.refine(input),
                     sourceUTF8Count: input.transcript.utf8.count
                 )
+                try Task.checkCancellation()
                 do {
                     try validator.validate(generated: generated, against: input)
                     let normalized = deterministicFallback.normalizeAccepted(
@@ -127,10 +129,16 @@ struct CleanupPipeline: Sendable {
                     )
                 }
             } catch {
+                try Task.checkCancellation()
+                if error is CancellationError { throw error }
+                let reason: CleanupFallbackReason
+                if error is CleanupDeadlineError { reason = .deadlineExceeded }
+                else if error is CleanupAdmissionError { reason = .admissionBusy }
+                else { reason = .refinerFailure(String(describing: error)) }
                 return try await fallbackResult(
                     input: input,
                     metadata: metadata,
-                    reason: .refinerFailure(String(describing: error))
+                    reason: reason
                 )
             }
         }
@@ -141,6 +149,7 @@ struct CleanupPipeline: Sendable {
         metadata: CleanupMetadata,
         reason: CleanupFallbackReason
     ) async throws -> CleanupResult {
+        try Task.checkCancellation()
         let fallback = try await deterministicFallback.refine(input)
         do {
             try validator.validate(generated: fallback, against: input)

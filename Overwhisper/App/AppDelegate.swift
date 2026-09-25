@@ -8,7 +8,7 @@ enum AppEnvironment {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let appState = AppState()
 
     private let coordinator = DictationCoordinator(tapHoldThreshold: 0.350)
@@ -16,6 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let configurationStore = ConfigurationStore()
     private let pasteAgainQueue = SerializedPasteAgainQueue()
     private let cleanupExecutor = CleanupExecutor()
+    private let cleanupAdmission = CleanupAdmissionController()
     private let modelStore = OwnedModelStore()
     private let iphoneEndpointServer = IPhoneEndpointServer()
     private let remoteAudioNormalizer = RemoteAudioNormalizer()
@@ -49,6 +50,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var remoteMenuItem: NSMenuItem?
     private var lastTextMenuItem: NSMenuItem?
     private var pasteLastMenuItem: NSMenuItem?
+    private var correctLastMenuItem: NSMenuItem?
+    private var lastCorrection = LastDictationCorrection()
 
     private var cancellables = Set<AnyCancellable>()
     private var engineTask: Task<Void, Never>?
@@ -441,6 +444,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setupMenu() {
+        appState.cleanupAdmissionSnapshotProvider = { [cleanupAdmission] in cleanupAdmission.snapshot() }
         statusItem = NSStatusBar.system.statusItem(withLength: 48)
         statusItem.isVisible = true
         if let button = statusItem.button {
@@ -454,6 +458,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let menu = NSMenu()
+        menu.delegate = self
         menu.autoenablesItems = false
 
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
@@ -504,6 +509,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pasteLast.isEnabled = false
         menu.addItem(pasteLast)
         pasteLastMenuItem = pasteLast
+        let correctLast = NSMenuItem(title: "Correct Last Dictation…", action: #selector(correctLastDictation), keyEquivalent: "")
+        correctLast.target = self
+        correctLast.isEnabled = false
+        menu.addItem(correctLast)
+        correctLastMenuItem = correctLast
 
         menu.addItem(.separator())
         let rewrite = NSMenuItem(title: "Rewrite Text…  Hyper+C", action: #selector(openClipboardRewrite), keyEquivalent: "")
@@ -680,6 +690,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func beginCapture(token: DictationSessionToken) {
         guard coordinator.owns(token) else { return }
+        let requestedAt = coordinator.session?.firstHotkeyDownAt ?? ProcessInfo.processInfo.systemUptime
         voiceRewrite?.cancel()
         clipboardRewriteWindow?.interruptForDictation()
         inferenceLease.beginDesktop()
@@ -702,6 +713,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             asrSelection: appState.asrSelection,
             profile: placeholderProfile
         ))
+        updateSession(token) { $0.captureRequestedAtUptime = requestedAt }
 
         // These happen before permission checks or model work so the key-down
         // feedback path stays under the 100 ms product gate.
@@ -742,6 +754,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 $0.captureWatchdog?.cancel()
                 $0.captureWatchdog = nil
                 $0.metricTiming.markRecordingStarted(at: recordingStartedAtUptime)
+                if let requested = $0.captureRequestedAtUptime {
+                    $0.metricDetails.record(.captureReady, from: requested, to: recordingStartedAtUptime)
+                }
             }
             if activeSession?.streamingTranscriber == nil {
                 appState.overlayMessage = "Listening · live text unavailable"
@@ -887,24 +902,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // before any potentially slow AX messages. Audio drainage is separate
         // and remains owned by this recording generation.
         let destinationApplication = NSWorkspace.shared.frontmostApplication
+        updateSession(request.token) {
+            $0.metricDetails.foregroundBundleIdentifier = destinationApplication?.bundleIdentifier
+        }
         let stoppedRecording: AudioRecorder.StoppedRecording
         do {
+            let started = ProcessInfo.processInfo.systemUptime
             stoppedRecording = try audioRecorder.stopCapture()
+            updateSession(request.token) { $0.metricDetails.record(.captureStop, from: started) }
         } catch {
             failSession(token: request.token, "Could not finish the recording: \(error.localizedDescription)")
             return
         }
+        let captureStarted = ProcessInfo.processInfo.systemUptime
         let destination = await DictationDestination.captureFrontmostWithRetry(for: destinationApplication)
         guard !Task.isCancelled, isCurrent(request.token) else { return }
         let initialProfile = resolveProfile(for: destination).profile
         updateSession(request.token) {
             $0.destination = destination
+            $0.metricDetails.record(.destinationCapture, from: captureStarted)
+            $0.metricDetails.captureOutcome = destination != nil ? .captured
+                : (destinationApplication == nil ? .noForegroundApp : .noEligibleDestination)
+            $0.metricDetails.insertionTier = destination?.insertionTier
             $0.profile = initialProfile
         }
         appState.activeProfileName = profileDisplayName(initialProfile)
 
         let audioURL: URL
         do {
+            let drainStarted = ProcessInfo.processInfo.systemUptime
             audioURL = try await audioRecorder.finishStoppedRecording(stoppedRecording)
             guard !Task.isCancelled, isCurrent(request.token) else {
                 if FileManager.default.fileExists(atPath: audioURL.path) {
@@ -914,6 +940,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             updateSession(request.token) {
                 $0.audioURL = audioURL
+                $0.metricDetails.record(.drainWait, from: drainStarted)
                 $0.captureFinishTask = nil
             }
         } catch {
@@ -978,6 +1005,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let streamingFinalTask = Task { [weak self] in
                 await self?.finishStreamingTranscript(token: request.token)
             }
+            // Every exit, including stale/cancelled ASR returns, owns cleanup
+            // of this separate optional task. Never cancel a newer session.
+            defer { streamingFinalTask.cancel() }
             do {
                 let resolvedProfile = self.resolveProfile(for: destination)
                 try Task.checkCancellation()
@@ -996,16 +1026,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let engine = self.activeSession?.engine else {
                     throw LocalDictationError.engineUnavailable
                 }
+                let leaseStarted = ProcessInfo.processInfo.systemUptime
                 try await self.inferenceLease.waitForRemoteRelease(timeout: .seconds(finalizationDeadline))
                 try Task.checkCancellation()
                 guard self.isCurrent(request.token) else { return }
+                self.updateSession(request.token) { $0.metricDetails.record(.leaseWait, from: leaseStarted) }
                 if let selection = self.activeSession?.asrSelection {
                     self.updateSession(request.token) {
                         $0.metricSpeechEngine = Self.metricsSpeechEngine(for: selection)
                         $0.metricSpeechModel = selection.modelVariant
                     }
                 }
+                let inferenceStarted = ProcessInfo.processInfo.systemUptime
                 let raw = try await engine.transcribe(audioURL: audioURL)
+                let inferenceCompleted = ProcessInfo.processInfo.systemUptime
                 let decision = ASRFinalizationPolicy.authoritative(raw)
                 DictationPerformanceSignposts.emit(
                     .asr,
@@ -1019,6 +1053,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard self.isCurrent(request.token) else { return }
                 let asrCompletedAtUptime = ProcessInfo.processInfo.systemUptime
                 self.updateSession(request.token) {
+                    $0.metricDetails.record(.inference, from: inferenceStarted, to: inferenceCompleted)
                     $0.metricTiming.markASRCompleted(at: asrCompletedAtUptime)
                 }
                 let asrLatency = self.activeSession?.metricTiming.asrLatencySeconds
@@ -1316,6 +1351,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let cleanupCompletedAtUptime = ProcessInfo.processInfo.systemUptime
             updateSession(token) { session in
                 session.deliveredText = result.text
+                session.metricDetails.cleanupFallbackReason = result.fallbackReasonLabel
                 session.recognizedCommandCount = cleanupMode == .clean
                     ? result.metadata.recognizedCommands.count
                     : 0
@@ -1340,6 +1376,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     session.refinementStatus = .failed
                     session.refinementOutcome = "deterministic_fallback"
                     switch reason {
+                    case .deadlineExceeded, .admissionBusy:
+                        session.refinementError = reason.metricLabel
                     case .refinerFailure(let message):
                         session.refinementError = message
                     case .validationFailure(let failure):
@@ -1451,10 +1489,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             insertionText,
             destination: session.destination,
             reactivateDestination: reactivateDestination,
-            performanceCorrelationID: token.generation
+            performanceCorrelationID: token.generation,
+            timingObserver: { [weak self] phase, start, end in
+                guard let self, self.isCurrent(token) else { return }
+                self.updateSession(token) { session in
+                    if phase == .pasteEvent {
+                        if let stop = session.metricTiming.recordingStoppedAtUptime {
+                            session.metricDetails.record(.pasteEvent, from: stop, to: end)
+                        }
+                    } else { session.metricDetails.record(phase, from: start, to: end) }
+                }
+            }
         )
         appState.recordInsertionDiagnostic(outcome)
         guard isCurrent(token) else { return }
+
+        updateSession(token) { $0.metricDetails.insertionFailure = InsertionDiagnosticFailureKind(outcome) }
 
         var toastDuration = Duration.milliseconds(250)
         switch outcome {
@@ -1596,6 +1646,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let pasteMayHaveBeenCommitted = appState.phase == .pasting
         updateSession(token) {
             $0.cancellationRequested = true
+            if $0.metricDetails.captureOutcome == nil { $0.metricDetails.captureOutcome = .cancelled }
             $0.captureFinishTask?.cancel()
             $0.finalizationTask?.cancel()
             $0.streamingStartTask?.cancel()
@@ -1634,6 +1685,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !session.deliveryCommitted,
            let historyID = session.historyID,
            let historyStore {
+            lastCorrection.invalidate(historyID)
             _ = try? await historyStore.updateDelivery(
                 id: historyID,
                 with: HistoryDeliveryUpdate(
@@ -1699,6 +1751,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         toastDuration: Duration? = nil
     ) {
         guard let session = activeSession, session.token == token else { return }
+        // Only completed delivery/preview is eligible. A cancelled new preview
+        // must not erase the reference to the previous completed dictation.
+        rememberCorrection(session: session)
         abandonVoiceRewrite(for: token)
         let toastMessage = appState.overlayMessage
         retireRuntime(session, hideOverlay: toastDuration == nil)
@@ -2151,7 +2206,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private static func runIPhoneTranscription(
+    // Internal visibility permits synthetic end-to-end pipeline tests without
+    // launching the app, loading models, or opening a network listener.
+    static func runIPhoneTranscription(
         request: IPhoneTranscriptionRequest,
         engine: any TranscriptionEngine,
         selection: ASRSelection,
@@ -2197,7 +2254,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private static func runIPhoneStreamTranscription(
+    static func runIPhoneStreamTranscription(
         request: IPhoneAudioStreamRequest,
         audio: IPhoneStreamedAudio,
         engine: any TranscriptionEngine,
@@ -2326,7 +2383,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             asrLatencySeconds: asrLatency,
             cleanupLatencySeconds: cleanupLatency,
             recognizedCommandCount: cleaned.metadata.recognizedCommands.count,
-            cleanupOutcome: cleanupOutcome
+            cleanupOutcome: cleanupOutcome,
+            cleanupFallbackReason: cleaned.fallbackReasonLabel
         )
     }
 
@@ -2406,7 +2464,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 compiledVocabulary: compiled,
                 refiner: AppleFoundationRefiner(
                     adapter: adapter,
-                    deadline: .milliseconds(milliseconds)
+                    deadline: .milliseconds(milliseconds),
+                    admission: cleanupAdmission
                 )
             ),
             .appleFoundation
@@ -2439,7 +2498,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         selection: ASRSelection
     ) {
         guard appState.analyticsEnabled, let historyStore else { return }
-        let event = DictationMetricEvent(
+        var event = DictationMetricEvent(
             eventID: UUID(),
             completedAt: Date(),
             recordingDurationSeconds: result.audioDurationSeconds,
@@ -2463,6 +2522,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             eventRevision: 1,
             schemaVersion: DictationMetricEvent.currentSchemaVersion
         )
+        event.details.cleanupFallbackReason = result.cleanupFallbackReason
+        event.details.buildLabel = LocalDictationBuild.label
         Task {
             do {
                 _ = try await historyStore.upsertMetric(event)
@@ -2624,7 +2685,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } else {
                 let adapter = SystemAppleFoundationModelAdapter()
                 if adapter.availability() == .available {
-                    base = AppleFoundationRefiner(adapter: adapter, deadline: deadline)
+                    base = AppleFoundationRefiner(adapter: adapter, deadline: deadline, admission: cleanupAdmission)
                 } else {
                     base = DeterministicRefiner()
                 }
@@ -2740,7 +2801,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 apiKey: key.isEmpty ? nil : key,
                 allowRemote: configuration.app.allowRemote,
                 deadline: deadline
-            )
+            ),
+            admission: cleanupAdmission
         )
     }
 
@@ -2843,7 +2905,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             analyticsEnabled: appState.destinationAnalyticsEnabled
         )
 
-        let event = DictationMetricEvent(
+        var event = DictationMetricEvent(
             eventID: token.id,
             completedAt: completedAt,
             recordingDurationSeconds: session.metricTiming.recordingDurationSeconds,
@@ -2870,6 +2932,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             schemaVersion: DictationMetricEvent.currentSchemaVersion
         )
 
+        event.details = session.metricDetails
+        event.details.buildLabel = LocalDictationBuild.label
+        event.details.redactDestination(enabled: appState.destinationAnalyticsEnabled)
         Task { [historyStore] in
             do {
                 _ = try await historyStore.upsertMetric(event)
@@ -2894,6 +2959,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return false
         }
         let id = token.id
+        let historyStarted = ProcessInfo.processInfo.systemUptime
+        defer {
+            if isCurrent(token) { updateSession(token) { $0.metricDetails.record(.rawHistory, from: historyStarted) } }
+        }
         do {
             _ = try await historyStore.saveRaw(
                 HistoryRawCapture(
@@ -2942,6 +3011,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               session.token == token,
               let id = session.historyID
         else { return }
+        let historyStarted = ProcessInfo.processInfo.systemUptime
+        defer {
+            if isCurrent(token) { updateSession(token) { $0.metricDetails.record(.preparedHistory, from: historyStarted) } }
+        }
         do {
             _ = try await historyStore.finalize(
                 id: id,
@@ -2976,6 +3049,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               session.token == token,
               let id = session.historyID
         else { return }
+        let historyStarted = ProcessInfo.processInfo.systemUptime
+        defer {
+            if isCurrent(token) { updateSession(token) { $0.metricDetails.record(.preparedHistory, from: historyStarted) } }
+        }
         do {
             _ = try await historyStore.markPolishFailed(
                 id: id,
@@ -3347,6 +3424,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
+    private var canCorrectLastDictation: Bool {
+        lastCorrection.canOpen(
+            dictationActive: activeSession != nil || coordinator.phase.hasActiveSession,
+            rewriteActive: voiceRewrite?.isActive == true || clipboardRewriteWindow?.isVisible == true
+                || clipboardRewriteWindow?.model.blocksRemoteInference == true
+                || clipboardRewriteWindow?.model.isDelivering == true
+        )
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        correctLastMenuItem?.isEnabled = canCorrectLastDictation
+    }
+
+    private func rememberCorrection(session: DictationSession) {
+        guard isCurrent(session.token) else { return }
+        lastCorrection.consider(id: session.historyID, deliveryCommitted: session.deliveryCommitted,
+                                hasText: !session.rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                                secure: session.destination?.isSecureField == true)
+    }
+
+    @objc private func correctLastDictation() {
+        guard canCorrectLastDictation, let id = lastCorrection.historyID, let historyStore else { return }
+        Task { [weak self] in
+            do {
+                let entry = try await historyStore.fetch(id: id)
+                guard let self, self.lastCorrection.historyID == id, self.canCorrectLastDictation else { return }
+                guard self.lastCorrection.accepts(entry), let entry else {
+                    self.lastCorrection.invalidate(id)
+                    self.correctLastMenuItem?.isEnabled = false
+                    let alert = NSAlert()
+                    alert.messageText = "That dictation is no longer available"
+                    alert.informativeText = "It may have been deleted or expired. No other entry was selected."
+                    alert.runModal()
+                    return
+                }
+                self.promptForVocabularyCorrection(from: entry)
+            } catch {
+                self?.appState.lastError = "Could not load the last dictation for correction."
+            }
+        }
+    }
+
     @objc private func openConfiguration() {
         try? FileManager.default.createDirectory(
             at: Self.configurationDirectory,
@@ -3384,6 +3503,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 let debugDataCleared = self.appState.debugSessionStore.clear()
                 self.appState.lastTranscription = ""
+                self.lastCorrection.clear()
+                self.correctLastMenuItem?.isEnabled = false
                 self.lastTextMenuItem?.isEnabled = false
                 self.pasteLastMenuItem?.isEnabled = false
                 self.historyWindow?.refresh()

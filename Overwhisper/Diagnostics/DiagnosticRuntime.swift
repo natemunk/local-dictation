@@ -58,6 +58,7 @@ extension AppState {
     /// Refreshes only schema/runtime metadata from history. The read-only path
     /// never fetches transcript, destination, error, or search-index content.
     func refreshPrivacySafeDiagnostics() async {
+        cleanupAdmissionSnapshot = cleanupAdmissionSnapshotProvider()
         mutateDiagnosticRuntime { $0.history = .loading }
         do {
             let policy = HistoryRetentionPolicy(
