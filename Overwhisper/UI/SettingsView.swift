@@ -89,6 +89,12 @@ struct SettingsView: View {
                 Picker("Position", selection: $appState.overlayPosition) {
                     ForEach(OverlayPosition.allCases) { Text($0.rawValue).tag($0) }
                 }
+                Slider(value: $appState.overlayBackgroundStrength, in: OverlayAppearance.strengthRange) {
+                    Text("Background strength")
+                }
+                Text("Lower strength shows more of the app behind the overlay. Reduce Transparency uses an opaque background.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Toggle("Compact overlay", isOn: $appState.overlayCompact)
             }
 
             Section("Configuration") {

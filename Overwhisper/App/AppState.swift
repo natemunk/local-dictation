@@ -83,6 +83,17 @@ final class AppState: ObservableObject {
     @Published var overlayPosition: OverlayPosition {
         didSet { preferences.set(overlayPosition.rawValue, forKey: LocalDictationPreferenceKey.overlayPosition) }
     }
+    @Published var overlayBackgroundStrength: Double {
+        didSet {
+            let clamped = OverlayAppearance.strength(overlayBackgroundStrength)
+            if clamped != overlayBackgroundStrength { overlayBackgroundStrength = clamped }
+            preferences.set(clamped, forKey: LocalDictationPreferenceKey.overlayBackgroundStrength)
+        }
+    }
+    @Published var overlayCompact: Bool {
+        didSet { preferences.set(overlayCompact, forKey: LocalDictationPreferenceKey.overlayCompact) }
+    }
+    @Published var overlayQuickControlsVisible = false
     @Published var selectedInputDeviceUID: String {
         didSet { preferences.set(selectedInputDeviceUID, forKey: LocalDictationPreferenceKey.selectedInputDeviceUID) }
     }
@@ -196,6 +207,10 @@ final class AppState: ObservableObject {
 
     init(preferences: UserDefaults = .standard) {
         self.preferences = preferences
+        overlayBackgroundStrength = OverlayAppearance.strength(
+            preferences.object(forKey: LocalDictationPreferenceKey.overlayBackgroundStrength) as? Double
+                ?? OverlayAppearance.defaultStrength)
+        overlayCompact = preferences.bool(forKey: LocalDictationPreferenceKey.overlayCompact)
         overlayPosition = preferences.string(forKey: LocalDictationPreferenceKey.overlayPosition)
             .flatMap(OverlayPosition.init(rawValue:)) ?? .bottomCenter
         selectedInputDeviceUID = preferences.string(
@@ -322,6 +337,8 @@ final class AppState: ObservableObject {
 }
 
 enum LocalDictationPreferenceKey {
+    static let overlayBackgroundStrength = "LocalDictation.overlayBackgroundStrength.v1"
+    static let overlayCompact = "LocalDictation.overlayCompact.v1"
     static let overlayPosition = "LocalDictation.overlayPosition.v1"
     static let selectedInputDeviceUID = "LocalDictation.selectedInputDeviceUID.v1"
     static let asrSelection = "LocalDictation.asrSelection.v1"

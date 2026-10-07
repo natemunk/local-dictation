@@ -177,9 +177,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.appState.microphoneNotice = "Using system microphone · preferred input unavailable"
         }
         audioDeviceManager = AudioDeviceManager()
-        overlayWindow = OverlayWindow(appState: appState) { [weak self] in
-            self?.cancelFromUI()
-        }
+        overlayWindow = OverlayWindow(appState: appState,
+            onCancel: { [weak self] token in
+                guard let self else { return }
+                if self.isCurrent(token) { self.cancelFromUI() }
+                else { self.overlayWindow.hide(token: token) }
+            },
+            onFinish: { [weak self] token in self?.finishFromOverlay(token: token, preview: false) },
+            onPreview: { [weak self] token in self?.finishFromOverlay(token: token, preview: true) },
+            onSettings: { [weak self] in
+                guard let self, self.activeSession == nil, self.coordinator.phase == .idle else { return }
+                self.openSettings()
+            })
         let clipboardState = appState
         textInserter = TextInserter(
             privateClipboardMode: { [weak clipboardState] in
@@ -3425,6 +3434,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         default:
             break
         }
+    }
+
+    private func finishFromOverlay(token: DictationSessionToken, preview: Bool) {
+        guard isCurrent(token), coordinator.owns(token), coordinator.phase == .recording else { return }
+        execute(coordinator.finishFromMenu(mode: currentProfileMode(), preview: preview).effects)
     }
 
     @objc private func previewFromMenu() {

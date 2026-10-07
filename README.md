@@ -86,6 +86,13 @@ Diagnostics shows a fixed last-failure category and recovery action. Low input
 energy and audible input with no recognized speech receive different messages.
 There is no ready sound or microphone recording while idle.
 
+The overlay has a lighter glass background. Drag its header to move it for the
+current session. **Finish**, **Preview**, and **Cancel** work without taking
+keyboard focus from your destination. The gear opens background-strength and
+compact-mode controls plus Top/Bottom positioning; these appearance preferences
+are saved. Full Settings is available after dictation finishes. macOS Reduce
+Transparency uses an opaque background, and Reduce Motion skips the fades.
+
 Signal currently uses clipboard recovery. Its composer may be reused across
 conversations; automatic paste requires a verified conversation-specific context
 token. Secure fields still discard recordings before transcription.

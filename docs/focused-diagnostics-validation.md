@@ -157,3 +157,22 @@ CTC tokenizer/rescorer path ownership must be established first. Fresh audio and
 explicit corpus review are required; no existing recordings or correction text
 are silently exported. Phone acceptance separately covers awake, display sleep,
 lid closed, long-idle sleep, preemption, and visible route accuracy.
+
+## Overlay appearance follow-up
+
+- Lighter configurable background strength affects the backdrop only; text and
+  controls remain fully visible. Reduce Transparency uses an opaque background.
+- Header-only native dragging preserves the session position and clamps resized
+  panels to the display. Compact mode hides waveform/live text while keeping
+  status and actions. The gear exposes inline appearance controls; full Settings
+  is blocked during an active dictation.
+- The panel and hosting/drag views refuse keyboard focus. Finish/Preview/Cancel
+  carry the visible session token; the app checks ownership before finishing.
+  Existing capture-at-finish and paste validation remain in effect.
+- Re-showing an already visible panel during Pasting restores alpha without
+  restarting the fade or moving the panel to a different pointer screen.
+  Backdrop tint/border are static; waveform timing is sampled once per draw.
+- 326 app tests and five corpus tests passed in debug and release, including native offscreen
+  panel focus, persisted settings, and multi-display drag bounds. These tests do
+  not replace live mouse interaction/paste checks in external editors. No idle
+  polling, ASR model change, iPhone API change, or new audio retention is added.

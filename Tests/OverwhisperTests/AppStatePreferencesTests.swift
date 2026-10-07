@@ -14,6 +14,8 @@ struct AppStatePreferencesTests {
 
         let first = AppState(preferences: defaults)
         first.overlayPosition = .topRight
+        first.overlayBackgroundStrength = 0.48
+        first.overlayCompact = true
         first.selectedInputDeviceUID = "test-microphone"
         first.asrSelection = .whisperLargeV3Turbo
         first.privateClipboardMode = true
@@ -25,6 +27,8 @@ struct AppStatePreferencesTests {
 
         let restored = AppState(preferences: defaults)
         #expect(restored.overlayPosition == .topRight)
+        #expect(restored.overlayBackgroundStrength == 0.48)
+        #expect(restored.overlayCompact)
         #expect(restored.selectedInputDeviceUID == "test-microphone")
         #expect(restored.asrSelection == .whisperLargeV3Turbo)
         #expect(restored.privateClipboardMode)
@@ -44,9 +48,11 @@ struct AppStatePreferencesTests {
 
         defaults.set("sideways", forKey: LocalDictationPreferenceKey.overlayPosition)
         defaults.set("cloud", forKey: LocalDictationPreferenceKey.asrSelection)
+        defaults.set(Double.nan, forKey: LocalDictationPreferenceKey.overlayBackgroundStrength)
 
         let state = AppState(preferences: defaults)
         #expect(state.overlayPosition == .bottomCenter)
+        #expect(state.overlayBackgroundStrength == OverlayAppearance.defaultStrength)
         #expect(state.asrSelection == .parakeetV2)
         #expect(state.analyticsEnabled)
         #expect(state.destinationAnalyticsEnabled)

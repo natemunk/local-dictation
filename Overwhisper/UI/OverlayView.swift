@@ -1,17 +1,19 @@
 import SwiftUI
 
-enum OverlayMetrics {
-    static let width: CGFloat = 390
-    static let height: CGFloat = 154
-}
-
 struct OverlayView: View {
     @ObservedObject var appState: AppState
     let onCancel: () -> Void
+    let onFinish: () -> Void
+    let onPreview: () -> Void
+    let onSettings: () -> Void
+    let onDragEnd: () -> Void
+    let onPosition: (OverlayPosition) -> Void
     @State private var smoothedLevel: CGFloat = 0
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 8) {
             HStack(spacing: 10) {
                 phaseIcon
                 VStack(alignment: .leading, spacing: 3) {
@@ -39,17 +41,18 @@ struct OverlayView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            .overlay { OverlayDragRegion(onDragEnd: onDragEnd).help("Drag to move the dictation overlay") }
 
-            if appState.phase == .recording {
+            if !appState.overlayCompact, appState.phase == .recording {
                 Waveform(level: smoothedLevel)
                     .frame(height: 32)
-            } else if appState.phase != .failed {
+            } else if !appState.overlayCompact, appState.phase != .failed {
                 ProgressView()
                     .controlSize(.small)
                     .frame(height: 32)
             }
 
-            if !appState.liveTranscript.displayed.isEmpty {
+            if !appState.overlayCompact, !appState.liveTranscript.displayed.isEmpty {
                 Text(appState.liveTranscript.displayed)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -59,10 +62,19 @@ struct OverlayView: View {
             }
 
             HStack {
-                Text(hint)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                Button("Finish", systemImage: "stop.fill", action: onFinish)
+                    .disabled(appState.phase != .recording)
+                    .help("Finish dictation and paste into the captured destination")
+                Button("Preview", systemImage: "text.page", action: onPreview)
+                    .disabled(appState.phase != .recording)
+                    .help("Finish into editable preview")
                 Spacer()
+                Button {
+                    appState.overlayQuickControlsVisible.toggle()
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .help("Overlay appearance")
                 if appState.phase.hasActiveSession {
                     Button(action: onCancel) {
                         Image(systemName: "xmark.circle.fill")
@@ -72,20 +84,50 @@ struct OverlayView: View {
                     .help("Cancel and discard this session")
                 }
             }
+            .buttonStyle(.plain)
+            .font(.caption)
+
+            if appState.overlayQuickControlsVisible {
+                VStack(spacing: 8) {
+                    HStack {
+                        Text("Background").font(.caption)
+                        Slider(value: $appState.overlayBackgroundStrength, in: OverlayAppearance.strengthRange)
+                            .disabled(reduceTransparency)
+                            .help("Background strength; text and controls stay fully visible")
+                        Text(reduceTransparency ? "Opaque" : "\(Int(appState.overlayBackgroundStrength * 100))%")
+                            .font(.caption.monospacedDigit()).frame(width: 44)
+                    }
+                    HStack {
+                        Toggle("Compact", isOn: $appState.overlayCompact).toggleStyle(.switch)
+                        Spacer()
+                        Button("Top") { onPosition(.topCenter) }
+                        Button("Bottom") { onPosition(.bottomCenter) }
+                    }.font(.caption)
+                    HStack {
+                        Text(appState.phase == .recording ? hint : "Drag the header to move this box")
+                            .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                        Spacer()
+                        Button("Settings…", action: onSettings)
+                            .disabled(appState.phase != .idle && appState.phase != .failed)
+                            .help("Full settings are available after dictation finishes")
+                    }.font(.caption)
+                }
+            }
         }
         .padding(.horizontal, 24)
-        .padding(.vertical, 18)
-        .frame(width: OverlayMetrics.width, height: OverlayMetrics.height)
-        .background(OverlaySurface(level: smoothedLevel))
+        .padding(.vertical, 12)
+        .frame(width: 390, height: OverlayAppearance.size(compact: appState.overlayCompact,
+            controls: appState.overlayQuickControlsVisible).height)
+        .background(OverlaySurface(strength: appState.overlayBackgroundStrength, reduceTransparency: reduceTransparency))
         .onChange(of: appState.audioLevel) { _, value in
             let target = CGFloat(sqrt(Double(max(0, min(1, value)))))
-            withAnimation(.easeOut(duration: target > smoothedLevel ? 0.06 : 0.24)) {
+            withAnimation(reduceMotion ? nil : .easeOut(duration: target > smoothedLevel ? 0.06 : 0.24)) {
                 smoothedLevel = max(target, smoothedLevel * 0.78)
             }
         }
         .onChange(of: appState.phase) { _, phase in
             if phase != .recording {
-                withAnimation(.easeOut(duration: 0.4)) { smoothedLevel = 0 }
+                withAnimation(reduceMotion ? nil : .easeOut(duration: 0.4)) { smoothedLevel = 0 }
             }
         }
     }
@@ -142,10 +184,11 @@ private struct Waveform: View {
     var body: some View {
         GeometryReader { proxy in
             let count = 32
+            let time = Date().timeIntervalSinceReferenceDate
             let width = max(2, (proxy.size.width - CGFloat(count - 1) * 3) / CGFloat(count))
             HStack(alignment: .center, spacing: 3) {
                 ForEach(0..<count, id: \.self) { index in
-                    let wave = 0.3 + 0.7 * abs(sin(Double(index) * 0.78 + Date().timeIntervalSinceReferenceDate * 2.4))
+                    let wave = 0.3 + 0.7 * abs(sin(Double(index) * 0.78 + time * 2.4))
                     Capsule()
                         .fill(
                             LinearGradient(
@@ -164,19 +207,21 @@ private struct Waveform: View {
 }
 
 private struct OverlaySurface: View {
-    let level: CGFloat
+    let strength: Double
+    let reduceTransparency: Bool
 
     var body: some View {
         RoundedRectangle(cornerRadius: 22, style: .continuous)
-            .fill(.ultraThinMaterial)
+            .fill(reduceTransparency ? AnyShapeStyle(Color(nsColor: .windowBackgroundColor)) : AnyShapeStyle(.ultraThinMaterial))
+            .opacity(reduceTransparency ? 1 : strength)
             .overlay {
                 RoundedRectangle(cornerRadius: 22, style: .continuous)
                     .fill(
                         LinearGradient(
                             colors: [
-                                .black.opacity(0.38),
-                                .indigo.opacity(0.12 + level * 0.12),
-                                .black.opacity(0.42),
+                                .black.opacity(reduceTransparency ? 0 : 0.18 * strength),
+                                .indigo.opacity(reduceTransparency ? 0 : 0.10 * strength),
+                                .black.opacity(reduceTransparency ? 0 : 0.22 * strength),
                             ],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
@@ -185,9 +230,9 @@ private struct OverlaySurface: View {
             }
             .overlay {
                 RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .strokeBorder(.white.opacity(0.18 + level * 0.15), lineWidth: 1)
+                    .strokeBorder(.white.opacity(0.18), lineWidth: 1)
             }
-            .shadow(color: .black.opacity(0.35), radius: 20, y: 10)
+            .shadow(color: .black.opacity(0.18), radius: 12, y: 6)
             .padding(6)
     }
 }
