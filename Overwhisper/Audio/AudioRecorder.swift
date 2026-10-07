@@ -229,6 +229,11 @@ final class AudioRecorder: ObservableObject {
     private var healthTimer: Timer?
     private var callbackLossHandled = false
     private var captureFailureHandled = false
+    private var firstFrameReported = false
+    private var audioUnitStartUptime: TimeInterval?
+    private(set) var capturedOutputFrames: Int64 = 0
+    private(set) var captureFailureReason: DictationFailureReason?
+    private(set) var inputDeviceCategory: MicrophoneDeviceCategory?
 
     @Published var currentLevel: Float = 0
     @Published var isRecording = false
@@ -242,6 +247,7 @@ final class AudioRecorder: ObservableObject {
 
     var onCallbackLoss: ((AudioCallbackLossAction) -> Void)?
     var onCaptureFailure: ((String) -> Void)?
+    var onFirstAudioFrame: ((TimeInterval) -> Void)?
     var onSystemInputFallback: (() -> Void)?
 
     private let sampleRate: Double = 16_000
@@ -327,6 +333,7 @@ final class AudioRecorder: ObservableObject {
                 onSystemInputFallback?()
             }
             inputUnit = unit
+            inputDeviceCategory = Self.deviceCategory(activeDeviceID)
 
             guard let canonicalFormat = AudioFormatFactory.noninterleavedFloat32(
                 sampleRate: sampleRate,
@@ -407,6 +414,7 @@ final class AudioRecorder: ObservableObject {
 
             runtime.startConsumer()
             renderContext.resetCallbackWatchdogForAudioUnitStart()
+            audioUnitStartUptime = ProcessInfo.processInfo.systemUptime
             status = AudioOutputUnitStart(unit)
             guard status == noErr else {
                 throw AudioRecorderError.deviceConfigurationFailed
@@ -447,6 +455,7 @@ final class AudioRecorder: ObservableObject {
 
         stopHealthMonitoring()
         stopAndDisposeInputUnit()
+        reportFirstFrameIfNeeded(runtime)
         runtime.requestDrain()
         return StoppedRecording(url: url, runtime: runtime)
     }
@@ -501,6 +510,11 @@ final class AudioRecorder: ObservableObject {
     }
 
     private func resetPublishedMetrics() {
+        inputDeviceCategory = nil
+        firstFrameReported = false
+        audioUnitStartUptime = nil
+        capturedOutputFrames = 0
+        captureFailureReason = nil
         peakRMS = 0
         meanRMS = 0
         droppedAudioChunkCount = 0
@@ -510,6 +524,21 @@ final class AudioRecorder: ObservableObject {
         microphoneDisconnected = false
         callbackLossHandled = false
         captureFailureHandled = false
+    }
+
+    private static func deviceCategory(_ id: AudioDeviceID) -> MicrophoneDeviceCategory {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var type: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, &type) == noErr else { return .unknown }
+        switch type {
+        case kAudioDeviceTransportTypeBuiltIn: return .builtIn
+        case kAudioDeviceTransportTypeUSB: return .usb
+        case kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE: return .bluetooth
+        case kAudioDeviceTransportTypeVirtual: return .virtual
+        default: return .other
+        }
     }
 
     private func startHealthMonitoring() {
@@ -530,16 +559,19 @@ final class AudioRecorder: ObservableObject {
 
     private func pollCaptureHealth() {
         guard isRecording, let runtime = captureRuntime else { return }
+        reportFirstFrameIfNeeded(runtime)
 
         if !captureFailureHandled,
            let failure = runtime.processingFailureDescription {
             captureFailureHandled = true
+            captureFailureReason = .audioProcessingFailed
             onCaptureFailure?(failure)
             return
         }
         if !captureFailureHandled,
            let renderError = runtime.renderContext.terminalRenderError {
             captureFailureHandled = true
+            captureFailureReason = .audioRenderFailed
             onCaptureFailure?(
                 "The microphone render callback failed "
                     + "at least "
@@ -551,6 +583,7 @@ final class AudioRecorder: ObservableObject {
         if !captureFailureHandled,
            runtime.renderContext.oversizedCallbackCount > 0 {
             captureFailureHandled = true
+            captureFailureReason = .oversizedAudioFrame
             onCaptureFailure?(
                 "The microphone produced a block larger than its declared maximum."
             )
@@ -575,6 +608,7 @@ final class AudioRecorder: ObservableObject {
         metrics: AudioCaptureMetrics,
         runtime: AudioCaptureRuntime
     ) {
+        capturedOutputFrames = metrics.emittedOutputFrames
         peakRMS = metrics.peakRMS
         meanRMS = metrics.meanRMS
         realtimeOverflowCount = runtime.renderContext.ring.overflowCount
@@ -584,6 +618,20 @@ final class AudioRecorder: ObservableObject {
         droppedAudioChunkCount = totalDrops > UInt64(Int.max)
             ? Int.max
             : Int(totalDrops)
+    }
+
+    func publishFirstAudioFrameIfAvailable() {
+        guard isRecording, let runtime = captureRuntime else { return }
+        reportFirstFrameIfNeeded(runtime)
+    }
+
+    private func reportFirstFrameIfNeeded(_ runtime: AudioCaptureRuntime) {
+        guard !firstFrameReported, let start = audioUnitStartUptime,
+              let delay = runtime.renderContext.secondsToFirstFrame else { return }
+        firstFrameReported = true
+        // Anchor a duration measured entirely with mach_continuous_time to
+        // uptime. Never subtract timestamps from the two different epochs.
+        onFirstAudioFrame?(start + delay)
     }
 
     private func finishRuntimeState(ownedBy runtime: AudioCaptureRuntime?) {
@@ -749,7 +797,7 @@ final class AudioRecorder: ObservableObject {
     }
 }
 
-enum AudioRecorderError: LocalizedError {
+enum AudioRecorderError: LocalizedError, Equatable {
     case failedToCreateFile
     case invalidFormat
     case converterCreationFailed

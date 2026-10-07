@@ -72,7 +72,11 @@ struct PrivacySafeDiagnosticsTests {
         )
         state.recordInsertionDiagnostic(.clipboardOnly(reason: clipboardSentinel))
 
+        state.lastDictationFailure = .noAudioFrames
         let snapshot = PrivacySafeDiagnosticSnapshot(appState: state)
+        #expect(snapshot.schemaVersion == 2)
+        #expect(snapshot.dictationFailure == .noAudioFrames)
+        #expect(snapshot.renderedReport.contains("dictation.failure_reason=no_audio_frames"))
         let fieldNames = snapshot.fields.map(\.name)
         #expect(fieldNames == DiagnosticFieldName.allCases)
         #expect(Set(fieldNames).count == fieldNames.count)

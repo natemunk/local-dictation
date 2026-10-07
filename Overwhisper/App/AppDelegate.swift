@@ -722,14 +722,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         overlayWindow.show(position: appState.overlayPosition, token: token)
         DictationPerformanceSignposts.emit(.overlay, correlationID: token.generation)
 
+        let notice = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: CaptureReadinessPolicy.noticeDelay) } catch { return }
+            guard let self, !Task.isCancelled, self.isCurrent(token) else { return }
+            self.audioRecorder.publishFirstAudioFrameIfAvailable()
+            guard CaptureReadinessPolicy.shouldShowStarting(
+                current: self.isCurrent(token), recording: self.appState.phase == .recording,
+                receivedFrame: self.activeSession?.firstAudioFrameAtUptime != nil,
+                typing: self.appState.interleavedTyping) else { return }
+            self.appState.overlayMessage = "Starting microphone…"
+        }
+        updateSession(token) { $0.captureNoticeTask = notice }
+
         let watchdog = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(2))
             guard !Task.isCancelled,
                   let self,
                   self.isCurrent(token),
-                  !self.audioRecorder.isRecording
+                  self.appState.phase == .recording
             else { return }
-            self.failSession(token: token, "The microphone did not start within two seconds.")
+            self.audioRecorder.publishFirstAudioFrameIfAvailable()
+            guard self.activeSession?.firstAudioFrameAtUptime == nil else { return }
+            let reason: DictationFailureReason = self.audioRecorder.isRecording ? .noAudioFrames : .microphoneStartTimedOut
+            self.failSession(token: token, "The microphone did not provide audio within two seconds.", reason: reason)
         }
         updateSession(token) { $0.captureWatchdog = watchdog }
     }
@@ -737,34 +752,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func startAudioCapture(token: DictationSessionToken) {
         guard isCurrent(token), coordinator.owns(token) else { return }
         guard !audioRecorder.isRecording else {
-            failSession(token: token, "The microphone is already owned by another recording.")
+            failSession(token: token, "The microphone is already owned by another recording.", reason: .microphoneAlreadyOwned)
             return
         }
 
         guard activeSession?.engine != nil else {
-            failSession(token: token, "The local speech model is still preparing. Try Hyper+D again when setup finishes.")
+            failSession(token: token, "The local speech model is still preparing. Try Hyper+D again when setup finishes.", reason: .modelUnavailable)
             return
         }
 
         do {
+            audioRecorder.onFirstAudioFrame = { [weak self] timestamp in
+                self?.receivedFirstAudioFrame(token: token, at: timestamp)
+            }
             let samples = try audioRecorder.startRecording()
             let recordingStartedAtUptime = ProcessInfo.processInfo.systemUptime
             DictationPerformanceSignposts.emit(.captureReady, correlationID: token.generation)
             updateSession(token) {
-                $0.captureWatchdog?.cancel()
-                $0.captureWatchdog = nil
                 $0.metricTiming.markRecordingStarted(at: recordingStartedAtUptime)
+                $0.metricDetails.inputDeviceCategory = audioRecorder.inputDeviceCategory
                 if let requested = $0.captureRequestedAtUptime {
                     $0.metricDetails.record(.captureReady, from: requested, to: recordingStartedAtUptime)
                 }
             }
-            if activeSession?.streamingTranscriber == nil {
-                appState.overlayMessage = "Listening · live text unavailable"
-            } else {
+            if activeSession?.streamingTranscriber != nil {
                 startStreamingUpdates(samples: samples, token: token)
             }
         } catch {
-            failSession(token: token, "Could not start the microphone: \(error.localizedDescription)")
+            let reason: DictationFailureReason = (error as? AudioRecorderError) == .noPermission
+                ? .permissionDenied : .microphoneStartFailed
+            failSession(token: token, "Could not start the microphone: \(error.localizedDescription)", reason: reason)
+        }
+    }
+
+    private func receivedFirstAudioFrame(token: DictationSessionToken, at timestamp: TimeInterval) {
+        guard isCurrent(token), activeSession?.firstAudioFrameAtUptime == nil else { return }
+        updateSession(token) {
+            $0.firstAudioFrameAtUptime = timestamp
+            $0.captureWatchdog?.cancel()
+            $0.captureWatchdog = nil
+            $0.captureNoticeTask?.cancel()
+            $0.captureNoticeTask = nil
+            if let began = $0.captureRequestedAtUptime {
+                $0.metricDetails.record(.firstAudioFrame, from: began, to: timestamp)
+            }
+        }
+        if appState.phase == .recording, !appState.interleavedTyping {
+            appState.overlayMessage = activeSession?.streamingTranscriber == nil
+                ? "Listening · live text unavailable" : "Listening"
         }
     }
 
@@ -894,7 +929,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func finishCapture(_ request: DictationFinishRequest) async {
         guard isCurrent(request.token) else { return }
         guard audioRecorder.isRecording else {
-            failSession(token: request.token, "The microphone stopped before finalization could begin.")
+            failSession(token: request.token, "The microphone stopped before finalization could begin.", reason: .captureStoppedEarly)
             return
         }
 
@@ -911,7 +946,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             stoppedRecording = try audioRecorder.stopCapture()
             updateSession(request.token) { $0.metricDetails.record(.captureStop, from: started) }
         } catch {
-            failSession(token: request.token, "Could not finish the recording: \(error.localizedDescription)")
+            failSession(token: request.token, "Could not finish the recording: \(error.localizedDescription)", reason: .audioFinalizationFailed)
             return
         }
         let captureStarted = ProcessInfo.processInfo.systemUptime
@@ -942,9 +977,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 $0.audioURL = audioURL
                 $0.metricDetails.record(.drainWait, from: drainStarted)
                 $0.captureFinishTask = nil
+                $0.captureInputEvidence = .classify(frames: audioRecorder.capturedOutputFrames,
+                    peakRMS: audioRecorder.peakRMS, heardAudio: appState.microphoneHasHeardAudio)
             }
         } catch {
-            failSession(token: request.token, "Could not finish the recording: \(error.localizedDescription)")
+            failSession(token: request.token, "Could not finish the recording: \(error.localizedDescription)", reason: .audioFinalizationFailed)
             return
         }
 
@@ -961,6 +998,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             appState.liveTranscript = LiveTranscript()
             appState.overlayMessage = "Secure field · recording discarded"
             completeSession(token: request.token, toastDuration: .seconds(2))
+            return
+        }
+
+        if activeSession?.captureInputEvidence == .noFrames {
+            failSession(token: request.token, DictationFailureReason.noAudioFrames.recoveryAction, reason: .noAudioFrames)
             return
         }
 
@@ -1117,7 +1159,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     error: error.localizedDescription,
                     token: request.token
                 )
-                self.failSession(token: request.token, "Transcription failed: \(error.localizedDescription)")
+                self.failSession(token: request.token, "Transcription failed: \(error.localizedDescription)", reason: .asrFailed)
             }
         }
         updateSession(request.token) { $0.finalizationTask = finalizationTask }
@@ -1140,7 +1182,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         session.finalizationTask?.cancel()
         cancelStreamingSession(token: token)
         guard let recovery else {
-            failSession(token: token, "Transcription timed out. No recovery text is available; please record again.")
+            failSession(token: token, "Transcription timed out. No recovery text is available; please record again.", reason: .asrTimedOut)
             return
         }
         await handleTranscriptRecovery(
@@ -1252,7 +1294,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !Task.isCancelled, isCurrent(token) else { return }
         updateSession(token) { $0.rawText = raw.text }
         guard !raw.text.isEmpty else {
-            failSession(token: token, "No speech was detected. Nothing was pasted.")
+            let reason = activeSession?.captureInputEvidence.emptyTranscriptReason ?? .noSpeech
+            failSession(token: token, reason.recoveryAction, reason: reason)
             return
         }
 
@@ -1700,7 +1743,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func failSession(token: DictationSessionToken, _ message: String) {
+    private func failSession(token: DictationSessionToken, _ message: String, reason: DictationFailureReason) {
         abandonVoiceRewrite(for: token)
         guard let session = activeSession,
               session.token == token,
@@ -1712,6 +1755,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             $0.finalizationWatchdog?.cancel()
             $0.finalizationWatchdog = nil
         }
+        updateSession(token) { $0.metricDetails.failureReason = reason }
         queueMeasuredMetric(
             token: token,
             outcome: .failed,
@@ -1723,8 +1767,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateSession(token) { $0.state = .failed }
         appState.endRecordingClock()
         appState.phase = .failed
-        appState.lastError = message
-        appState.overlayMessage = "Error"
+        appState.lastDictationFailure = reason
+        appState.lastError = reason.isNeutral ? reason.recoveryAction : message
+        appState.overlayMessage = reason == .noSpeech ? "No speech detected"
+            : (reason == .lowInputEnergy ? "Check microphone input" : "Recording stopped")
         overlayWindow.show(position: appState.overlayPosition, token: token)
         retireRuntime(session, hideOverlay: false)
         inferenceLease.endDesktop()
@@ -1787,6 +1833,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         session.streamingStartTask?.cancel()
         session.streamingUpdatesTask?.cancel()
         session.captureWatchdog?.cancel()
+        session.captureNoticeTask?.cancel()
         session.finalizationWatchdog?.cancel()
         if activeSession?.token == session.token,
            audioRecorder?.isRecording == true {
@@ -1848,7 +1895,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .fail:
             failSession(
                 token: token,
-                "The microphone stopped before any usable audio was captured."
+                "The microphone stopped before any usable audio was captured.", reason: .noAudioFrames
             )
         }
     }
@@ -1857,7 +1904,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let token = activeSession?.token,
               appState.phase == .recording
         else { return }
-        failSession(token: token, "Audio capture failed: \(message)")
+        failSession(token: token, "Audio capture failed: \(message)",
+                    reason: audioRecorder.captureFailureReason ?? .audioProcessingFailed)
     }
 
     private func currentProfileMode() -> DictationMode {

@@ -366,6 +366,8 @@ enum DiagnosticFieldName: String, CaseIterable, Sendable {
     case insertionState = "insertion.state"
     case insertionLastOutcome = "insertion.last_outcome"
     case insertionLastFailure = "insertion.last_failure"
+    case dictationFailureStage = "dictation.failure_stage"
+    case dictationFailureReason = "dictation.failure_reason"
 }
 
 struct DiagnosticField: Equatable, Sendable {
@@ -389,6 +391,7 @@ struct PrivacySafeDiagnosticSnapshot: Equatable, Encodable, Sendable {
     let configuration: ConfigurationDiagnosticSnapshot
     let history: HistoryDiagnosticSnapshot
     let insertion: InsertionDiagnosticSnapshot
+    let dictationFailure: DictationFailureReason?
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version"
@@ -399,11 +402,13 @@ struct PrivacySafeDiagnosticSnapshot: Equatable, Encodable, Sendable {
         case configuration
         case history
         case insertion
+        case dictationFailure = "dictation_failure"
     }
 
     @MainActor
     init(appState: AppState) {
-        schemaVersion = 1
+        schemaVersion = 2
+        dictationFailure = appState.lastDictationFailure
         permissions = PermissionDiagnosticSnapshot(
             microphone: appState.microphonePermissionGranted ? .ready : .needsAttention,
             inputMonitoring: appState.inputMonitoringGranted ? .ready : .needsAttention,
@@ -531,6 +536,8 @@ struct PrivacySafeDiagnosticSnapshot: Equatable, Encodable, Sendable {
             DiagnosticField(.insertionState, insertion.state.rawValue),
             DiagnosticField(.insertionLastOutcome, insertion.lastOutcome.rawValue),
             DiagnosticField(.insertionLastFailure, insertion.lastFailure.rawValue),
+            DiagnosticField(.dictationFailureStage, dictationFailure?.stage.rawValue ?? "none"),
+            DiagnosticField(.dictationFailureReason, dictationFailure?.rawValue ?? "none"),
         ]
     }
 

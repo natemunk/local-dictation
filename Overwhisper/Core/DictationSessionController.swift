@@ -26,6 +26,9 @@ struct DictationSession {
     var metricTiming = DictationMetricTiming()
     var metricDetails = DictationMetricDetails()
     var captureRequestedAtUptime: TimeInterval?
+    var firstAudioFrameAtUptime: TimeInterval?
+    var captureInputEvidence: CaptureInputEvidence = .noFrames
+    var captureNoticeTask: Task<Void, Never>?
     var metricDictationMode: HistoryDictationMode?
     var metricSpeechEngine: String?
     var metricSpeechModel: String?

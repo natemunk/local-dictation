@@ -178,6 +178,8 @@ final class AppState: ObservableObject {
     private var levelWindow: [Float] = []
     private var lastAudibleAt: TimeInterval = 0
     private var hasHeardAudio = false
+    var microphoneHasHeardAudio: Bool { hasHeardAudio }
+    @Published var lastDictationFailure: DictationFailureReason?
     private var micProvenHealthy = false
 
     var onboardingReady: Bool {

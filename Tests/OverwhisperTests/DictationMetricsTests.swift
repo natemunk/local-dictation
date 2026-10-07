@@ -50,6 +50,10 @@ struct DictationMetricsTests {
             "cleanup_fallback_reason",
             "build_label",
             "foreground_bundle_identifier",
+            "hotkey_to_first_audio_frame_seconds",
+            "failure_stage",
+            "failure_reason",
+            "input_device_kind",
         ]))
         #expect(try await store.metricsForeignKeyCount() == 0)
         #expect(try await store.metricCount() == 0)
@@ -60,7 +64,7 @@ struct DictationMetricsTests {
         #expect(
             try await store.metricsDatabaseColumnNames().allSatisfy { column in
                 // Explicit numeric-duration exception, never transcript text.
-                column == "engine_transcription_seconds" || forbiddenFragments.allSatisfy {
+                ["engine_transcription_seconds", "hotkey_to_first_audio_frame_seconds"].contains(column) || forbiddenFragments.allSatisfy {
                     !column.localizedCaseInsensitiveContains($0)
                 }
             }
@@ -402,6 +406,9 @@ struct DictationMetricsTests {
         event.details.insertionFailure = .destinationMissing
         event.details.cleanupFallbackReason = "admission_busy"
         event.details.buildLabel = "0.1.0/abc-dirty"
+        event.details.failureReason = .permissionDenied
+        event.details.inputDeviceCategory = .bluetooth
+        event.details.record(.firstAudioFrame, from: 10, to: 10.12)
         event.details.foregroundBundleIdentifier = "com.example.Editor"
         event.details.redactDestination(enabled: false)
         #expect(try await store.upsertMetric(event, analyticsEnabled: false) == false)
@@ -444,6 +451,33 @@ struct DictationMetricsTests {
         #expect(event.asrLatencySeconds == 0.4)
         #expect(event.stopToDeliveryLatencySeconds == 0.6)
         #expect(event.details == DictationMetricDetails())
+    }
+
+    @Test("capture migration preserves installed v2 rows and nullable new phases")
+    func captureMigrationPreservesV2() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("capture-migration.sqlite")
+        let id = UUID()
+        do {
+            let old = try DatabaseQueue(path: url.path)
+            try HistoryStore.makeMigrator().migrate(old, upTo: HistoryStore.metricsDetailMigrationIdentifier)
+            try await old.write { db in
+                try db.execute(sql: """
+                    INSERT INTO dictation_metrics(event_id,completed_at,created_at,updated_at,delivery_outcome,
+                        source_kind,schema_version,asr_latency_seconds,hotkey_to_capture_ready_seconds)
+                    VALUES (?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'paste_event_sent','measured',2,0.4,0.08)
+                    """, arguments: [id.uuidString.lowercased()])
+            }
+        }
+        let store = try HistoryStore(databaseURL: url)
+        let event = try #require(try await store.fetchMetric(eventID: id))
+        #expect(event.schemaVersion == 2)
+        #expect(event.asrLatencySeconds == 0.4)
+        #expect(event.details.durations[.captureReady] == 0.08)
+        #expect(event.details.durations[.firstAudioFrame] == nil)
+        #expect(event.details.failureReason == nil)
+        #expect(event.details.inputDeviceCategory == nil)
     }
 
     private func metric(

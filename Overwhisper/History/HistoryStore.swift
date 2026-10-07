@@ -15,6 +15,7 @@ actor HistoryStore {
     static let metricsMigrationIdentifier = "dictation_metrics_v1"
     static let unifiedMigrationIdentifier = "history_unified_v3"
     static let metricsDetailMigrationIdentifier = "dictation_metrics_v2"
+    static let captureMetricsMigrationIdentifier = "dictation_metrics_v3_capture"
     static let expectedMigrationIdentifiers = [
         schemaMigrationIdentifier,
         searchMigrationIdentifier,
@@ -23,6 +24,7 @@ actor HistoryStore {
         metricsMigrationIdentifier,
         unifiedMigrationIdentifier,
         metricsDetailMigrationIdentifier,
+        captureMetricsMigrationIdentifier,
     ]
 
     private static let tableName = "dictation_history"
@@ -1312,8 +1314,16 @@ actor HistoryStore {
 
         migrator.registerMigration(metricsDetailMigrationIdentifier) { db in
             try db.alter(table: metricsTableName) { table in
-                for phase in DictationMetricPhase.allCases { table.add(column: phase.rawValue, .double) }
-                for name in DictationMetricDetails.labelColumns { table.add(column: name, .text) }
+                for name in DictationMetricDetails.v2PhaseColumns { table.add(column: name, .double) }
+                for name in DictationMetricDetails.v2LabelColumns { table.add(column: name, .text) }
+            }
+        }
+        migrator.registerMigration(captureMetricsMigrationIdentifier) { db in
+            try db.alter(table: metricsTableName) { table in
+                table.add(column: "hotkey_to_first_audio_frame_seconds", .double)
+                table.add(column: "failure_stage", .text)
+                table.add(column: "failure_reason", .text)
+                table.add(column: "input_device_kind", .text)
             }
         }
         return migrator

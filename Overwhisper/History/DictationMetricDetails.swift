@@ -12,6 +12,7 @@ enum DictationMetricPhase: String, CaseIterable, Sendable {
     case preparedHistory = "pre_delivery_history_seconds"
     case pasteValidation = "paste_validation_seconds"
     case pasteEvent = "stop_to_paste_event_seconds"
+    case firstAudioFrame = "hotkey_to_first_audio_frame_seconds"
 }
 
 enum DestinationCaptureOutcome: String, Sendable {
@@ -30,6 +31,8 @@ struct DictationMetricDetails: Equatable, Sendable {
     var cleanupFallbackReason: String?
     var buildLabel: String?
     var foregroundBundleIdentifier: String?
+    var failureReason: DictationFailureReason?
+    var inputDeviceCategory: MicrophoneDeviceCategory?
 
     mutating func record(_ phase: DictationMetricPhase, from start: TimeInterval,
                          to end: TimeInterval = ProcessInfo.processInfo.systemUptime) {
@@ -41,8 +44,14 @@ struct DictationMetricDetails: Equatable, Sendable {
         if !enabled { foregroundBundleIdentifier = nil }
     }
 
-    static let labelColumns = ["insertion_failure_kind", "insertion_tier", "capture_outcome",
-                               "cleanup_fallback_reason", "build_label", "foreground_bundle_identifier"]
+    // Frozen historical schema: new measurements must not rewrite v2 migration.
+    static let v2PhaseColumns = ["hotkey_to_capture_ready_seconds", "capture_stop_seconds",
+        "destination_capture_seconds", "remaining_drain_wait_seconds", "inference_lease_wait_seconds",
+        "engine_transcription_seconds", "raw_history_write_seconds", "pre_delivery_history_seconds",
+        "paste_validation_seconds", "stop_to_paste_event_seconds"]
+    static let v2LabelColumns = ["insertion_failure_kind", "insertion_tier", "capture_outcome",
+                                "cleanup_fallback_reason", "build_label", "foreground_bundle_identifier"]
+    static let labelColumns = v2LabelColumns + ["failure_stage", "failure_reason", "input_device_kind"]
     static let columnNames = DictationMetricPhase.allCases.map(\.rawValue) + labelColumns
 
     var databaseValues: [DatabaseValue] {
@@ -52,7 +61,8 @@ struct DictationMetricDetails: Equatable, Sendable {
         }
         let labels: [String?] = [insertionFailure?.rawValue, insertionTier?.rawValue,
                                 captureOutcome?.rawValue, cleanupFallbackReason, buildLabel,
-                                foregroundBundleIdentifier]
+                                foregroundBundleIdentifier, failureReason?.stage.rawValue, failureReason?.rawValue,
+                                inputDeviceCategory?.rawValue]
         return durations + labels.map { $0?.databaseValue ?? .null }
     }
 
@@ -67,6 +77,8 @@ struct DictationMetricDetails: Equatable, Sendable {
         cleanupFallbackReason = row["cleanup_fallback_reason"]
         buildLabel = row["build_label"]
         foregroundBundleIdentifier = row["foreground_bundle_identifier"]
+        failureReason = (row["failure_reason"] as String?).flatMap(DictationFailureReason.init(rawValue:))
+        inputDeviceCategory = (row["input_device_kind"] as String?).flatMap(MicrophoneDeviceCategory.init(rawValue:))
     }
 }
 

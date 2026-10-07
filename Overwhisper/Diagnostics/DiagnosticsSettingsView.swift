@@ -18,6 +18,10 @@ struct DiagnosticsSettingsView: View {
             }
 
             Section("Runtime") {
+                valueRow("Last dictation failure", value: appState.lastDictationFailure?.displayName ?? "None observed this run")
+                if let reason = appState.lastDictationFailure {
+                    Text(reason.recoveryAction).font(.caption).foregroundStyle(.secondary)
+                }
                 valueRow("Optional cleanup", value: cleanupAdmissionDescription)
                 if appState.cleanupAdmissionSnapshot.state == .draining {
                     Text("Waiting for cancelled model work to exit. Deterministic cleanup remains available; optional cleanup resumes when the provider exits or the app restarts.")

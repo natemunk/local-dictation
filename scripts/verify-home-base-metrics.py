@@ -37,15 +37,17 @@ with tempfile.TemporaryDirectory(prefix="ld-home-base-compat-") as temporary:
              "destination_capture_seconds", "remaining_drain_wait_seconds",
              "inference_lease_wait_seconds", "engine_transcription_seconds",
              "raw_history_write_seconds", "pre_delivery_history_seconds",
-             "paste_validation_seconds", "stop_to_paste_event_seconds"]
+             "paste_validation_seconds", "stop_to_paste_event_seconds",
+             "hotkey_to_first_audio_frame_seconds"]
     labels = ["insertion_failure_kind", "insertion_tier", "capture_outcome",
-              "cleanup_fallback_reason", "build_label", "foreground_bundle_identifier"]
+              "cleanup_fallback_reason", "build_label", "foreground_bundle_identifier",
+              "failure_stage", "failure_reason", "input_device_kind"]
     with sqlite3.connect(path) as connection:
         for name in names:
             connection.execute(f'ALTER TABLE dictation_metrics ADD COLUMN "{name}" REAL')
         for name in labels:
             connection.execute(f'ALTER TABLE dictation_metrics ADD COLUMN "{name}" TEXT')
-        connection.execute("UPDATE dictation_metrics SET schema_version=2, build_label='synthetic/test', stop_to_paste_event_seconds=0.45")
+        connection.execute("UPDATE dictation_metrics SET schema_version=3, build_label='synthetic/test', stop_to_paste_event_seconds=0.45")
     after = read(path)
     assert before == after, "Existing consumer selection changed"
     assert not set(names + labels) & set(after[0]), "Consumer must keep its allowlist"

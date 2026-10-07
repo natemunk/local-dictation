@@ -114,11 +114,21 @@ final class AudioRenderHealthState: @unchecked Sendable {
     static let terminalConsecutiveFailureThreshold: UInt64 = 3
 
     private let lastCallbackTickStorage = Atomic<UInt64>(0)
+    private let audioUnitStartTickStorage = Atomic<UInt64>(0)
+    private let firstFrameTickStorage = Atomic<UInt64>(0)
     private let lastRenderErrorStorage = Atomic<Int64>(0)
     private let consecutiveRenderFailureCountStorage = Atomic<UInt64>(0)
 
     var lastCallbackTick: UInt64 {
         lastCallbackTickStorage.load(ordering: .acquiring)
+    }
+
+    var firstFrameTick: UInt64 { firstFrameTickStorage.load(ordering: .acquiring) }
+    var audioUnitStartTick: UInt64 { audioUnitStartTickStorage.load(ordering: .acquiring) }
+
+    @inline(__always)
+    func recordPublishedFrame(at tick: UInt64 = mach_continuous_time()) {
+        _ = firstFrameTickStorage.compareExchange(expected: 0, desired: tick, ordering: .acquiringAndReleasing)
     }
 
     var lastRenderError: OSStatus? {
@@ -140,6 +150,8 @@ final class AudioRenderHealthState: @unchecked Sendable {
     }
 
     func resetForAudioUnitStart(at tick: UInt64 = mach_continuous_time()) {
+        audioUnitStartTickStorage.store(tick, ordering: .releasing)
+        firstFrameTickStorage.store(0, ordering: .releasing)
         lastCallbackTickStorage.store(tick, ordering: .releasing)
         consecutiveRenderFailureCountStorage.store(0, ordering: .releasing)
         lastRenderErrorStorage.store(0, ordering: .releasing)
@@ -201,6 +213,13 @@ final class RealtimeAudioRenderContext: @unchecked Sendable {
         callbackCounter.load(ordering: .relaxed)
     }
 
+    var secondsToFirstFrame: TimeInterval? {
+        let first = healthState.firstFrameTick
+        let start = healthState.audioUnitStartTick
+        guard first > 0, start > 0, first >= start else { return nil }
+        return timebase.seconds(from: start, to: first)
+    }
+
     var terminalRenderError: OSStatus? {
         healthState.terminalRenderError
     }
@@ -250,7 +269,7 @@ final class RealtimeAudioRenderContext: @unchecked Sendable {
             )
             if status == noErr {
                 healthState.recordRenderSuccess()
-                _ = ring.publish(slot)
+                if ring.publish(slot), frameCount > 0 { healthState.recordPublishedFrame() }
             } else {
                 _ = ring.cancelProducerClaim(slot)
                 healthState.recordRenderFailure(status)

@@ -70,7 +70,7 @@ struct DictationMetricTiming: Equatable, Sendable {
 /// One transcript-free analytics row. Text is accepted only by the caller's
 /// local word-counting step and has no representation in this type.
 struct DictationMetricEvent: Equatable, Sendable {
-    static let currentSchemaVersion = 2
+    static let currentSchemaVersion = 3
 
     let eventID: UUID
     let completedAt: Date

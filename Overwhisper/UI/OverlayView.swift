@@ -99,8 +99,9 @@ struct OverlayView: View {
                 .frame(width: 10, height: 10)
                 .shadow(color: .red.opacity(0.6), radius: 5)
         case .failed:
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
+            Image(systemName: appState.lastDictationFailure?.isNeutral == true
+                ? "info.circle" : "exclamationmark.triangle.fill")
+                .foregroundStyle(appState.lastDictationFailure?.isNeutral == true ? Color.secondary : Color.orange)
         case .idle:
             Image(systemName: "checkmark.circle.fill")
                 .foregroundStyle(.green)
@@ -125,7 +126,7 @@ struct OverlayView: View {
         if appState.interleavedTyping { return "Enter belongs to the current app · Hyper+D to finish" }
         switch appState.phase {
         case .recording: return "Enter finish · ⌥ literal · ⇧ preview · esc cancel"
-        case .failed: return "Text remains in history when available"
+        case .failed: return appState.lastDictationFailure?.recoveryAction ?? "Text remains in history when available"
         default: return "esc cancel"
         }
     }
