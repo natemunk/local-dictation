@@ -569,6 +569,138 @@ actor HistoryStore {
         }
     }
 
+    // MARK: - Desktop history browsing
+
+    /// Returns one keyset-paged desktop history slice ordered by
+    /// `(timestamp DESC, id DESC)`. The cursor is exclusive, so rows inserted
+    /// or deleted after a page is read cannot shift the next page. Search is
+    /// intentionally separate and continues to use `search(_:limit:)`.
+    func browse(
+        filter: HistoryBrowseFilter = .all,
+        cursor: HistoryBrowseCursor? = nil,
+        limit: Int = HistoryBrowsePage.defaultPageSize
+    ) throws -> HistoryBrowsePage {
+        guard (1...HistoryBrowsePage.maximumPageSize).contains(limit) else {
+            throw HistoryBrowsingError.invalidPageSize(limit)
+        }
+
+        return try database.read { db in
+            var predicates = [String]()
+            var arguments: StatementArguments = []
+
+            switch filter {
+            case .all:
+                break
+            case .pinned:
+                predicates.append("\(Column.isPinned) = 1")
+            case .clipboardRecovery:
+                predicates.append(
+                    "\(Column.deliveryStatus) IN (?, ?)"
+                )
+                arguments += [
+                    HistoryDeliveryStatus.clipboardOnly.rawValue,
+                    HistoryDeliveryStatus.historyOnly.rawValue,
+                ]
+            }
+
+            if let cursor {
+                predicates.append(
+                    "(\(Column.timestamp) < ? OR (\(Column.timestamp) = ? AND \(Column.id) < ?))"
+                )
+                arguments += [cursor.timestamp, cursor.timestamp, cursor.id.uuidString.lowercased()]
+            }
+
+            let whereClause = predicates.isEmpty
+                ? ""
+                : "WHERE " + predicates.joined(separator: " AND ")
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT *
+                    FROM \(Self.tableName)
+                    \(whereClause)
+                    ORDER BY \(Column.timestamp) DESC, \(Column.id) DESC
+                    LIMIT ?
+                    """,
+                arguments: arguments + [limit + 1]
+            )
+
+            let pageRows = Array(rows.prefix(limit))
+            let entries = try pageRows.map(Self.decodeEntry)
+            let nextCursor = rows.count > limit
+                ? entries.last.map { HistoryBrowseCursor(timestamp: $0.timestamp, id: $0.id) }
+                : nil
+            return HistoryBrowsePage(entries: entries, nextCursor: nextCursor)
+        }
+    }
+
+    /// Re-reads a browser's currently loaded IDs in one database read. This
+    /// lets a refresh remove rows deleted elsewhere and reflect pin/status
+    /// changes without applying a filter after an in-memory cap.
+    func fetchBrowseEntries(
+        ids: [UUID],
+        filter: HistoryBrowseFilter = .all
+    ) throws -> [HistoryEntry] {
+        guard !ids.isEmpty else { return [] }
+
+        return try database.read { db in
+            // Keep each IN clause well below SQLite's variable limit even if a
+            // user has loaded many pages in one history window.
+            let chunkSize = 400
+            var entries = [HistoryEntry]()
+            for chunkStart in stride(from: 0, to: ids.count, by: chunkSize) {
+                let chunk = Array(ids[chunkStart..<min(chunkStart + chunkSize, ids.count)])
+                var predicates = ["\(Column.id) IN (\(Array(repeating: "?", count: chunk.count).joined(separator: ",")))"]
+                var argumentValues: [(any DatabaseValueConvertible)?] = chunk.map {
+                    $0.uuidString.lowercased()
+                }
+
+                switch filter {
+                case .all:
+                    break
+                case .pinned:
+                    predicates.append("\(Column.isPinned) = 1")
+                case .clipboardRecovery:
+                    predicates.append("\(Column.deliveryStatus) IN (?, ?)")
+                    argumentValues += [
+                        HistoryDeliveryStatus.clipboardOnly.rawValue,
+                        HistoryDeliveryStatus.historyOnly.rawValue,
+                    ]
+                }
+
+                let rows = try Row.fetchAll(
+                    db,
+                    sql: """
+                        SELECT *
+                        FROM \(Self.tableName)
+                        WHERE \(predicates.joined(separator: " AND "))
+                        """,
+                    arguments: StatementArguments(argumentValues)
+                )
+                entries.append(contentsOf: try rows.map(Self.decodeEntry))
+            }
+
+            return entries.sorted { lhs, rhs in
+                if lhs.timestamp != rhs.timestamp {
+                    return lhs.timestamp > rhs.timestamp
+                }
+                return lhs.id.uuidString.lowercased() > rhs.id.uuidString.lowercased()
+            }
+        }
+    }
+
+    func browseCount(filter: HistoryBrowseFilter = .all) throws -> Int {
+        try database.read { db in
+            let predicate: String
+            switch filter {
+            case .all: predicate = "1"
+            case .pinned: predicate = "\(Column.isPinned) = 1"
+            case .clipboardRecovery: predicate = "\(Column.deliveryStatus) IN ('clipboard_only','history_only')"
+            }
+            return try Int.fetchOne(db, sql: "SELECT count(*) FROM \(Self.tableName) WHERE \(predicate)") ?? 0
+        }
+    }
+
     func search(_ query: String, limit: Int = 50) throws -> [HistoryEntry] {
         guard limit > 0 else { return [] }
         let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)

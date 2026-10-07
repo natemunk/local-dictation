@@ -12,7 +12,9 @@ actual cleanup backend; no API or Cloudflare deployment is required.
 ## Metrics v2 contract
 
 `dictation_metrics_v2` adds nullable columns and sets newly written events to
-schema version 2. Existing rows are not backfilled or relabeled. All durations
+schema version 2 in that release. The desktop readiness release writes schema
+version 3 and adds `dictation_metrics_v3_capture`; existing rows are not backfilled
+or relabeled. V2 migration columns are frozen. All durations
 are monotonic seconds; unattempted/incomplete phases are NULL, not zero.
 
 | Column | Meaning |
@@ -27,6 +29,15 @@ are monotonic seconds; unattempted/incomplete phases are NULL, not zero.
 | pre_delivery_history_seconds | Finalization/failed-polish history write before delivery |
 | paste_validation_seconds | Existing destination validation and immediate recheck |
 | stop_to_paste_event_seconds | Stop to immediately after posting Command+V, before history bookkeeping |
+| hotkey_to_first_audio_frame_seconds | Hotkey to the first successful native frame published to the capture ring; absent if no frame arrives |
+
+V3 also adds fixed `failure_stage`/`failure_reason` labels and `input_device_kind`
+(built-in, USB, Bluetooth, virtual, other, unknown). No device names or UIDs are
+stored. First-frame callback duration uses mach continuous time, anchored to the
+existing uptime clock before starting the AudioUnit; epochs are never directly
+subtracted. A frame may arrive before AudioOutputUnitStart returns, so this value
+may be smaller than the existing capture-ready measurement. UI publication uses
+the existing capture health cadence; there is no new idle timer.
 
 The original `asr_latency_seconds` still means Stop → ASR completion. The original
 `stop_to_delivery_latency_seconds` still includes post-paste bookkeeping.
@@ -93,6 +104,8 @@ and remain local. Do not automatically upload these reports.
 
 Correct Last Dictation… reuses the existing personal vocabulary confirmation
 dialog. It uses a persisted desktop history ID from this run, never the clipboard.
+Select the heard phrase from the raw transcript and explicitly confirm its written
+form. Replacing an existing mapping prompts again before any personal-pack write.
 Recovery/preview entries are eligible; cancelled, empty, secure, and phone entries
 are not. A deleted or expired entry is not silently replaced with another entry.
 

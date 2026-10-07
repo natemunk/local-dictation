@@ -3530,7 +3530,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.correctLastMenuItem?.isEnabled = false
                 self.lastTextMenuItem?.isEnabled = false
                 self.pasteLastMenuItem?.isEnabled = false
-                self.historyWindow?.refresh()
+                self.historyWindow?.clearForDeletion()
                 self.appState.lastError = debugDataCleared
                     ? nil
                     : "Database history was deleted, but some retained debug files could not be removed."

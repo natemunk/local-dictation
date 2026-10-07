@@ -45,8 +45,11 @@ final class HistoryWindowController {
     }
 
     func refresh() {
-        viewModel.reload()
+        guard let window, window.isVisible, !window.isMiniaturized else { return }
+        viewModel.refresh()
     }
+
+    func clearForDeletion() { viewModel.clearForDeletion() }
 }
 
 @MainActor
@@ -54,10 +57,14 @@ final class HistoryViewModel: ObservableObject {
     @Published var entries: [HistoryEntry] = []
     @Published var selection: UUID?
     @Published var query = ""
+    @Published var browseFilter: HistoryBrowseFilter = .all
     @Published var errorMessage: String?
     @Published var editDraft = ""
     @Published var isEditing = false
     @Published private(set) var conflictingText: String?
+    @Published private(set) var isLoading = false
+    @Published private(set) var hasMore = false
+    @Published private(set) var searchIsCapped = false
 
     let store: HistoryStore
     let onCopy: (String) -> Void
@@ -70,6 +77,10 @@ final class HistoryViewModel: ObservableObject {
     private let writeEdit: (UUID, String?, Int64) async throws -> HistoryEntry
     private var loadGeneration: UInt64 = 0
     private var loadTask: Task<Void, Never>?
+    private var browseCursor: HistoryBrowseCursor?
+    private var retainedSelection: HistoryEntry?
+
+    private static let searchLimit = 500
 
     init(
         store: HistoryStore,
@@ -125,6 +136,9 @@ final class HistoryViewModel: ObservableObject {
                 guard let self else { return }
                 if let index = self.entries.firstIndex(where: { $0.id == id }) {
                     self.entries[index] = updated
+                }
+                if self.retainedSelection?.id == id {
+                    self.retainedSelection = updated
                 }
                 if self.selection == id, self.editID == editID {
                     if text == nil || self.editDraft == text {
@@ -191,35 +205,215 @@ final class HistoryViewModel: ObservableObject {
     }
 
     var selectedEntry: HistoryEntry? {
-        entries.first { $0.id == selection }
+        if let selected = entries.first(where: { $0.id == selection }) {
+            return selected
+        }
+        return retainedSelection?.id == selection ? retainedSelection : nil
     }
 
     func reload() {
+        loadPage(reset: true)
+    }
+
+    func clearForDeletion() {
+        loadGeneration &+= 1
+        loadTask?.cancel()
+        loadTask = nil
+        entries.removeAll()
+        retainedSelection = nil
+        selection = nil
+        query = ""
+        browseCursor = nil
+        hasMore = false
+        isLoading = false
+        searchIsCapped = false
+        cancelEditing()
+    }
+
+    func refresh() {
+        guard !isSearching, !entries.isEmpty else {
+            reload()
+            return
+        }
+
         loadGeneration &+= 1
         let generation = loadGeneration
-        let requestedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestedFilter = browseFilter
+        var loadedIDs = entries.map(\.id)
+        if let retainedSelection, !loadedIDs.contains(retainedSelection.id) {
+            loadedIDs.append(retainedSelection.id)
+        }
         loadTask?.cancel()
+        isLoading = true
         loadTask = Task { @MainActor [weak self, store] in
             do {
-                let loaded: [HistoryEntry]
-                if requestedQuery.isEmpty {
-                    loaded = try await store.fetchRecent(limit: 500)
-                } else {
-                    loaded = try await store.search(requestedQuery, limit: 500)
-                }
+                let reread = try await store.fetchBrowseEntries(
+                    ids: loadedIDs,
+                    filter: .all
+                )
+                let page = try await store.browse(
+                    filter: requestedFilter,
+                    cursor: nil,
+                    limit: HistoryBrowsePage.defaultPageSize
+                )
+                let total = try await store.browseCount(filter: requestedFilter)
                 guard !Task.isCancelled,
                       let self,
                       self.loadGeneration == generation
                 else { return }
-                self.entries = loaded
-                if !loaded.contains(where: { $0.id == self.selection }) {
-                    self.selection = loaded.first?.id
+
+                let liveByID = Dictionary(uniqueKeysWithValues: reread.map { ($0.id, $0) })
+                var refreshedByID = Dictionary(uniqueKeysWithValues: reread.filter { requestedFilter.includes($0) }.map { ($0.id, $0) })
+                for entry in page.entries {
+                    refreshedByID[entry.id] = entry
                 }
+                self.entries = refreshedByID.values.sorted(by: Self.historyOrder)
+                self.hasMore = total > self.entries.count
+                // Continue below the fresh head; Load More skips loaded pages
+                // so a large batch of new entries cannot create a browsing gap.
+                self.browseCursor = self.hasMore ? page.nextCursor : nil
+                self.searchIsCapped = false
+                self.isLoading = false
                 self.errorMessage = nil
+                if let currentSelection = self.selection {
+                    if self.entries.contains(where: { $0.id == currentSelection }) {
+                        self.retainedSelection = nil
+                    } else if self.isEditing, let live = liveByID[currentSelection] {
+                        // A remote unpin must not throw away a current draft.
+                        // Deleted rows are absent from liveByID and are cleared.
+                        self.retainedSelection = live
+                    } else {
+                        self.selection = nil
+                        self.retainedSelection = nil
+                        if self.isEditing {
+                            self.cancelEditing()
+                        }
+                    }
+                } else if self.selection == nil {
+                    self.selection = self.entries.first?.id
+                }
             } catch is CancellationError {
                 return
             } catch {
                 guard let self, self.loadGeneration == generation else { return }
+                self.isLoading = false
+                self.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func loadMore() {
+        guard !isSearching, hasMore, !isLoading else { return }
+        loadPage(reset: false)
+    }
+
+    func selectionChanged() {
+        retainedSelection = nil
+        cancelEditing()
+    }
+
+    private var isSearching: Bool {
+        !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private static func historyOrder(_ lhs: HistoryEntry, _ rhs: HistoryEntry) -> Bool {
+        if lhs.timestamp != rhs.timestamp {
+            return lhs.timestamp > rhs.timestamp
+        }
+        return lhs.id.uuidString.lowercased() > rhs.id.uuidString.lowercased()
+    }
+
+    private func loadPage(reset: Bool) {
+        loadGeneration &+= 1
+        let generation = loadGeneration
+        let requestedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestedFilter = browseFilter
+        let requestedCursor = reset ? nil : browseCursor
+        let previousSelection = selection
+        let previousSelectedEntry = selectedEntry
+        let previousEntries = entries
+        loadTask?.cancel()
+        isLoading = true
+        if reset {
+            browseCursor = nil
+            hasMore = false
+        }
+        loadTask = Task { @MainActor [weak self, store] in
+            do {
+                let loaded: [HistoryEntry]
+                let nextCursor: HistoryBrowseCursor?
+                if requestedQuery.isEmpty {
+                    var page = try await store.browse(
+                        filter: requestedFilter,
+                        cursor: requestedCursor,
+                        limit: HistoryBrowsePage.defaultPageSize
+                    )
+                    if !reset {
+                        let existingIDs = Set(previousEntries.map(\.id))
+                        while page.hasMore && page.entries.allSatisfy({ existingIDs.contains($0.id) }) {
+                            try Task.checkCancellation()
+                            page = try await store.browse(filter: requestedFilter, cursor: page.nextCursor,
+                                                          limit: HistoryBrowsePage.defaultPageSize)
+                        }
+                    }
+                    loaded = page.entries
+                    nextCursor = page.nextCursor
+                } else {
+                    loaded = try await store.search(requestedQuery, limit: Self.searchLimit)
+                    nextCursor = nil
+                }
+
+                // A refresh can move a selected row beyond the first page.
+                // Fetch that one row so the detail pane and an in-progress
+                // edit remain intact. A deleted row is cleared explicitly.
+                let retained = if reset,
+                                  let previousSelection,
+                                  !loaded.contains(where: { $0.id == previousSelection }) {
+                    try? await store.fetch(id: previousSelection)
+                } else {
+                    previousSelectedEntry
+                }
+
+                guard !Task.isCancelled,
+                      let self,
+                      self.loadGeneration == generation
+                else { return }
+
+                if reset {
+                    self.entries = loaded
+                    self.browseCursor = nextCursor
+                    self.hasMore = nextCursor != nil && requestedQuery.isEmpty
+                    self.searchIsCapped = !requestedQuery.isEmpty
+
+                    if let previousSelection {
+                        if loaded.contains(where: { $0.id == previousSelection }) {
+                            self.retainedSelection = nil
+                        } else if self.isEditing, let retained {
+                            self.retainedSelection = retained
+                        } else {
+                            self.retainedSelection = nil
+                            self.selection = loaded.first?.id
+                            if self.selection == nil || self.selection != previousSelection {
+                                self.cancelEditing()
+                            }
+                        }
+                    } else {
+                        self.selection = loaded.first?.id
+                    }
+                } else {
+                    var existingIDs = Set(self.entries.map(\.id))
+                    self.entries.append(contentsOf: loaded.filter { existingIDs.insert($0.id).inserted })
+                    self.entries.sort(by: Self.historyOrder)
+                    self.browseCursor = nextCursor
+                    self.hasMore = nextCursor != nil
+                }
+                self.errorMessage = nil
+                self.isLoading = false
+            } catch is CancellationError {
+                return
+            } catch {
+                guard let self, self.loadGeneration == generation else { return }
+                self.isLoading = false
                 self.errorMessage = error.localizedDescription
             }
         }
@@ -232,6 +426,7 @@ final class HistoryViewModel: ObservableObject {
                 _ = try await store.delete(id: selection)
                 guard let self else { return }
                 self.selection = nil
+                self.retainedSelection = nil
                 self.reload()
             } catch {
                 self?.errorMessage = error.localizedDescription
@@ -244,8 +439,7 @@ final class HistoryViewModel: ObservableObject {
             do {
                 _ = try await store.deleteTranscriptHistory()
                 guard let self else { return }
-                self.selection = nil
-                self.reload()
+                self.clearForDeletion()
             } catch {
                 self?.errorMessage = error.localizedDescription
             }
@@ -261,15 +455,52 @@ private struct HistoryView: View {
         NavigationSplitView {
             VStack(spacing: 0) {
                 TextField("Search raw, polished, and edited text", text: $viewModel.query)
+                    .disabled(viewModel.isEditing)
                     .textFieldStyle(.roundedBorder)
                     .padding(10)
                     .onSubmit { viewModel.reload() }
                     .onChange(of: viewModel.query) { _, _ in viewModel.reload() }
 
-                List(viewModel.entries, selection: $viewModel.selection) { entry in
-                    row(entry)
-                        .tag(entry.id)
-                        .padding(.vertical, 3)
+                HStack(spacing: 8) {
+                    Picker("Show", selection: $viewModel.browseFilter) {
+                        ForEach(HistoryBrowseFilter.allCases) { filter in
+                            Text(filter.title).tag(filter)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .disabled(viewModel.isEditing || !viewModel.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Spacer()
+                    Button("Refresh", systemImage: "arrow.clockwise", action: viewModel.refresh)
+                        .labelStyle(.iconOnly)
+                        .help("Refresh history")
+                }
+                .padding(.horizontal, 10)
+                .padding(.bottom, 8)
+                .onChange(of: viewModel.browseFilter) { _, _ in viewModel.reload() }
+
+                List(selection: $viewModel.selection) {
+                    ForEach(viewModel.entries) { entry in
+                        row(entry)
+                            .tag(entry.id)
+                            .padding(.vertical, 3)
+                    }
+                    if viewModel.isLoading {
+                        HStack {
+                            Spacer()
+                            ProgressView()
+                            Spacer()
+                        }
+                        .listRowSeparator(.hidden)
+                    } else if viewModel.searchIsCapped {
+                        Text("Searching all history (up to 500 matches). Clear search to browse with filters and Load More.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .listRowSeparator(.hidden)
+                    } else if viewModel.hasMore {
+                        Button("Load More") { viewModel.loadMore() }
+                            .frame(maxWidth: .infinity)
+                            .listRowSeparator(.hidden)
+                    }
                 }
             }
             .navigationSplitViewColumnWidth(min: 260, ideal: 330)
@@ -280,7 +511,7 @@ private struct HistoryView: View {
                 ContentUnavailableView("No Dictation Selected", systemImage: "waveform")
             }
         }
-        .onChange(of: viewModel.selection) { _, _ in viewModel.cancelEditing() }
+        .onChange(of: viewModel.selection) { _, _ in viewModel.selectionChanged() }
         .toolbar {
             ToolbarItemGroup {
                 Button("Delete Entry", systemImage: "trash", action: viewModel.deleteSelected)

@@ -92,3 +92,68 @@ microphone, AX, paste, model, and storage latency still need normal-use evidence
 - Keep current cleanup settings unchanged. Collect seven days of ordinary usage
   before choosing targeted application or accessibility changes. No automatic
   monitoring or new audio retention is configured.
+
+## October 7 desktop milestone
+
+Starting source: `884b1dc`; installed baseline: `0.1.0/2c31ef097faf`.
+Frozen v2 review sample ends at 2026-10-07 14:42:15.771 UTC: 1,346 desktop
+events, 1,322 paste-event posts, seven clipboard recoveries, 15 failed outcomes,
+two cancellations. Delivered sessions have stop-to-paste-event median 186.8 ms
+and p95 348.5 ms, and capture-ready median 81.1 ms/p95 161.2 ms. First-frame
+timing is new and has no retrospective baseline. These are event outcomes,
+not human accuracy/confirmed insertion scores.
+
+- Readiness uses the first successful nonempty native frame published to the
+  audio ring, an atomic timestamp, and the existing capture health cadence.
+  The 150 ms notice checks actual arrival before display and is session guarded.
+  No ready sound ships before AirPods acceptance; no idle microphone starts.
+- Empty recognition is classified from captured frames and existing audio
+  evidence as no frames, near-zero input, or audible input/no recognized speech.
+  Near-zero energy is a recovery clue, not proof of device failure. Quiet speech
+  that produces text is never discarded by this heuristic.
+- Metrics v3 adds nullable first-frame time, fixed failure stage/reason, and
+  coarse input transport. V2 migration fields are frozen and history-sync DTOs
+  remain unchanged. Existing broad outcomes and latency meanings are retained.
+  Copy Diagnostics uses schema 2 and includes the fixed last failure category;
+  it never copies the dynamic error description shown in the UI.
+- Signal is currently no-go for automatic insertion. Installed version 8.29.0
+  has a reusable DOM composer, but a live AX conversation-token probe was not
+  available. DOM identifiers do not prove macOS AX exposure. Even an editable
+  Signal field is clipboard-only until conversation changes can be reliably
+  detected. A secure-field sentinel remains non-insertable and triggers discard
+  before ASR. No AXManualAccessibility setting is changed.
+- Vocabulary correction offers selectable transcript text, an explicit mapping,
+  a second confirmation before changing an existing mapping, and immediate
+  config reload. It adds no clipboard inspection or transcript persistence.
+- Desktop history has `(timestamp,id)` cursor browsing, 100-row pages, and only
+  Pinned/Clipboard recovery filters. Search stays capped at 500, with an explicit
+  all-history search label and disabled browse filters. Refresh handles deleted
+  and edited rows, preserves drafts, fills bulk-insertion gaps, and avoids
+  duplicate pages. Hidden/minimized windows skip reloads. Delete Everything
+  synchronously clears their transient rows/drafts and cancels stale loads.
+- Static rechecks found the earlier protected-span atomic alignment, secure
+  deletion/VACUUM, retention, raw-history outage recovery, and generation cleanup
+  paths. Existing suites exercise these; this is not a fresh exhaustive audit or
+  real-device recertification of every historical review finding.
+
+Before release, run optimized Swift tests, privacy audit, Home Base compatibility,
+benchmark scoring fixtures, and signed bundle verification. Live microphone,
+Bluetooth, wrong-conversation, dialog layout/confirmation, and real iPhone sleep
+cases remain manual acceptance. The unchanged iPhone gateway/PWA suite and type
+checks passed (338 tests); the integrated desktop suite passed 324 app tests plus
+five corpus tests in release. Debug integration and offscreen native selection
+also passed, including UTF-16 selection after emoji. Release instrumentation
+fixture overhead was 2.3%; this is not a whole-app performance/accuracy claim.
+
+After an approved install, collect seven days/preferably 500 attempts. Further
+audio optimization is justified by first-frame p95 above 250 ms or confirmed
+capture/device failures above 0.5% with a repeatable pattern. Compare existing
+timing fields before/after; preserve device/duration grouping.
+
+Vocabulary boosting remains off. Pinned FluidAudio 0.14.3 requires a different
+sliding-window path and an extra CTC 110M model. Any future trial compares batch,
+unboosted sliding-window, and boosted sliding-window with identical replacements.
+CTC tokenizer/rescorer path ownership must be established first. Fresh audio and
+explicit corpus review are required; no existing recordings or correction text
+are silently exported. Phone acceptance separately covers awake, display sleep,
+lid closed, long-idle sleep, preemption, and visible route accuracy.

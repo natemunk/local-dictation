@@ -76,11 +76,31 @@ Hold Command+Control+Option+Shift and tap D. This needs no extra utility. macOS 
 Local Dictation normally lives behind the `LD` item in the right side of the macOS menu bar. Its menu provides Start/Finish Dictation, History, Configuration, Settings, and Quit.
 
 **Correct Last Dictation…** reuses the personal vocabulary dialog for the last
-saved desktop dictation from this app run, including recovery text. It is disabled
+persisted desktop dictation. Select the mistaken phrase in the transcript, enter
+its replacement, and confirm it. Updating an existing mapping requires a second
+confirmation. The original transcript and text already pasted stay unchanged.
+
+Desktop capture shows **Starting microphone…** only after a slow start (150 ms),
+then **Listening** when the first successful audio frame arrives. Settings →
+Diagnostics shows a fixed last-failure category and recovery action. Low input
+energy and audible input with no recognized speech receive different messages.
+There is no ready sound or microphone recording while idle.
+
+Signal currently uses clipboard recovery. Its composer may be reused across
+conversations; automatic paste requires a verified conversation-specific context
+token. Secure fields still discard recordings before transcription.
+
+The action includes saved recovery text from this app run and is disabled
 while dictation or rewrite is active. Deleted/expired entries are not substituted,
 and corrections are saved only after you confirm them.
 
-For the optional cleanup admission status, metrics v2 definitions, and read-only
+History browses in pages of 100 with **Load More**, **Pinned**, and **Clipboard
+recovery** filters. Refresh preserves loaded entries and current edit drafts;
+deletions remove stale rows. Search covers all history, returns up to 500 matches,
+and temporarily disables browse filters. Hidden or minimized history windows do
+not reload on each dictation. Delete Everything clears their in-memory contents.
+
+For optional cleanup admission status, metrics definitions, and read-only
 performance queries, see [Focused reliability diagnostics](docs/focused-diagnostics.md).
 
 If macOS hides the item because the menu bar is crowded, launch `~/Applications/Local Dictation.app` again from Finder or Spotlight. The already-running app opens Settings instead of starting a duplicate. Settings → General shows live permission and Hyper+D health; Settings → Diagnostics provides a privacy-safe operational report.
