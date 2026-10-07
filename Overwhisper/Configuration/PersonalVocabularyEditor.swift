@@ -100,4 +100,18 @@ struct PersonalVocabularyEditor {
             fileURL: fileURL
         )
     }
+
+    /// Read-only preflight for explicit replacement confirmation. Cancellation
+    /// must not create a directory or rewrite the personal pack.
+    func existingCorrection(for spokenForm: String) throws -> String? {
+        let url = paths.personalVocabularyFile
+        guard fileManager.fileExists(atPath: url.path) else { return nil }
+        let file = try TOMLDocumentCodec.decode(VocabularyFile.self, from: url)
+        if let version = file.version, version != 1 {
+            throw PersonalVocabularyEditorError.unsupportedVersion(version)
+        }
+        return file.replacements?.first {
+            $0.key.caseInsensitiveCompare(spokenForm.trimmingCharacters(in: .whitespacesAndNewlines)) == .orderedSame
+        }?.value
+    }
 }

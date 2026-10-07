@@ -3197,39 +3197,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func promptForVocabularyCorrection(from entry: HistoryEntry) {
-        let spokenField = NSTextField(string: "")
-        spokenField.placeholderString = "What Local Dictation heard"
-        let writtenField = NSTextField(string: "")
-        writtenField.placeholderString = "What it should write"
-
-        let stack = NSStackView(views: [
-            NSTextField(labelWithString: "Spoken form"),
-            spokenField,
-            NSTextField(labelWithString: "Written form"),
-            writtenField,
-        ])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 6
-        stack.setFrameSize(NSSize(width: 390, height: 108))
-        spokenField.widthAnchor.constraint(equalToConstant: 390).isActive = true
-        writtenField.widthAnchor.constraint(equalToConstant: 390).isActive = true
-
-        let alert = NSAlert()
-        alert.messageText = "Add a personal vocabulary correction?"
-        alert.informativeText = "Nothing is learned automatically. Enter one exact phrase mapping, then confirm it. History context: \(Self.historyCorrectionPreview(entry.rawText))"
-        alert.accessoryView = stack
-        alert.addButton(withTitle: "Add Correction")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard let mapping = VocabularyCorrectionPrompt.runModal(rawText: entry.rawText) else { return }
 
         do {
-            let result = try PersonalVocabularyEditor(
-                paths: configurationStore.paths
-            ).addCorrection(
-                spokenForm: spokenField.stringValue,
-                writtenForm: writtenField.stringValue
-            )
+            let editor = PersonalVocabularyEditor(paths: configurationStore.paths)
+            if let existing = try editor.existingCorrection(for: mapping.spokenForm), existing != mapping.writtenForm {
+                let replace = NSAlert()
+                replace.messageText = "Replace existing personal correction?"
+                replace.informativeText = "\(mapping.spokenForm): \(existing) → \(mapping.writtenForm)"
+                replace.addButton(withTitle: "Replace")
+                replace.addButton(withTitle: "Cancel")
+                guard replace.runModal() == .alertFirstButtonReturn else { return }
+            }
+            let result = try editor.addCorrection(spokenForm: mapping.spokenForm, writtenForm: mapping.writtenForm)
             loadConfiguration(bootstrap: false)
             let confirmation = NSAlert()
             confirmation.messageText = result.replacedExisting
@@ -3245,11 +3225,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             failure.alertStyle = .warning
             failure.runModal()
         }
-    }
-
-    private static func historyCorrectionPreview(_ text: String) -> String {
-        let collapsed = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
-        return collapsed.count > 120 ? "\(collapsed.prefix(117))…" : collapsed
     }
 
     private func initializeEngine(onCompletion: ((Bool) -> Void)? = nil) {

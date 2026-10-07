@@ -4,6 +4,18 @@ import Testing
 
 @Suite("Personal vocabulary editor")
 struct PersonalVocabularyEditorTests {
+    @Test func replacementPreflightHasNoWrites() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ConfigurationPaths(rootDirectory: root)
+        let editor = PersonalVocabularyEditor(paths: paths)
+        #expect(try editor.existingCorrection(for: "test phrase") == nil)
+        #expect(!FileManager.default.fileExists(atPath: root.path))
+        _ = try editor.addCorrection(spokenForm: "test phrase", writtenForm: "TestPhrase")
+        let before = try Data(contentsOf: paths.personalVocabularyFile)
+        #expect(try editor.existingCorrection(for: " TEST PHRASE ") == "TestPhrase")
+        #expect(try Data(contentsOf: paths.personalVocabularyFile) == before)
+    }
     @Test("an explicit correction transactionally preserves the personal pack")
     func addsAndReplacesCorrection() throws {
         let root = FileManager.default.temporaryDirectory
