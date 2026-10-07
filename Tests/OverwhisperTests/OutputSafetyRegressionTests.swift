@@ -7,6 +7,26 @@ import Testing
 // pasteboard mutations even when each test uses a unique name.
 @Suite("Output safety regressions", .serialized)
 struct OutputSafetyRegressionTests {
+    @Test @MainActor func signalRequiresConversationProofAndPreservesSecureDiscard() async throws {
+        func signal(secure: Bool) -> DictationDestination.CaptureCandidate {
+            .init(processIdentifier: 1, bundleIdentifier: "org.whispersystems.signal-desktop",
+                applicationName: "Signal", role: kAXTextAreaRole, subrole: nil,
+                focusTokenAvailable: true, focusedElementIsEditable: true, focusedElementIsSecure: secure,
+                allowsFocusTokenFallback: true, validateForInsertion: { _ in true }, remainsValidForInsertion: { true })
+        }
+        #expect(DictationDestination.captureFrontmost(candidateProvider: { signal(secure: false) }) == nil)
+        let secure = try #require(DictationDestination.captureFrontmost(candidateProvider: { signal(secure: true) }))
+        #expect(secure.isSecureField)
+        #expect(secure.insertionTier == nil)
+        #expect(await secure.validateForInsertion(reactivateIfNeeded: false) == false)
+        #expect(!secure.remainsValidForInsertion())
+        let board = makePasteboard()
+        board.setString("Unchanged", forType: .string)
+        let inserter = makeInserter(pasteboard: board, pasteSimulator: { Issue.record("Secure field must not paste"); return true })
+        let outcome = await inserter.insertText("Synthetic sensitive fixture", destination: secure)
+        #expect(outcome == .historyOnly(reason: "Secure fields cannot receive dictation or history paste"))
+        #expect(board.string(forType: .string) == "Unchanged")
+    }
     @Test("destination capture requires a secure field or a concrete AX focus token")
     @MainActor
     func captureFailsClosed() {

@@ -179,6 +179,18 @@ final class DictationDestination {
     ) -> DictationDestination? {
         guard let candidate = candidateProvider() else { return nil }
 
+        // Preserve a non-insertable secure-field sentinel for every app.
+        // validateForInsertion/remainsValid both reject it; AppDelegate discards
+        // audio before ASR, and TextInserter refuses it before writing clipboard.
+        if candidate.focusedElementIsSecure {
+            return DictationDestination(candidate: candidate, insertionTier: nil)
+        }
+
+        // Signal can reuse its composer AX element across conversations. Until
+        // a conversation-specific context token is validated, even an editable
+        // element is insufficient to authorize automatic insertion.
+        guard candidate.bundleIdentifier.lowercased() != "org.whispersystems.signal-desktop" else { return nil }
+
         let insertionTier: DestinationInsertionTier?
         if candidate.focusTokenAvailable && candidate.focusedElementIsEditable {
             insertionTier = .exactEditableElement
